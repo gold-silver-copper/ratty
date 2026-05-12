@@ -194,6 +194,18 @@ pub enum BindingAction {
     /// Toggles the Mobius-strip terminal view.
     #[serde(rename = "ToggleMobiusMode")]
     ToggleMobiusMode,
+    /// Scrolls one page up through scrollback.
+    #[serde(rename = "ScrollPageUp")]
+    ScrollPageUp,
+    /// Scrolls one page down through scrollback.
+    #[serde(rename = "ScrollPageDown")]
+    ScrollPageDown,
+    /// Scrolls one line up through scrollback.
+    #[serde(rename = "ScrollUp")]
+    ScrollUp,
+    /// Scrolls one line down through scrollback.
+    #[serde(rename = "ScrollDown")]
+    ScrollDown,
     /// Increases plane warp.
     #[serde(rename = "IncreaseWarp")]
     IncreaseWarp,

@@ -77,6 +77,38 @@ impl FromWorld for TerminalKeyBindings {
                 BindingAction::ToggleMobiusMode,
             ),
             KeyBinding::new(
+                KeyCode::PageUp,
+                BindingModifiers {
+                    alt: true,
+                    ..default()
+                },
+                BindingAction::ScrollPageUp,
+            ),
+            KeyBinding::new(
+                KeyCode::PageDown,
+                BindingModifiers {
+                    alt: true,
+                    ..default()
+                },
+                BindingAction::ScrollPageDown,
+            ),
+            KeyBinding::new(
+                KeyCode::ArrowUp,
+                BindingModifiers {
+                    alt: true,
+                    ..default()
+                },
+                BindingAction::ScrollUp,
+            ),
+            KeyBinding::new(
+                KeyCode::ArrowDown,
+                BindingModifiers {
+                    alt: true,
+                    ..default()
+                },
+                BindingAction::ScrollDown,
+            ),
+            KeyBinding::new(
                 KeyCode::ArrowUp,
                 BindingModifiers {
                     control: true,
@@ -209,6 +241,15 @@ pub struct TerminalKeyboard {
 }
 
 impl TerminalKeyboard {
+    fn modifiers(&self) -> BindingModifiers {
+        BindingModifiers {
+            control: self.ctrl_pressed,
+            alt: self.alt_pressed,
+            shift: self.shift_pressed,
+            super_key: self.super_pressed,
+        }
+    }
+
     /// Translates a keyboard event into terminal input bytes.
     pub fn handle_event_with_modes(
         &mut self,
@@ -282,11 +323,11 @@ pub fn handle_keyboard_input(
     mut params: KeyboardSystemParams,
 ) {
     for event in keyboard_events.read() {
-        // Use Bevy's live pressed-key state for shortcut matching so bindings remain correct even
-        // if a modifier press/release event was missed or arrived in a different order.
-        let modifiers = current_modifiers(&params.keys);
+        let binding_key_code =
+            navigation_key_code(&event.logical_key).unwrap_or(event.key_code);
+        let modifiers = current_modifiers(&params.keys).union(keyboard.modifiers());
         if event.state == ButtonState::Pressed
-            && let Some(action) = params.bindings.action_for(event.key_code, modifiers)
+            && let Some(action) = params.bindings.action_for(binding_key_code, modifiers)
         {
             if event.repeat
                 && !matches!(
@@ -294,6 +335,10 @@ pub fn handle_keyboard_input(
                     BindingAction::IncreaseFontSize
                         | BindingAction::DecreaseFontSize
                         | BindingAction::ResetFontSize
+                        | BindingAction::ScrollPageUp
+                        | BindingAction::ScrollPageDown
+                        | BindingAction::ScrollUp
+                        | BindingAction::ScrollDown
                         | BindingAction::IncreaseWarp
                         | BindingAction::DecreaseWarp
                 )
@@ -327,6 +372,39 @@ pub fn handle_keyboard_input(
                             .mobius_transition
                             .begin_enter(previous_mode, &params.plane_view);
                     }
+                    params.selection.clear();
+                    params.redraw.request();
+                    continue;
+                }
+                BindingAction::ScrollPageUp
+                | BindingAction::ScrollPageDown
+                | BindingAction::ScrollUp
+                | BindingAction::ScrollDown => {
+                    if params.runtime.parser.screen().alternate_screen() {
+                        continue;
+                    }
+
+                    let amount = match action {
+                        BindingAction::ScrollPageUp | BindingAction::ScrollPageDown => {
+                            usize::from(params.terminal.rows.saturating_sub(1).max(1))
+                        }
+                        BindingAction::ScrollUp | BindingAction::ScrollDown => 1,
+                        _ => unreachable!(),
+                    };
+                    let direction = match action {
+                        BindingAction::ScrollPageUp | BindingAction::ScrollUp => 1isize,
+                        BindingAction::ScrollPageDown | BindingAction::ScrollDown => -1isize,
+                        _ => unreachable!(),
+                    };
+
+                    let screen = params.runtime.parser.screen_mut();
+                    let current = screen.scrollback();
+                    let next = if direction.is_positive() {
+                        current.saturating_add(amount)
+                    } else {
+                        current.saturating_sub(amount)
+                    };
+                    screen.set_scrollback(next);
                     params.selection.clear();
                     params.redraw.request();
                     continue;
@@ -398,7 +476,7 @@ pub fn handle_keyboard_input(
         }
 
         if event.state == ButtonState::Pressed
-            && !is_modifier_key(event.key_code)
+            && !is_modifier_key(binding_key_code)
             && params.selection.clear()
         {
             params.redraw.request();
@@ -410,6 +488,11 @@ pub fn handle_keyboard_input(
             params.runtime.kitty_keyboard_flags(),
             params.runtime.modify_other_keys(),
         ) {
+            let screen = params.runtime.parser.screen_mut();
+            if screen.scrollback() != 0 {
+                screen.set_scrollback(0);
+                params.redraw.request();
+            }
             params.runtime.write_input(&input);
         }
     }
@@ -438,6 +521,15 @@ impl BindingModifiers {
             && (!self.alt || current.alt)
             && (!self.shift || current.shift)
             && (!self.super_key || current.super_key)
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            control: self.control || other.control,
+            alt: self.alt || other.alt,
+            shift: self.shift || other.shift,
+            super_key: self.super_key || other.super_key,
+        }
     }
 
     fn count(self) -> usize {
@@ -686,6 +778,22 @@ impl NavigationKey {
             Self::Insert => b"\x1b[2~".to_vec(),
             Self::Delete => b"\x1b[3~".to_vec(),
         }
+    }
+}
+
+fn navigation_key_code(logical_key: &Key) -> Option<KeyCode> {
+    match logical_key {
+        Key::ArrowUp => Some(KeyCode::ArrowUp),
+        Key::ArrowDown => Some(KeyCode::ArrowDown),
+        Key::ArrowRight => Some(KeyCode::ArrowRight),
+        Key::ArrowLeft => Some(KeyCode::ArrowLeft),
+        Key::Home => Some(KeyCode::Home),
+        Key::End => Some(KeyCode::End),
+        Key::PageUp => Some(KeyCode::PageUp),
+        Key::PageDown => Some(KeyCode::PageDown),
+        Key::Insert => Some(KeyCode::Insert),
+        Key::Delete => Some(KeyCode::Delete),
+        _ => None,
     }
 }
 
