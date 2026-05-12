@@ -323,8 +323,7 @@ pub fn handle_keyboard_input(
     mut params: KeyboardSystemParams,
 ) {
     for event in keyboard_events.read() {
-        let binding_key_code =
-            navigation_key_code(&event.logical_key).unwrap_or(event.key_code);
+        let binding_key_code = navigation_key_code(&event.logical_key).unwrap_or(event.key_code);
         let modifiers = current_modifiers(&params.keys).union(keyboard.modifiers());
         if event.state == ButtonState::Pressed
             && let Some(action) = params.bindings.action_for(binding_key_code, modifiers)
