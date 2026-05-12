@@ -218,7 +218,7 @@ impl TerminalRuntime {
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned())
                 .or_else(|| env::var("SHELL").ok())
-                .unwrap_or_else(|| "/bin/bash".to_string());
+                .unwrap_or_else(|| "/bin/sh".to_string());
             let mut cmd = CommandBuilder::new(shell);
             cmd.args(&config.shell.args);
             cmd
