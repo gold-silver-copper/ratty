@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeSet,
-    fs, io,
+    env, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -55,13 +55,19 @@ struct DrawingApp<'a> {
 
 impl<'a> DrawingApp<'a> {
     fn new() -> io::Result<Self> {
-        let preview_obj_path = workspace_asset("target/live_draw.obj");
+        let cwd = env::current_dir()?;
+        let relative_path = if cwd.file_name().and_then(|name| name.to_str()) == Some("widget") {
+            "../target/live_draw.obj"
+        } else {
+            "target/live_draw.obj"
+        };
+        let preview_obj_path = cwd.join(relative_path);
         if let Some(parent) = preview_obj_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         let preview = RattyGraphic::new(
-            RattyGraphicSettings::new(preview_obj_path.to_string_lossy().into_owned())
+            RattyGraphicSettings::new(relative_path)
                 .id(700)
                 .format(ObjectFormat::Obj)
                 .animate(true)
@@ -346,17 +352,6 @@ impl<'a> DrawingApp<'a> {
             position.y.saturating_sub(self.canvas_area.y),
         ))
     }
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("widget crate should live under the workspace root")
-        .to_path_buf()
-}
-
-fn workspace_asset(path: impl AsRef<Path>) -> PathBuf {
-    workspace_root().join(path)
 }
 
 fn write_obj(path: &Path, points: &BTreeSet<(u16, u16)>) -> io::Result<()> {
