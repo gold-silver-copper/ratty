@@ -42,6 +42,13 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
                     ": brightness ({:.1})  ",
                     graphic.settings().brightness
                 )),
+                Span::styled("1-6", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(
+                    ": rot [{:.0}, {:.0}, {:.0}]  ",
+                    graphic.settings().rotation[0],
+                    graphic.settings().rotation[1],
+                    graphic.settings().rotation[2]
+                )),
                 Span::styled("a", Style::default().fg(Color::Cyan)),
                 Span::raw(format!(
                     ": animate ({})  ",
@@ -83,6 +90,7 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
         })?;
 
         if let Event::Key(key) = event::read()? {
+            let mut send_update = false;
             match (key.code, key.modifiers) {
                 (KeyCode::Char('q'), _) => {
                     graphic.clear()?;
@@ -94,26 +102,60 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
                 (KeyCode::Char('a'), _) => {
                     let animate = graphic.settings().animate;
                     graphic.settings_mut().animate = !animate;
+                    send_update = true;
                 }
                 (KeyCode::Char('r'), _) => {
                     area = Rect::new(0, 0, 24, 10);
                     graphic.settings_mut().animate = true;
-                    graphic.settings_mut().scale = 1.0;
-                    graphic.settings_mut().brightness = 0.9;
+                    *graphic.settings_mut() =
+                        RattyGraphicSettings::new("assets/objects/SpinyMouse.glb")
+                            .id(7)
+                            .animate(true)
+                            .scale(1.0)
+                            .brightness(0.9);
                     centered = false;
+                    send_update = true;
                 }
                 (KeyCode::Char('+'), _) | (KeyCode::Char('='), _) => {
                     graphic.settings_mut().scale += 0.1;
+                    send_update = true;
                 }
                 (KeyCode::Char('-'), _) => {
                     graphic.settings_mut().scale = (graphic.settings().scale - 0.1).max(0.1);
+                    send_update = true;
                 }
                 (KeyCode::Char(']'), _) => {
                     graphic.settings_mut().brightness += 0.1;
+                    send_update = true;
                 }
                 (KeyCode::Char('['), _) => {
                     graphic.settings_mut().brightness =
                         (graphic.settings().brightness - 0.1).max(0.1);
+                    send_update = true;
+                }
+                (KeyCode::Char('1'), _) => {
+                    graphic.settings_mut().rotation[0] -= 15.0;
+                    send_update = true;
+                }
+                (KeyCode::Char('2'), _) => {
+                    graphic.settings_mut().rotation[0] += 15.0;
+                    send_update = true;
+                }
+                (KeyCode::Char('3'), _) => {
+                    graphic.settings_mut().rotation[1] -= 15.0;
+                    send_update = true;
+                }
+                (KeyCode::Char('4'), _) => {
+                    graphic.settings_mut().rotation[1] += 15.0;
+                    send_update = true;
+                }
+                (KeyCode::Char('5'), _) => {
+                    graphic.settings_mut().rotation[2] -= 15.0;
+                    send_update = true;
+                }
+                (KeyCode::Char('6'), _) => {
+                    graphic.settings_mut().rotation[2] += 15.0;
+                    send_update = true;
                 }
                 (KeyCode::Left, _) => {
                     area.x = area.x.saturating_sub(1);
@@ -128,6 +170,10 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
                     area.y = area.y.saturating_add(1);
                 }
                 _ => {}
+            }
+
+            if send_update {
+                graphic.update()?;
             }
         }
     }

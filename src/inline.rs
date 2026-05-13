@@ -10,7 +10,8 @@ use vt100::Callbacks;
 use crate::kitty::{KittyOperation, KittyParserState, refresh_kitty_placeholder_anchors};
 use crate::model::{ObjectSource, load_object_source};
 use crate::rgp::{
-    RgpOperation, RgpPlacementStyle, consume_sequence as consume_rgp_sequence, support_reply,
+    RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, consume_sequence as consume_rgp_sequence,
+    support_reply,
 };
 const APC_START: &[u8] = b"\x1b_";
 const ST: &[u8] = b"\x1b\\";
@@ -295,6 +296,13 @@ impl TerminalInlineObjects {
                 }
                 None
             }
+            RgpOperation::Update { object_id, update } => {
+                if let Some(anchor) = self.anchors.get_mut(&object_id) {
+                    apply_rgp_update(&mut anchor.style, update);
+                    self.dirty = true;
+                }
+                None
+            }
             RgpOperation::Delete { object_id } => {
                 if let Some(object_id) = object_id {
                     self.remove_object(object_id);
@@ -472,6 +480,12 @@ pub struct InlineStyle {
     pub color: Option<[u8; 3]>,
     /// Brightness multiplier.
     pub brightness: f32,
+    /// Translation offset relative to the anchor.
+    pub offset: Vec3,
+    /// Rotation in degrees.
+    pub rotation: Vec3,
+    /// Non-uniform scale multiplier.
+    pub scale3: Vec3,
 }
 
 impl From<RgpPlacementStyle> for InlineStyle {
@@ -482,6 +496,42 @@ impl From<RgpPlacementStyle> for InlineStyle {
             depth: value.depth,
             color: value.color,
             brightness: value.brightness,
+            offset: Vec3::from_array(value.offset),
+            rotation: Vec3::from_array(value.rotation),
+            scale3: Vec3::from_array(value.scale3),
         }
+    }
+}
+
+fn apply_rgp_update(style: &mut InlineStyle, update: RgpPlacementUpdate) {
+    if let Some(animate) = update.animate {
+        style.animate = animate;
+    }
+    if let Some(scale) = update.scale {
+        style.scale = scale;
+    }
+    if let Some(depth) = update.depth {
+        style.depth = depth;
+    }
+    if let Some(color) = update.color {
+        style.color = Some(color);
+    }
+    if let Some(brightness) = update.brightness {
+        style.brightness = brightness;
+    }
+    apply_vec3_update(&mut style.offset, update.offset);
+    apply_vec3_update(&mut style.rotation, update.rotation);
+    apply_vec3_update(&mut style.scale3, update.scale3);
+}
+
+fn apply_vec3_update(target: &mut Vec3, update: [Option<f32>; 3]) {
+    if let Some(x) = update[0] {
+        target.x = x;
+    }
+    if let Some(y) = update[1] {
+        target.y = y;
+    }
+    if let Some(z) = update[2] {
+        target.z = z;
     }
 }

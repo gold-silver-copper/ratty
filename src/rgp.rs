@@ -18,6 +18,33 @@ pub struct RgpPlacementStyle {
     pub color: Option<[u8; 3]>,
     /// Brightness multiplier.
     pub brightness: f32,
+    /// Translation offset relative to the anchor.
+    pub offset: [f32; 3],
+    /// Rotation in degrees.
+    pub rotation: [f32; 3],
+    /// Non-uniform scale.
+    pub scale3: [f32; 3],
+}
+
+/// Partial update for an RGP object placement.
+#[derive(Clone, Copy, Default)]
+pub struct RgpPlacementUpdate {
+    /// Updates the default animation flag.
+    pub animate: Option<bool>,
+    /// Updates the uniform scale multiplier.
+    pub scale: Option<f32>,
+    /// Updates the extrusion depth.
+    pub depth: Option<f32>,
+    /// Updates the object color.
+    pub color: Option<[u8; 3]>,
+    /// Updates the brightness multiplier.
+    pub brightness: Option<f32>,
+    /// Updates the translation offset relative to the anchor.
+    pub offset: [Option<f32>; 3],
+    /// Updates the rotation in degrees.
+    pub rotation: [Option<f32>; 3],
+    /// Updates the non-uniform scale.
+    pub scale3: [Option<f32>; 3],
 }
 
 /// Consumes an RGP APC sequence.
@@ -43,11 +70,20 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
     let mut col = None;
     let mut width = None;
     let mut height = None;
-    let mut animate = false;
+    let mut animate = None;
     let mut scale = None;
     let mut depth = None;
     let mut color = None;
     let mut brightness = None;
+    let mut px = None;
+    let mut py = None;
+    let mut pz = None;
+    let mut rx = None;
+    let mut ry = None;
+    let mut rz = None;
+    let mut sx = None;
+    let mut sy = None;
+    let mut sz = None;
     for part in parts.filter(|part| !part.is_empty()) {
         let Some((key, value)) = part.split_once('=') else {
             continue;
@@ -60,11 +96,20 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
             "col" => col = value.parse().ok(),
             "w" => width = value.parse().ok(),
             "h" => height = value.parse().ok(),
-            "animate" => animate = value == "1",
+            "animate" => animate = parse_bool(value),
             "scale" => scale = value.parse().ok(),
             "depth" => depth = value.parse().ok(),
             "color" | "tint" => color = parse_color(value),
             "brightness" => brightness = value.parse().ok(),
+            "px" => px = value.parse().ok(),
+            "py" => py = value.parse().ok(),
+            "pz" => pz = value.parse().ok(),
+            "rx" => rx = value.parse().ok(),
+            "ry" => ry = value.parse().ok(),
+            "rz" => rz = value.parse().ok(),
+            "sx" => sx = value.parse().ok(),
+            "sy" => sy = value.parse().ok(),
+            "sz" => sz = value.parse().ok(),
             _ => {}
         }
     }
@@ -84,12 +129,28 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
                 columns: width?,
                 rows: height?,
                 style: RgpPlacementStyle {
-                    animate,
+                    animate: animate.unwrap_or(false),
                     scale: scale.unwrap_or(1.0),
                     depth: depth.unwrap_or(0.0),
                     color,
                     brightness: brightness.unwrap_or(1.0),
+                    offset: [px.unwrap_or(0.0), py.unwrap_or(0.0), pz.unwrap_or(0.0)],
+                    rotation: [rx.unwrap_or(0.0), ry.unwrap_or(0.0), rz.unwrap_or(0.0)],
+                    scale3: [sx.unwrap_or(1.0), sy.unwrap_or(1.0), sz.unwrap_or(1.0)],
                 },
+            },
+        }),
+        "u" => Some(RgpOperation::Update {
+            object_id: id?,
+            update: RgpPlacementUpdate {
+                animate,
+                scale,
+                depth,
+                color,
+                brightness,
+                offset: [px, py, pz],
+                rotation: [rx, ry, rz],
+                scale3: [sx, sy, sz],
             },
         }),
         "d" => Some(RgpOperation::Delete { object_id: id }),
@@ -132,6 +193,13 @@ pub enum RgpOperation {
         /// Placement anchor.
         anchor: RgpAnchor,
     },
+    /// Object update.
+    Update {
+        /// Object identifier.
+        object_id: u32,
+        /// Partial style/transform update.
+        update: RgpPlacementUpdate,
+    },
     /// Object deletion.
     Delete {
         /// Optional object identifier.
@@ -143,7 +211,7 @@ pub enum RgpOperation {
 
 /// Returns the RGP support reply sequence.
 pub fn support_reply() -> Vec<u8> {
-    b"\x1b_ratty;g;s;v=1;fmt=obj|glb;path=1;anim=1;depth=1;color=1;brightness=1\x1b\\".to_vec()
+    b"\x1b_ratty;g;s;v=1;fmt=obj|glb;path=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1\x1b\\".to_vec()
 }
 
 fn parse_color(value: &str) -> Option<[u8; 3]> {
@@ -157,4 +225,12 @@ fn parse_color(value: &str) -> Option<[u8; 3]> {
         u8::from_str_radix(&value[2..4], 16).ok()?,
         u8::from_str_radix(&value[4..6], 16).ok()?,
     ])
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
 }

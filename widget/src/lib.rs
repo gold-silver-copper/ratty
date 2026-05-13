@@ -54,6 +54,12 @@ pub struct RattyGraphicSettings<'a> {
     pub color: Option<[u8; 3]>,
     /// Object brightness multiplier.
     pub brightness: f32,
+    /// Translation offset relative to the anchor.
+    pub offset: [f32; 3],
+    /// Rotation in degrees.
+    pub rotation: [f32; 3],
+    /// Non-uniform scale multiplier.
+    pub scale3: [f32; 3],
 }
 
 impl<'a> RattyGraphicSettings<'a> {
@@ -69,6 +75,9 @@ impl<'a> RattyGraphicSettings<'a> {
             depth: 0.0,
             color: None,
             brightness: 1.0,
+            offset: [0.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0],
+            scale3: [1.0, 1.0, 1.0],
         }
     }
 
@@ -111,6 +120,24 @@ impl<'a> RattyGraphicSettings<'a> {
     /// Sets the brightness multiplier.
     pub fn brightness(mut self, brightness: f32) -> Self {
         self.brightness = brightness;
+        self
+    }
+
+    /// Sets the translation offset relative to the anchor.
+    pub fn offset(mut self, offset: [f32; 3]) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// Sets the rotation in degrees.
+    pub fn rotation(mut self, rotation: [f32; 3]) -> Self {
+        self.rotation = rotation;
+        self
+    }
+
+    /// Sets the non-uniform scale multiplier.
+    pub fn scale3(mut self, scale3: [f32; 3]) -> Self {
+        self.scale3 = scale3;
         self
     }
 }
@@ -161,7 +188,7 @@ impl<'a> RattyGraphic<'a> {
         let center_row = area.y.saturating_add(area.height.saturating_sub(1) / 2);
         let center_col = area.x.saturating_add(area.width.saturating_sub(1) / 2);
         format!(
-            "\x1b_ratty;g;p;id={};row={};col={};w={};h={};animate={};scale={};depth={};color={};brightness={}\x1b\\",
+            "\x1b_ratty;g;p;id={};row={};col={};w={};h={};animate={};scale={};depth={};color={};brightness={};px={};py={};pz={};rx={};ry={};rz={};sx={};sy={};sz={}\x1b\\",
             self.settings.id,
             center_row,
             center_col,
@@ -175,6 +202,40 @@ impl<'a> RattyGraphic<'a> {
                 .map(|[r, g, b]| format!("{r:02x}{g:02x}{b:02x}"))
                 .unwrap_or_else(|| "ffffff".to_string()),
             self.settings.brightness,
+            self.settings.offset[0],
+            self.settings.offset[1],
+            self.settings.offset[2],
+            self.settings.rotation[0],
+            self.settings.rotation[1],
+            self.settings.rotation[2],
+            self.settings.scale3[0],
+            self.settings.scale3[1],
+            self.settings.scale3[2],
+        )
+    }
+
+    /// Returns the RGP update sequence.
+    pub fn update_sequence(&self) -> String {
+        format!(
+            "\x1b_ratty;g;u;id={};animate={};scale={};depth={};color={};brightness={};px={};py={};pz={};rx={};ry={};rz={};sx={};sy={};sz={}\x1b\\",
+            self.settings.id,
+            u8::from(self.settings.animate),
+            self.settings.scale,
+            self.settings.depth,
+            self.settings
+                .color
+                .map(|[r, g, b]| format!("{r:02x}{g:02x}{b:02x}"))
+                .unwrap_or_else(|| "ffffff".to_string()),
+            self.settings.brightness,
+            self.settings.offset[0],
+            self.settings.offset[1],
+            self.settings.offset[2],
+            self.settings.rotation[0],
+            self.settings.rotation[1],
+            self.settings.rotation[2],
+            self.settings.scale3[0],
+            self.settings.scale3[1],
+            self.settings.scale3[2],
         )
     }
 
@@ -190,6 +251,16 @@ impl<'a> RattyGraphic<'a> {
     /// Returns an error if stdout cannot be written or flushed.
     pub fn clear(&self) -> io::Result<()> {
         io::stdout().write_all(self.delete_sequence().as_bytes())?;
+        io::stdout().flush()
+    }
+
+    /// Writes the RGP update sequence to stdout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if stdout cannot be written or flushed.
+    pub fn update(&self) -> io::Result<()> {
+        io::stdout().write_all(self.update_sequence().as_bytes())?;
         io::stdout().flush()
     }
 }

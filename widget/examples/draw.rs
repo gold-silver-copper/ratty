@@ -46,8 +46,10 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
 struct DrawingApp<'a> {
     should_quit: bool,
     canvas_area: Rect,
+    preview_area: Rect,
     mouse_position: Option<Position>,
     last_draw_position: Option<Position>,
+    last_rotate_position: Option<Position>,
     points: BTreeSet<(u16, u16)>,
     preview: RattyGraphic<'a>,
     preview_obj_path: PathBuf,
@@ -79,8 +81,10 @@ impl<'a> DrawingApp<'a> {
         Ok(Self {
             should_quit: false,
             canvas_area: Rect::default(),
+            preview_area: Rect::default(),
             mouse_position: None,
             last_draw_position: None,
+            last_rotate_position: None,
             points: BTreeSet::new(),
             preview,
             preview_obj_path,
@@ -103,9 +107,17 @@ impl<'a> DrawingApp<'a> {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('a') => {
+                let animate = self.preview.settings().animate;
+                self.preview.settings_mut().animate = !animate;
+                if !self.points.is_empty() {
+                    self.preview.update()?;
+                }
+            }
             KeyCode::Char('c') => {
                 self.points.clear();
                 self.last_draw_position = None;
+                self.last_rotate_position = None;
                 self.preview.clear()?;
             }
             _ => {}
@@ -116,6 +128,15 @@ impl<'a> DrawingApp<'a> {
     fn on_mouse(&mut self, event: MouseEvent) -> io::Result<()> {
         let position = Position::new(event.column, event.row);
         self.mouse_position = Some(position);
+
+        let preview_contains = position.x >= self.preview_area.x
+            && position.x < self.preview_area.x.saturating_add(self.preview_area.width)
+            && position.y >= self.preview_area.y
+            && position.y < self.preview_area.y.saturating_add(self.preview_area.height);
+        if preview_contains {
+            return self.on_preview_mouse(event, position);
+        }
+
         let Some(local) = self.local_canvas_position(position) else {
             return Ok(());
         };
@@ -139,6 +160,34 @@ impl<'a> DrawingApp<'a> {
             }
             MouseEventKind::Up(_) => {
                 self.last_draw_position = None;
+                self.last_rotate_position = None;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_preview_mouse(&mut self, event: MouseEvent, position: Position) -> io::Result<()> {
+        match event.kind {
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                self.last_rotate_position = Some(position);
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                let Some(previous) = self.last_rotate_position else {
+                    self.last_rotate_position = Some(position);
+                    return Ok(());
+                };
+                let dx = position.x as i16 - previous.x as i16;
+                let dy = position.y as i16 - previous.y as i16;
+                self.preview.settings_mut().rotation[1] += f32::from(dx) * 4.0;
+                self.preview.settings_mut().rotation[0] += f32::from(dy) * 4.0;
+                self.last_rotate_position = Some(position);
+                if !self.points.is_empty() {
+                    self.preview.update()?;
+                }
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                self.last_rotate_position = None;
             }
             _ => {}
         }
@@ -243,8 +292,15 @@ impl<'a> DrawingApp<'a> {
         Paragraph::new(TextLine::from(vec![
             Span::styled("left mouse", Style::default().fg(Color::Cyan)),
             Span::raw(": draw  "),
+            Span::styled("click & drag", Style::default().fg(Color::Cyan)),
+            Span::raw(": rotate  "),
             Span::styled("right mouse", Style::default().fg(Color::Cyan)),
             Span::raw(": erase  "),
+            Span::styled("a", Style::default().fg(Color::Cyan)),
+            Span::raw(format!(
+                ": animate ({})  ",
+                u8::from(self.preview.settings().animate)
+            )),
             Span::styled("c", Style::default().fg(Color::Cyan)),
             Span::raw(": clear  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
@@ -328,6 +384,7 @@ impl<'a> DrawingApp<'a> {
             .border_style(Style::default().fg(Color::White))
             .title("Preview");
         let inner = block.inner(area);
+        self.preview_area = inner;
         block.render(area, frame.buffer_mut());
         frame.render_widget(Clear, inner);
 

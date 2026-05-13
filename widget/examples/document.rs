@@ -598,7 +598,7 @@ fn place_at_anchor(
 ) -> String {
     let settings = graphic.settings();
     format!(
-        "\x1b_ratty;g;p;id={};row={};col={};w={};h={};animate={};scale={};depth={};color={};brightness={}\x1b\\",
+        "\x1b_ratty;g;p;id={};row={};col={};w={};h={};animate={};scale={};depth={};color={};brightness={};px={};py={};pz={};rx={};ry={};rz={};sx={};sy={};sz={}\x1b\\",
         settings.id,
         anchor_y,
         anchor_x,
@@ -612,6 +612,15 @@ fn place_at_anchor(
             .map(|[r, g, b]| format!("{r:02x}{g:02x}{b:02x}"))
             .unwrap_or_else(|| "ffffff".to_string()),
         settings.brightness,
+        settings.offset[0],
+        settings.offset[1],
+        settings.offset[2],
+        settings.rotation[0],
+        settings.rotation[1],
+        settings.rotation[2],
+        settings.scale3[0],
+        settings.scale3[1],
+        settings.scale3[2],
     )
 }
 

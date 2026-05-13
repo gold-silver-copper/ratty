@@ -49,7 +49,8 @@ Each object has:
 - `s` [support query](#1-support-query)
 - `r` [register object asset](#2-register-object-asset)
 - `p` [place object](#3-place-object)
-- `d` [delete object](#4-delete-object)
+- `u` [update object](#4-update-object)
+- `d` [delete object](#5-delete-object)
 
 ### 1. Support Query
 
@@ -64,18 +65,20 @@ ESC _ ratty;g;s ESC \
 Ratty replies:
 
 ```text
-ESC _ ratty;g;s;v=1;fmt=obj|glb;path=1;anim=1;depth=1;color=1;brightness=1 ESC \
+ESC _ ratty;g;s;v=1;fmt=obj|glb;path=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1 ESC \
 ```
 
 Fields:
 
 - `v=1`: protocol version
-- `fmt=glb`: `obj` and `glb` are supported in v1
+- `fmt=glb`: `obj` and `glb` are supported
 - `path=1`: path-based object registration is supported
-- `anim=1`: `animate=1` placement is supported
+- `anim=1`: `animate=1` placement is supported for v1 compatibility
 - `depth=1`: `depth=<f32>` placement is supported
 - `color=1`: `color=<RRGGBB>` placement is supported
 - `brightness=1`: `brightness=<f32>` placement is supported
+- `transform=1`: transform fields such as rotation and offsets are supported
+- `update=1`: `u` object updates are supported
 
 If no reply arrives, the terminal does not support the protocol.
 
@@ -104,7 +107,7 @@ Places a previously registered object into terminal cell space.
 Client sends:
 
 ```text
-ESC _ ratty;g;p;id=42;row=12;col=8;w=4;h=2;animate=1;scale=1.0;depth=2.5;color=ff8844;brightness=1.0 ESC \
+ESC _ ratty;g;p;id=42;row=12;col=8;w=4;h=2;animate=1;scale=1.0;depth=2.5;color=ff8844;brightness=1.0;px=0;py=0;pz=0;rx=0;ry=45;rz=0;sx=1;sy=1;sz=1 ESC \
 ```
 
 Fields:
@@ -119,8 +122,35 @@ Fields:
 - `depth`: optional z-offset, defaults to `0.0`
 - `color`: optional RGB color as `RRGGBB`
 - `brightness`: optional brightness multiplier, defaults to `1.0`
+- `px`, `py`, `pz`: optional translation offset relative to the anchor, defaults to `0`
+- `rx`, `ry`, `rz`: optional rotation in degrees, defaults to `0`
+- `sx`, `sy`, `sz`: optional non-uniform scale, defaults to `1`
 
-### 4. Delete Object
+Clients that only send the original v1 fields still work unchanged.
+
+### 4. Update Object
+
+Updates the styling or transform of a previously placed object without changing
+its registration or anchor.
+
+Client sends:
+
+```text
+ESC _ ratty;g;u;id=42;ry=120;px=0.25;animate=0 ESC \
+```
+
+Fields are optional and mirror the mutable fields from `p`:
+
+- `animate`
+- `scale`
+- `depth`
+- `color`
+- `brightness`
+- `px`, `py`, `pz`
+- `rx`, `ry`, `rz`
+- `sx`, `sy`, `sz`
+
+### 5. Delete Object
 
 Deletes either a placement or an object.
 
@@ -147,7 +177,13 @@ ESC _ ratty;g;r;id=7;fmt=obj;path=CairoSpinyMouse.obj ESC \
 Place it in the terminal at row 5, column 10, spanning 3×2 cells:
 
 ```text
-ESC _ ratty;g;p;id=7;row=5;col=10;w=3;h=2;animate=1;scale=1.0;depth=1.5;color=7fd0ff;brightness=1.0 ESC \
+ESC _ ratty;g;p;id=7;row=5;col=10;w=3;h=2;animate=1;scale=1.0;depth=1.5;color=7fd0ff;brightness=1.0;ry=30 ESC \
+```
+
+Rotate it later:
+
+```text
+ESC _ ratty;g;u;id=7;ry=180 ESC \
 ```
 
 Delete it:

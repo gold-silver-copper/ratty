@@ -814,11 +814,22 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
         let layout = inline_layout(anchor, terminal, viewport, cell_width, cell_height);
         let base_scale = layout.pixel_width.max(layout.pixel_height).max(1.0) * 0.9;
         let scale = base_scale * anchor.style.scale.max(0.001);
+        let scale3 = Vec3::new(
+            anchor.style.scale3.x.max(0.001),
+            anchor.style.scale3.y.max(0.001),
+            anchor.style.scale3.z.max(0.001),
+        );
         let base_oblique = if anchor.style.depth > 0.0 {
             Quat::from_rotation_y(0.75) * Quat::from_rotation_x(0.35)
         } else {
             Quat::IDENTITY
         };
+        let explicit_rotation = Quat::from_euler(
+            EulerRot::XYZ,
+            anchor.style.rotation.x.to_radians(),
+            anchor.style.rotation.y.to_radians(),
+            anchor.style.rotation.z.to_radians(),
+        );
         let (spin, tilt, bob) = if anchor.style.animate {
             (
                 elapsed_secs * app_config.cursor.animation.spin_speed,
@@ -830,17 +841,19 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
         } else {
             (0.0, 0.0, 0.0)
         };
+        let animated_rotation = Quat::from_rotation_y(spin) * Quat::from_rotation_x(tilt);
+        let object_rotation = base_oblique * explicit_rotation * animated_rotation;
+        let object_scale = Vec3::splat(scale) * scale3;
 
         match presentation.mode {
             TerminalPresentationMode::Flat2d => {
                 transform.translation = Vec3::new(
-                    layout.center_x,
-                    layout.center_y + bob,
-                    CURSOR_DEPTH + anchor.style.depth * 4.0,
+                    layout.center_x + anchor.style.offset.x,
+                    layout.center_y + bob + anchor.style.offset.y,
+                    CURSOR_DEPTH + anchor.style.depth * 4.0 + anchor.style.offset.z,
                 );
-                transform.rotation =
-                    base_oblique * Quat::from_rotation_y(spin) * Quat::from_rotation_x(tilt);
-                transform.scale = Vec3::splat(scale);
+                transform.rotation = object_rotation;
+                transform.scale = object_scale;
                 *visibility = Visibility::Visible;
             }
             TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
@@ -856,11 +869,10 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
                     elapsed_secs,
                     8.0 + anchor.style.depth * 1.5,
                     mobius_progress,
-                );
+                ) + anchor.style.offset;
                 transform.translation = plane_transform.transform_point(local_position);
-                transform.rotation = plane_transform.rotation
-                    * (base_oblique * Quat::from_rotation_y(spin) * Quat::from_rotation_x(tilt));
-                transform.scale = Vec3::splat(scale);
+                transform.rotation = plane_transform.rotation * object_rotation;
+                transform.scale = object_scale;
                 *visibility = Visibility::Visible;
             }
         }
