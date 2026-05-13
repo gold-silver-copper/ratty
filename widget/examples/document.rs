@@ -329,7 +329,7 @@ impl<'a> TempleEditor<'a> {
 
         for (name, row, col, width, height, scale) in presets {
             if self.asset_pool.iter().any(|asset| asset == name) {
-                let path = Box::leak(format!("widget/assets/{name}").into_boxed_str());
+                let path = format!("widget/assets/{name}");
                 let id = self.next_object_id;
                 self.next_object_id += 1;
                 self.insert_object(ObjectPlacement {
@@ -356,7 +356,7 @@ impl<'a> TempleEditor<'a> {
             .map(|duration| duration.as_nanos() as usize)
             .unwrap_or(0);
         let asset = self.asset_pool[nanos % self.asset_pool.len()].clone();
-        let path = Box::leak(format!("widget/assets/{asset}").into_boxed_str());
+        let path = format!("widget/assets/{asset}");
         let row = self.cursor_row;
         let col = self.cursor_col;
         let id = self.next_object_id;
