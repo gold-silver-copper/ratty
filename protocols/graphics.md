@@ -65,7 +65,7 @@ ESC _ ratty;g;s ESC \
 Ratty replies:
 
 ```text
-ESC _ ratty;g;s;v=1;fmt=obj|glb;path=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1 ESC \
+ESC _ ratty;g;s;v=1;fmt=obj|glb;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1 ESC \
 ```
 
 Fields:
@@ -73,6 +73,8 @@ Fields:
 - `v=1`: protocol version
 - `fmt=glb`: `obj` and `glb` are supported
 - `path=1`: path-based object registration is supported
+- `payload=1`: payload-based asset registration is supported
+- `chunk=1`: chunked payload-based registration is supported
 - `anim=1`: `animate=1` placement is supported
 - `depth=1`: `depth=<f32>` placement is supported
 - `color=1`: `color=<RRGGBB>` placement is supported
@@ -94,11 +96,53 @@ ESC _ ratty;g;r;id=42;fmt=obj;path=CairoSpinyMouse.obj ESC \
 
 This registers object `42` using an object asset.
 
-#### Required fields
+The required fields are:
 
 - `id`: object id chosen by the application
 - `fmt`: payload format, `obj` or `glb` in v1
 - `path`: object path known to Ratty
+
+#### Payload-based registration
+
+RGP can also register an object by embedding the asset data directly into the
+register command as a payload. This is intended for cases such as SSH, where
+the sending application cannot rely on a shared filesystem path on the terminal
+side.
+
+The payload is base64-encoded and appended after the semicolon-separated
+header fields.
+
+Client sends:
+
+```text
+ESC _ ratty;g;r;id=42;fmt=obj;source=payload;more=0;name=rat.obj;<base64 payload> ESC \
+```
+
+For larger assets, the payload can be split across multiple register chunks:
+
+```text
+ESC _ ratty;g;r;id=42;fmt=glb;source=payload;more=1;<chunk-1> ESC \
+ESC _ ratty;g;r;id=42;fmt=glb;source=payload;more=1;<chunk-2> ESC \
+ESC _ ratty;g;r;id=42;fmt=glb;source=payload;more=0;<chunk-n> ESC \
+```
+
+Fields:
+
+- `id`: object id chosen by the application
+- `fmt`: payload format, `obj` or `glb`
+- `source`: registration source
+  - `payload`: asset bytes are carried in this command
+- `more`: continuation flag
+  - `1`: more register chunks follow for this object id
+  - `0`: this is the final chunk and registration can be finalized
+- `name`: optional source name for diagnostics and temporary asset naming
+
+The terminal accumulates chunks for the same `id` until it receives the final
+`more=0` chunk. At that point, the object becomes registered and can be placed
+normally.
+
+Path-based and payload-based registration are additive modes of the same `r` verb.
+Clients may continue using `path=...` exactly as before.
 
 ### 3. Place Object
 
