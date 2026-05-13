@@ -73,7 +73,7 @@ Fields:
 - `v=1`: protocol version
 - `fmt=glb`: `obj` and `glb` are supported
 - `path=1`: path-based object registration is supported
-- `anim=1`: `animate=1` placement is supported for v1 compatibility
+- `anim=1`: `animate=1` placement is supported
 - `depth=1`: `depth=<f32>` placement is supported
 - `color=1`: `color=<RRGGBB>` placement is supported
 - `brightness=1`: `brightness=<f32>` placement is supported
