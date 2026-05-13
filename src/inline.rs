@@ -396,9 +396,7 @@ impl TerminalInlineObjects {
             return None;
         }
 
-        let Some(pending) = self.pending_rgp_payloads.remove(&object_id) else {
-            return None;
-        };
+        let pending = self.pending_rgp_payloads.remove(&object_id)?;
         info!(
             "finalizing RGP payload for object {} (format={}, total={} bytes)",
             object_id,
