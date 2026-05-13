@@ -166,6 +166,8 @@ pub fn load_object_source_from_bytes(
         "obj" => load_obj_meshes_from_bytes(display_name, bytes)
             .map(|meshes| (format!("payload:{display_name}"), ObjectSource::Obj(meshes))),
         "glb" | "gltf" => {
+            // Bevy scene loading still goes through the asset server, so payload-backed GLB/GLTF
+            // assets need to be materialized under the asset root before they can be instantiated.
             let extension = if format == "gltf" { "gltf" } else { "glb" };
             let stem = Path::new(display_name)
                 .file_stem()
