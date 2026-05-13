@@ -1,5 +1,7 @@
 //! Ratty Graphics Protocol parsing.
 
+use base64::Engine as _;
+
 /// Ratty Graphics Protocol APC prefix.
 pub const RGP_APC_START: &[u8] = b"\x1b_ratty;g;";
 const ST: &[u8] = b"\x1b\\";
@@ -47,6 +49,24 @@ pub struct RgpPlacementUpdate {
     pub scale3: [Option<f32>; 3],
 }
 
+/// Register source for an RGP object.
+pub enum RgpRegisterSource {
+    /// Path-based object registration.
+    Path {
+        /// Asset path known to Ratty.
+        path: String,
+    },
+    /// Payload-based object registration.
+    Payload {
+        /// Optional payload name.
+        name: Option<String>,
+        /// Whether more chunks follow.
+        more: bool,
+        /// Decoded payload bytes.
+        data: Vec<u8>,
+    },
+}
+
 /// Consumes an RGP APC sequence.
 pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
     if !sequence.starts_with(RGP_APC_START) {
@@ -66,6 +86,9 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
     let mut id = None;
     let mut format = None;
     let mut path = None;
+    let mut source = None;
+    let mut more = None;
+    let mut name = None;
     let mut row = None;
     let mut col = None;
     let mut width = None;
@@ -84,14 +107,22 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
     let mut sx = None;
     let mut sy = None;
     let mut sz = None;
+    let mut payload = None;
     for part in parts.filter(|part| !part.is_empty()) {
         let Some((key, value)) = part.split_once('=') else {
+            if verb == "r" && source.as_deref() == Some("payload") {
+                payload = Some(part.to_string());
+                break;
+            }
             continue;
         };
         match key {
             "id" => id = value.parse().ok(),
             "fmt" => format = Some(value.to_string()),
             "path" => path = Some(value.to_string()),
+            "source" => source = Some(value.to_string()),
+            "more" => more = parse_bool(value),
+            "name" => name = Some(value.to_string()),
             "row" => row = value.parse().ok(),
             "col" => col = value.parse().ok(),
             "w" => width = value.parse().ok(),
@@ -110,6 +141,10 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
             "sx" => sx = value.parse().ok(),
             "sy" => sy = value.parse().ok(),
             "sz" => sz = value.parse().ok(),
+            _ if verb == "r" && source.as_deref() == Some("payload") => {
+                payload = Some(part.to_string());
+                break;
+            }
             _ => {}
         }
     }
@@ -119,7 +154,21 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
         "r" => Some(RgpOperation::Register {
             object_id: id?,
             format: format?,
-            path: path?,
+            source: if let Some(path) = path {
+                RgpRegisterSource::Path { path }
+            } else {
+                if source.as_deref() != Some("payload") {
+                    return None;
+                }
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(payload.unwrap_or_default())
+                    .ok()?;
+                RgpRegisterSource::Payload {
+                    name,
+                    more: more.unwrap_or(false),
+                    data,
+                }
+            },
         }),
         "p" => Some(RgpOperation::Place {
             object_id: id?,
@@ -183,8 +232,8 @@ pub enum RgpOperation {
         object_id: u32,
         /// Declared object format.
         format: String,
-        /// Asset path.
-        path: String,
+        /// Register source.
+        source: RgpRegisterSource,
     },
     /// Object placement.
     Place {
@@ -211,7 +260,7 @@ pub enum RgpOperation {
 
 /// Returns the RGP support reply sequence.
 pub fn support_reply() -> Vec<u8> {
-    b"\x1b_ratty;g;s;v=1;fmt=obj|glb;path=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1\x1b\\".to_vec()
+    b"\x1b_ratty;g;s;v=1;fmt=obj|glb;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1\x1b\\".to_vec()
 }
 
 fn parse_color(value: &str) -> Option<[u8; 3]> {

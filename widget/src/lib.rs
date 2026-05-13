@@ -1,9 +1,12 @@
 #![doc = include_str!("../README.md")]
 
+use base64::Engine as _;
 use ratatui_core::{buffer::Buffer, layout::Rect, widgets::Widget};
 use std::borrow::Cow;
 use std::io::{self, Write};
 use std::path::Path;
+
+const PAYLOAD_CHUNK_SIZE: usize = 3072;
 
 /// Object asset format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +34,13 @@ impl ObjectFormat {
         {
             Some("obj") => Self::Obj,
             _ => Self::Glb,
+        }
+    }
+
+    fn payload_name(self) -> &'static str {
+        match self {
+            Self::Obj => "payload.obj",
+            Self::Glb => "payload.glb",
         }
     }
 }
@@ -173,6 +183,62 @@ impl<'a> RattyGraphic<'a> {
         )
     }
 
+    /// Returns the RGP register sequences for a payload-backed asset.
+    pub fn register_payload_sequences(&self, bytes: &[u8]) -> Vec<String> {
+        self.register_payload_sequences_with_name(bytes, None)
+    }
+
+    /// Returns the RGP register sequences for a payload-backed asset with an explicit source name.
+    pub fn register_payload_sequences_with_name(
+        &self,
+        bytes: &[u8],
+        name: Option<&str>,
+    ) -> Vec<String> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let default_name = Path::new(self.settings.path.as_ref())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.settings.format.payload_name());
+        let name = name.unwrap_or(default_name);
+        let mut sequences = Vec::new();
+
+        for (index, chunk_start) in (0..encoded.len()).step_by(PAYLOAD_CHUNK_SIZE).enumerate() {
+            let chunk_end = (chunk_start + PAYLOAD_CHUNK_SIZE).min(encoded.len());
+            let more = u8::from(chunk_end < encoded.len());
+            let chunk = &encoded[chunk_start..chunk_end];
+            sequences.push(if index == 0 {
+                format!(
+                    "\x1b_ratty;g;r;id={};fmt={};source=payload;more={};name={};{}\x1b\\",
+                    self.settings.id,
+                    self.settings.format.as_str(),
+                    more,
+                    name,
+                    chunk
+                )
+            } else {
+                format!(
+                    "\x1b_ratty;g;r;id={};fmt={};source=payload;more={};{}\x1b\\",
+                    self.settings.id,
+                    self.settings.format.as_str(),
+                    more,
+                    chunk
+                )
+            });
+        }
+
+        if sequences.is_empty() {
+            sequences.push(format!(
+                "\x1b_ratty;g;r;id={};fmt={};source=payload;more=0;name={};\x1b\\",
+                self.settings.id,
+                self.settings.format.as_str(),
+                name,
+            ));
+        }
+
+        sequences
+    }
+
     /// Writes the RGP register sequence to stdout.
     ///
     /// # Errors
@@ -181,6 +247,28 @@ impl<'a> RattyGraphic<'a> {
     pub fn register(&self) -> io::Result<()> {
         io::stdout().write_all(self.register_sequence().as_bytes())?;
         io::stdout().flush()
+    }
+
+    /// Writes the RGP register sequences for a payload-backed asset to stdout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if stdout cannot be written or flushed.
+    pub fn register_payload(&self, bytes: &[u8]) -> io::Result<()> {
+        self.register_payload_with_name(bytes, None)
+    }
+
+    /// Writes the RGP register sequences for a payload-backed asset to stdout with an explicit source name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if stdout cannot be written or flushed.
+    pub fn register_payload_with_name(&self, bytes: &[u8], name: Option<&str>) -> io::Result<()> {
+        let mut stdout = io::stdout();
+        for sequence in self.register_payload_sequences_with_name(bytes, name) {
+            stdout.write_all(sequence.as_bytes())?;
+        }
+        stdout.flush()
     }
 
     /// Returns the RGP place sequence for an area.

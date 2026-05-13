@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeSet,
-    env, fs, io,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeSet, io};
 
 use crossterm::{
     event::{
@@ -52,24 +48,12 @@ struct DrawingApp<'a> {
     last_rotate_position: Option<Position>,
     points: BTreeSet<(u16, u16)>,
     preview: RattyGraphic<'a>,
-    preview_obj_path: PathBuf,
 }
 
 impl<'a> DrawingApp<'a> {
     fn new() -> io::Result<Self> {
-        let cwd = env::current_dir()?;
-        let relative_path = if cwd.file_name().and_then(|name| name.to_str()) == Some("widget") {
-            "../target/live_draw.obj"
-        } else {
-            "target/live_draw.obj"
-        };
-        let preview_obj_path = cwd.join(relative_path);
-        if let Some(parent) = preview_obj_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
         let preview = RattyGraphic::new(
-            RattyGraphicSettings::new(relative_path)
+            RattyGraphicSettings::new("live_draw.obj")
                 .id(700)
                 .format(ObjectFormat::Obj)
                 .animate(true)
@@ -87,7 +71,6 @@ impl<'a> DrawingApp<'a> {
             last_rotate_position: None,
             points: BTreeSet::new(),
             preview,
-            preview_obj_path,
         })
     }
 
@@ -271,8 +254,8 @@ impl<'a> DrawingApp<'a> {
             return self.preview.clear();
         }
 
-        write_obj(&self.preview_obj_path, &self.points)?;
-        self.preview.register()
+        let obj = write_obj(&self.points);
+        self.preview.register_payload(obj.as_bytes())
     }
 
     fn render(&mut self, frame: &mut Frame<'_>) {
@@ -411,7 +394,7 @@ impl<'a> DrawingApp<'a> {
     }
 }
 
-fn write_obj(path: &Path, points: &BTreeSet<(u16, u16)>) -> io::Result<()> {
+fn write_obj(points: &BTreeSet<(u16, u16)>) -> String {
     let mut out = String::new();
     let mut vertex = 1u32;
 
@@ -430,5 +413,5 @@ fn write_obj(path: &Path, points: &BTreeSet<(u16, u16)>) -> io::Result<()> {
         vertex += 4;
     }
 
-    fs::write(path, out)
+    out
 }

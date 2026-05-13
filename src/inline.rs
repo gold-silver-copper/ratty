@@ -8,10 +8,10 @@ use bevy::prelude::*;
 use vt100::Callbacks;
 
 use crate::kitty::{KittyOperation, KittyParserState, refresh_kitty_placeholder_anchors};
-use crate::model::{ObjectSource, load_object_source};
+use crate::model::{ObjectSource, load_object_source, load_object_source_from_bytes};
 use crate::rgp::{
-    RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, consume_sequence as consume_rgp_sequence,
-    support_reply,
+    RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, RgpRegisterSource,
+    consume_sequence as consume_rgp_sequence, support_reply,
 };
 const APC_START: &[u8] = b"\x1b_";
 const ST: &[u8] = b"\x1b\\";
@@ -36,6 +36,7 @@ pub struct TerminalRgpObject {
 #[derive(Resource, Default)]
 pub struct TerminalInlineObjects {
     pending_bytes: Vec<u8>,
+    pending_rgp_payloads: HashMap<u32, PendingRgpPayload>,
     kitty: KittyParserState,
     dirty: bool,
     last_viewport_size: Vec2,
@@ -154,12 +155,14 @@ impl TerminalInlineObjects {
     fn remove_object(&mut self, object_id: u32) {
         self.objects.remove(&object_id);
         self.anchors.remove(&object_id);
+        self.pending_rgp_payloads.remove(&object_id);
         self.dirty = true;
     }
 
     fn clear_objects(&mut self) {
         self.objects.clear();
         self.anchors.clear();
+        self.pending_rgp_payloads.clear();
         self.dirty = true;
     }
 
@@ -243,34 +246,44 @@ impl TerminalInlineObjects {
             RgpOperation::Register {
                 object_id,
                 format,
-                path,
+                source,
             } => {
                 if format != "obj" && format != "glb" {
                     warn!("unsupported RGP object format `{format}` for object {object_id}");
                     None
                 } else {
-                    match load_object_source(Path::new(&path)) {
-                        Ok((source, source_data)) => {
-                            info!("registered RGP object {} from {}", object_id, source,);
-                            self.objects.insert(
-                                object_id,
-                                InlineObject::RgpObject(match source_data {
-                                    ObjectSource::Obj(meshes) => RgpInlineObject::Obj {
-                                        meshes,
-                                        handles: None,
-                                    },
-                                    ObjectSource::Gltf(asset_path) => RgpInlineObject::Gltf {
-                                        asset_path,
-                                        handle: None,
-                                    },
-                                }),
-                            );
-                            self.dirty = true;
-                            None
+                    match source {
+                        RgpRegisterSource::Path { path } => {
+                            self.pending_rgp_payloads.remove(&object_id);
+                            match load_object_source(Path::new(&path)) {
+                                Ok((source, source_data)) => {
+                                    info!("registered RGP object {} from {}", object_id, source);
+                                    self.objects.insert(
+                                        object_id,
+                                        InlineObject::RgpObject(match source_data {
+                                            ObjectSource::Obj(meshes) => RgpInlineObject::Obj {
+                                                meshes,
+                                                handles: None,
+                                            },
+                                            ObjectSource::Gltf(asset_path) => {
+                                                RgpInlineObject::Gltf {
+                                                    asset_path,
+                                                    handle: None,
+                                                }
+                                            }
+                                        }),
+                                    );
+                                    self.dirty = true;
+                                    None
+                                }
+                                Err(error) => {
+                                    warn!("failed to load RGP object {object_id}: {error:#}");
+                                    None
+                                }
+                            }
                         }
-                        Err(error) => {
-                            warn!("failed to load RGP object {object_id}: {error:#}");
-                            None
+                        RgpRegisterSource::Payload { name, more, data } => {
+                            self.handle_rgp_payload_chunk(object_id, &format, name, more, data)
                         }
                     }
                 }
@@ -343,6 +356,87 @@ impl TerminalInlineObjects {
             self.anchors.remove(&object_id);
         }
     }
+
+    // Buffers chunked payload registrations until the final chunk arrives, then loads and registers the object.
+    fn handle_rgp_payload_chunk(
+        &mut self,
+        object_id: u32,
+        format: &str,
+        name: Option<String>,
+        more: bool,
+        data: Vec<u8>,
+    ) -> Option<Vec<u8>> {
+        let pending = self
+            .pending_rgp_payloads
+            .entry(object_id)
+            .or_insert_with(|| PendingRgpPayload {
+                format: format.to_string(),
+                name: name.clone(),
+                data: Vec::new(),
+            });
+        if pending.format != format {
+            warn!(
+                "ignoring RGP payload chunk for object {} due to format mismatch ({} vs {})",
+                object_id, pending.format, format
+            );
+            return None;
+        }
+        if pending.name.is_none() {
+            pending.name = name;
+        }
+        pending.data.extend_from_slice(&data);
+        info!(
+            "received RGP payload chunk for object {} (format={}, accumulated={} bytes, more={})",
+            object_id,
+            pending.format,
+            pending.data.len(),
+            more
+        );
+        if more {
+            return None;
+        }
+
+        let Some(pending) = self.pending_rgp_payloads.remove(&object_id) else {
+            return None;
+        };
+        info!(
+            "finalizing RGP payload for object {} (format={}, total={} bytes)",
+            object_id,
+            pending.format,
+            pending.data.len()
+        );
+        match load_object_source_from_bytes(&pending.format, pending.name.as_deref(), &pending.data)
+        {
+            Ok((source, source_data)) => {
+                info!("registered RGP object {} from {}", object_id, source);
+                self.objects.insert(
+                    object_id,
+                    InlineObject::RgpObject(match source_data {
+                        ObjectSource::Obj(meshes) => RgpInlineObject::Obj {
+                            meshes,
+                            handles: None,
+                        },
+                        ObjectSource::Gltf(asset_path) => RgpInlineObject::Gltf {
+                            asset_path,
+                            handle: None,
+                        },
+                    }),
+                );
+                self.dirty = true;
+                None
+            }
+            Err(error) => {
+                warn!("failed to load RGP object {object_id}: {error:#}");
+                None
+            }
+        }
+    }
+}
+
+struct PendingRgpPayload {
+    format: String,
+    name: Option<String>,
+    data: Vec<u8>,
 }
 
 fn normalize_hvp_sequences(bytes: &[u8]) -> Cow<'_, [u8]> {

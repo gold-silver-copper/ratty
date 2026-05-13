@@ -146,6 +146,50 @@ pub fn load_object_source(path: &Path) -> anyhow::Result<(String, ObjectSource)>
     }
 }
 
+/// Loads an object source from inline bytes.
+///
+/// # Errors
+///
+/// Returns an error if the payload cannot be parsed or materialized.
+pub fn load_object_source_from_bytes(
+    format: &str,
+    name: Option<&str>,
+    bytes: &[u8],
+) -> anyhow::Result<(String, ObjectSource)> {
+    let display_name = name.unwrap_or(match format {
+        "obj" => "payload.obj",
+        "glb" | "gltf" => "payload.glb",
+        _ => "payload",
+    });
+
+    match format {
+        "obj" => load_obj_meshes_from_bytes(display_name, bytes)
+            .map(|meshes| (format!("payload:{display_name}"), ObjectSource::Obj(meshes))),
+        "glb" | "gltf" => {
+            let extension = if format == "gltf" { "gltf" } else { "glb" };
+            let stem = Path::new(display_name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| !stem.is_empty())
+                .unwrap_or("payload");
+            let sanitized = stem
+                .chars()
+                .map(|c| match c {
+                    'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+                    _ => '_',
+                })
+                .collect::<String>();
+            let candidate = format!("objects/rgp/{sanitized}.{extension}");
+            let asset_path = ensure_scene_asset_path(&candidate, Some((display_name, bytes)))?;
+            Ok((
+                format!("payload:{display_name}"),
+                ObjectSource::Gltf(asset_path),
+            ))
+        }
+        _ => bail!("unsupported object format for {}", display_name),
+    }
+}
+
 fn ensure_scene_asset_path(
     candidate: &str,
     embedded: Option<(&str, &[u8])>,
