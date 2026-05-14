@@ -187,6 +187,10 @@ impl TerminalSurface {
             return;
         }
 
+        if self.cols == cols && self.rows == rows {
+            return;
+        }
+
         self.tui.backend_mut().resize(cols, rows);
         let _ = self.tui.resize(Rect::new(0, 0, cols, rows));
         if self.cursor_model_visible {

@@ -190,7 +190,6 @@ pub(crate) struct ResizeParams<'w, 's> {
     plane_query:
         Query<'w, 's, &'static mut Transform, (With<TerminalPlane>, Without<TerminalSprite>)>,
     plane_back_query: PlaneBackResizeQuery<'w, 's>,
-    images: ResMut<'w, Assets<Image>>,
 }
 
 /// Handles primary window resize events.
@@ -199,8 +198,7 @@ pub(crate) struct ResizeParams<'w, 's> {
 /// [`TerminalRuntime`], [`TerminalSurface`], [`TerminalViewport`], the 2D terminal sprite and the
 /// front and back terminal plane transforms.
 ///
-/// The updated terminal image is uploaded immediately so later systems in the same frame see the
-/// new geometry.
+/// The updated terminal image is uploaded by the normal redraw system on the next update.
 pub(crate) fn handle_window_resize(
     mut resize_events: MessageReader<WindowResized>,
     mut params: ResizeParams,
@@ -214,7 +212,7 @@ pub(crate) fn handle_window_resize(
         sprite_query,
         plane_query,
         plane_back_query,
-        images,
+        ..
     } = &mut params;
     let Ok(primary_window) = primary_window.single() else {
         return;
@@ -241,7 +239,6 @@ pub(crate) fn handle_window_resize(
 
     runtime.resize(cols, rows);
     terminal.resize(cols, rows);
-    let _ = terminal.sync_image(images, 0.0);
     redraw.request();
 
     for mut sprite in sprite_query.iter_mut() {

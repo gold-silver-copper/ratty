@@ -299,6 +299,10 @@ impl TerminalRuntime {
             return;
         }
 
+        if self.parser.screen().size() == (rows, cols) {
+            return;
+        }
+
         let _ = self._master.resize(PtySize {
             rows,
             cols,
