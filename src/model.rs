@@ -107,6 +107,46 @@ pub fn spawn_cursor_model(
 ///
 /// Returns an error if the asset cannot be resolved or parsed.
 pub fn load_object_source(path: &Path) -> anyhow::Result<(String, ObjectSource)> {
+    if path.exists() {
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        return match extension.as_str() {
+            "obj" => load_obj_meshes_from_path(path)
+                .map(|meshes| (path.display().to_string(), ObjectSource::Obj(meshes))),
+            "glb" | "gltf" => {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let stem = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .filter(|stem| !stem.is_empty())
+                    .unwrap_or("external");
+                let sanitized = stem
+                    .chars()
+                    .map(|c| match c {
+                        'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+                        _ => '_',
+                    })
+                    .collect::<String>();
+                let candidate = format!("objects/external/{sanitized}.{extension}");
+                let asset_file = Path::new("assets").join(&candidate);
+                std::fs::create_dir_all(
+                    asset_file
+                        .parent()
+                        .context("scene asset path has no parent directory")?,
+                )?;
+                std::fs::write(&asset_file, &bytes)
+                    .with_context(|| format!("failed to materialize scene {}", path.display()))?;
+                Ok((path.display().to_string(), ObjectSource::Gltf(candidate)))
+            }
+            _ => bail!("unsupported object format for {}", path.display()),
+        };
+    }
+
     let candidate = object_asset_path(path)?;
     let extension = Path::new(&candidate)
         .extension()
