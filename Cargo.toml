@@ -41,7 +41,7 @@ bevy = { version = "0.18.1", default-features = false, features = [
 clap = { version = "4.5", features = ["derive"] }
 etcetera = "0.11"
 image = { version = "0.25", default-features = false, features = ["png"] }
-parley_ratatui = "0.2.0"
+parley_ratatui = "0.2.1"
 pollster = "0.4"
 portable-pty = "0.8"
 ratatui = "0.30"
