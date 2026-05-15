@@ -108,9 +108,9 @@ type PlaneBackResizeQuery<'w, 's> = Query<
 
 const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
-#[derive(Resource)]
 /// Tracks the most recent window resize event so PTY/grid resizing can be deferred until the
 /// resize stream settles.
+#[derive(Resource)]
 pub struct PendingTerminalResize {
     latest_size: Option<Vec2>,
     last_event: Option<Instant>,
