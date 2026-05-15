@@ -240,7 +240,8 @@ pub fn setup_scene(
     let pixmap_width = pixmap.x;
     let pixmap_height = pixmap.y;
 
-    let mut image = create_terminal_image(pixmap_width, pixmap_height, [0, 0, 0, 255]);
+    let terminal_alpha = (terminal_opacity * 255.0).round() as u8;
+    let mut image = create_terminal_image(pixmap_width, pixmap_height, [0, 0, 0, 0]);
     image.data = Some(vec![0; (pixmap_width * pixmap_height * 4) as usize]);
 
     let image_handle = images.add(image);
@@ -254,7 +255,7 @@ pub fn setup_scene(
             r.saturating_sub(13),
             g.saturating_sub(11),
             b.saturating_sub(3),
-            255,
+            terminal_alpha,
         ],
     );
     let back_image_handle = images.add(back_image);
