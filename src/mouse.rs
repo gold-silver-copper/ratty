@@ -32,6 +32,11 @@ pub(crate) struct ForwardedMouseState {
     last_cell: Option<UVec2>,
 }
 
+#[derive(Default)]
+pub(crate) struct LocalScrollState {
+    pixel_remainder: f32,
+}
+
 /// Normalized selection bounds.
 #[derive(Copy, Clone)]
 pub struct SelectionBounds {
@@ -181,7 +186,7 @@ impl TerminalSelection {
 #[derive(SystemParam)]
 pub struct MouseSystemParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
-    runtime: NonSend<'w, TerminalRuntime>,
+    runtime: NonSendMut<'w, TerminalRuntime>,
     terminal: NonSend<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
@@ -198,6 +203,7 @@ pub(crate) fn handle_mouse_input(
     mut wheel_events: MessageReader<MouseWheel>,
     mut params: MouseSystemParams,
     mut forwarded_mouse: Local<ForwardedMouseState>,
+    mut local_scroll: Local<LocalScrollState>,
 ) {
     let MouseSystemParams {
         primary_window,
@@ -432,6 +438,28 @@ pub(crate) fn handle_mouse_input(
                     false,
                     mouse_encoding,
                 ));
+            }
+        } else if presentation.mode == TerminalPresentationMode::Flat2d
+            && !runtime.parser.screen().alternate_screen()
+        {
+            let amount = match event.unit {
+                MouseScrollUnit::Line => event.y.round() as isize,
+                MouseScrollUnit::Pixel => {
+                    let char_height = terminal.char_dimensions().y.max(1) as f32;
+                    local_scroll.pixel_remainder += event.y / char_height;
+                    let amount = local_scroll.pixel_remainder.trunc() as isize;
+                    local_scroll.pixel_remainder -= amount as f32;
+                    amount
+                }
+            };
+
+            if amount != 0 {
+                let screen = runtime.parser.screen_mut();
+                let current = screen.scrollback() as isize;
+                let next = (current + amount).max(0) as usize;
+                screen.set_scrollback(next);
+                selection.clear();
+                redraw.request();
             }
         } else if matches!(
             presentation.mode,
