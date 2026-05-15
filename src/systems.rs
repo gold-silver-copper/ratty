@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::TryRecvError;
+use std::time::{Duration, Instant};
 
 use crate::config::{AppConfig, CURSOR_DEPTH};
 use crate::inline::{
@@ -105,6 +106,25 @@ type PlaneBackResizeQuery<'w, 's> = Query<
     ),
 >;
 
+const RESIZE_SETTLE_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Resource)]
+/// Tracks the most recent window resize event so PTY/grid resizing can be deferred until the
+/// resize stream settles.
+pub struct PendingTerminalResize {
+    latest_size: Option<Vec2>,
+    last_event: Option<Instant>,
+}
+
+impl Default for PendingTerminalResize {
+    fn default() -> Self {
+        Self {
+            latest_size: None,
+            last_event: None,
+        }
+    }
+}
+
 /// Pumps PTY output into the terminal parser.
 ///
 /// This runs early in the update schedule, before [`redraw_soft_terminal`]. It drains PTY output
@@ -182,9 +202,6 @@ fn infer_upward_scroll(prev_rows: &[String], next_rows: &[String]) -> u16 {
 #[derive(SystemParam)]
 pub(crate) struct ResizeParams<'w, 's> {
     primary_window: Query<'w, 's, Entity, With<PrimaryWindow>>,
-    runtime: NonSendMut<'w, TerminalRuntime>,
-    terminal: NonSendMut<'w, TerminalSurface>,
-    redraw: ResMut<'w, TerminalRedrawState>,
     viewport: ResMut<'w, TerminalViewport>,
     sprite_query: Query<'w, 's, &'static mut Sprite, With<TerminalSprite>>,
     plane_query:
@@ -194,20 +211,17 @@ pub(crate) struct ResizeParams<'w, 's> {
 
 /// Handles primary window resize events.
 ///
-/// This updates both the PTY grid and the rendered scene dimensions. It resizes
-/// [`TerminalRuntime`], [`TerminalSurface`], [`TerminalViewport`], the 2D terminal sprite and the
-/// front and back terminal plane transforms.
+/// This updates the visible terminal geometry immediately and records the latest size for a
+/// deferred PTY/grid resize once the resize stream settles.
 ///
 /// The updated terminal image is uploaded by the normal redraw system on the next update.
 pub(crate) fn handle_window_resize(
     mut resize_events: MessageReader<WindowResized>,
     mut params: ResizeParams,
+    mut pending_resize: ResMut<PendingTerminalResize>,
 ) {
     let ResizeParams {
         primary_window,
-        runtime,
-        terminal,
-        redraw,
         viewport,
         sprite_query,
         plane_query,
@@ -232,14 +246,8 @@ pub(crate) fn handle_window_resize(
     let viewport_size = Vec2::new(window_size.x.max(1.0), window_size.y.max(1.0));
     viewport.size = viewport_size;
     viewport.center = Vec2::ZERO;
-
-    let char_dims = terminal.char_dimensions().max(UVec2::ONE);
-    let cols = ((viewport_size.x / char_dims.x as f32).floor() as u16).max(1);
-    let rows = ((viewport_size.y / char_dims.y as f32).floor() as u16).max(1);
-
-    runtime.resize(cols, rows);
-    terminal.resize(cols, rows);
-    redraw.request();
+    pending_resize.latest_size = Some(viewport_size);
+    pending_resize.last_event = Some(Instant::now());
 
     for mut sprite in sprite_query.iter_mut() {
         sprite.custom_size = Some(viewport_size);
@@ -252,6 +260,35 @@ pub(crate) fn handle_window_resize(
     for mut transform in plane_back_query.iter_mut() {
         transform.scale = viewport_size.extend(1.0);
     }
+}
+
+/// Applies a deferred PTY/grid resize after window resize events settle.
+pub(crate) fn apply_pending_terminal_resize(
+    mut pending_resize: ResMut<PendingTerminalResize>,
+    mut runtime: NonSendMut<TerminalRuntime>,
+    mut terminal: NonSendMut<TerminalSurface>,
+    mut redraw: ResMut<TerminalRedrawState>,
+) {
+    let Some(last_event) = pending_resize.last_event else {
+        return;
+    };
+    if last_event.elapsed() < RESIZE_SETTLE_DELAY {
+        return;
+    }
+
+    let Some(window_size) = pending_resize.latest_size.take() else {
+        pending_resize.last_event = None;
+        return;
+    };
+    pending_resize.last_event = None;
+
+    let char_dims = terminal.char_dimensions().max(UVec2::ONE);
+    let cols = ((window_size.x / char_dims.x as f32).floor() as u16).max(1);
+    let rows = ((window_size.y / char_dims.y as f32).floor() as u16).max(1);
+
+    runtime.resize(cols, rows);
+    terminal.resize(cols, rows);
+    redraw.request();
 }
 
 /// Applies inline object visibility for the current presentation mode.

@@ -7,9 +7,10 @@ use crate::keyboard::{TerminalClipboard, TerminalKeyBindings, handle_keyboard_in
 use crate::mouse::{TerminalSelection, handle_mouse_input};
 use crate::scene::{apply_terminal_presentation, setup_scene};
 use crate::systems::{
-    animate_mobius_transition, animate_terminal_plane_warp, apply_inline_objects,
-    apply_instance_brightness, handle_window_resize, pump_pty_output, redraw_soft_terminal,
-    sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects,
+    PendingTerminalResize, animate_mobius_transition, animate_terminal_plane_warp,
+    apply_inline_objects, apply_instance_brightness, apply_pending_terminal_resize,
+    handle_window_resize, pump_pty_output, redraw_soft_terminal, sync_asset_to_terminal_cursor,
+    sync_inline_objects, sync_rgp_objects,
 };
 use crate::terminal::TerminalRedrawState;
 
@@ -20,6 +21,7 @@ impl Plugin for TerminalPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TerminalSelection>()
             .init_resource::<TerminalInlineObjects>()
+            .init_resource::<PendingTerminalResize>()
             .init_resource::<TerminalRedrawState>()
             .init_resource::<TerminalKeyBindings>()
             .init_non_send_resource::<TerminalClipboard>()
@@ -28,6 +30,10 @@ impl Plugin for TerminalPlugin {
             .add_systems(Update, handle_keyboard_input)
             .add_systems(Update, handle_mouse_input)
             .add_systems(Update, handle_window_resize)
+            .add_systems(
+                Update,
+                apply_pending_terminal_resize.after(handle_window_resize),
+            )
             .add_systems(
                 Update,
                 apply_terminal_presentation
