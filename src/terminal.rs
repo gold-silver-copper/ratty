@@ -312,7 +312,14 @@ fn build_terminal_renderer(
         ),
         palette,
     };
-    let font_options = FontOptions::default().with_family(font.family.clone());
+    let font_options = FontOptions::default()
+        .with_family(font.family.clone())
+        .with_fallback_family("Apple Symbols")
+        .with_fallback_family("Arial Unicode MS")
+        .with_fallback_family("Noto Sans Symbols 2")
+        .with_fallback_family("Noto Sans Symbols")
+        .with_fallback_family("Symbola")
+        .with_fallback_family("Segoe UI Symbol");
     TerminalRenderer::new(
         FontOptions {
             size: font.size as f32,
