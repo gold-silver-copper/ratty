@@ -4,6 +4,8 @@ mod mobius;
 
 pub use mobius::{MobiusTransition, MobiusTransitionDirection};
 
+use std::f32::consts::PI;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::ClearColorConfig;
 use bevy::ecs::query::With;
@@ -227,10 +229,10 @@ pub fn setup_scene(
             clear_color: ClearColorConfig::None,
             ..default()
         },
-        Projection::Orthographic(OrthographicProjection {
+        Projection::Perspective(PerspectiveProjection {
             near: -2000.0,
             far: 2000.0,
-            ..OrthographicProjection::default_3d()
+            ..PerspectiveProjection::default()
         }),
         Transform::from_xyz(0.0, 0.0, 800.0).looking_at(Vec3::ZERO, Vec3::Y),
         Msaa::Off,
@@ -462,13 +464,13 @@ pub(crate) fn apply_terminal_presentation(
     }
 
     for (mut projection, mut transform) in &mut plane_transforms.p2() {
-        if let Projection::Orthographic(ortho) = projection.as_mut() {
+        if let Projection::Perspective(persp) = projection.as_mut() {
             let zoom = if is_mobius && mobius_transition.active {
                 mobius_transition.current_zoom()
             } else {
                 plane_view.zoom
             };
-            ortho.scale = if is_3d { zoom } else { 1.0 };
+            persp.fov = if is_3d { zoom } else { 1.0 };
         }
 
         let offset = if is_3d {
