@@ -202,9 +202,12 @@ pub enum BindingAction {
     /// Disables a binding.
     #[serde(rename = "none")]
     None,
-    /// Toggles between the flat and warped terminal views.
-    #[serde(rename = "Toggle3DMode")]
-    Toggle3DMode,
+    /// Toggles between the flat and orthographic terminal views.
+    #[serde(rename = "ToggleOrtho3DMode")]
+    ToggleOrtho3DMode,
+    /// Toggles the perspective terminal view.
+    #[serde(rename = "TogglePersp3DMode")]
+    TogglePersp3DMode,
     /// Toggles the Mobius-strip terminal view.
     #[serde(rename = "ToggleMobiusMode")]
     ToggleMobiusMode,

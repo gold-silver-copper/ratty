@@ -273,18 +273,8 @@ pub fn apply_inline_objects(
         ),
     >,
 ) {
-    let sprite_visibility = match presentation.mode {
-        TerminalPresentationMode::Flat2d => Visibility::Visible,
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-            Visibility::Hidden
-        }
-    };
-    let plane_visibility = match presentation.mode {
-        TerminalPresentationMode::Flat2d => Visibility::Hidden,
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-            Visibility::Visible
-        }
-    };
+    let sprite_visibility = if presentation.mode.is_3d() { Visibility::Visible } else { Visibility::Hidden };
+    let plane_visibility = if presentation.mode.is_3d() { Visibility::Hidden } else { Visibility::Visible };
 
     for mut visibility in &mut sprite_query {
         *visibility = sprite_visibility;
@@ -342,10 +332,7 @@ pub(crate) fn redraw_soft_terminal(mut params: RedrawParams) {
         asset_server,
     } = &mut params;
     let needs_redraw = redraw.take();
-    let force_live_redraw = matches!(
-        presentation.mode,
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-    ) && !app_config.cursor.model.visible;
+    let force_live_redraw = presentation.mode.is_3d() && !app_config.cursor.model.visible;
     if !needs_redraw && !force_live_redraw && model_load_state.loaded {
         return;
     }
@@ -369,18 +356,12 @@ pub(crate) fn redraw_soft_terminal(mut params: RedrawParams) {
     });
 
     let _ = terminal.sync_image(images, time.elapsed_secs());
-    if matches!(
-        presentation.mode,
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-    ) {
+    if presentation.mode.is_3d() {
         sync_terminal_debug_image(terminal, images, screen);
     }
 
     sync_plane_texture(terminal.image_handle.as_ref(), plane_materials, materials);
-    if matches!(
-        presentation.mode,
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-    ) {
+    if presentation.mode.is_3d() {
         sync_plane_texture(
             terminal.back_image_handle.as_ref(),
             plane_back_materials,
@@ -448,10 +429,7 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         images,
         meshes,
     } = &mut params;
-    let force_warp_sync = matches!(
-        presentation.mode,
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-    ) && plane_warp.amount > 0.0
+    let force_warp_sync = presentation.mode.is_3d() && plane_warp.amount > 0.0
         && !inline_objects.anchors.is_empty();
     if !force_warp_sync && !inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows) {
         return;
@@ -590,12 +568,7 @@ fn sync_kitty_inline_image(
         TerminalInlineObjectSprite,
         sprite,
         Transform::from_translation(Vec3::new(layout.center_x, layout.center_y, 5.0)),
-        match ctx.mode {
-            TerminalPresentationMode::Flat2d => Visibility::Visible,
-            TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-                Visibility::Hidden
-            }
-        },
+        if ctx.mode.is_3d() { Visibility::Visible } else { Visibility::Hidden },
     ));
 
     let x_segments = layout.columns.clamp(2, 24);
@@ -845,36 +818,33 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
         let object_rotation = base_oblique * explicit_rotation * animated_rotation;
         let object_scale = Vec3::splat(scale) * scale3;
 
-        match presentation.mode {
-            TerminalPresentationMode::Flat2d => {
-                transform.translation = Vec3::new(
-                    layout.center_x + anchor.style.offset.x,
-                    layout.center_y + bob + anchor.style.offset.y,
-                    CURSOR_DEPTH + anchor.style.depth * 4.0 + anchor.style.offset.z,
-                );
-                transform.rotation = object_rotation;
-                transform.scale = object_scale;
-                *visibility = Visibility::Visible;
-            }
-            TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-                let Ok(plane_transform) = plane_query.single() else {
-                    *visibility = Visibility::Hidden;
-                    continue;
-                };
-                let local_position = plane_surface_point(
-                    presentation.mode,
-                    layout.local_x,
-                    layout.local_y,
-                    plane_warp.amount,
-                    elapsed_secs,
-                    8.0 + anchor.style.depth * 1.5,
-                    mobius_progress,
-                ) + anchor.style.offset;
-                transform.translation = plane_transform.transform_point(local_position);
-                transform.rotation = plane_transform.rotation * object_rotation;
-                transform.scale = object_scale;
-                *visibility = Visibility::Visible;
-            }
+        if presentation.mode.is_3d() {
+            let Ok(plane_transform) = plane_query.single() else {
+                *visibility = Visibility::Hidden;
+                continue;
+            };
+            let local_position = plane_surface_point(
+                presentation.mode,
+                layout.local_x,
+                layout.local_y,
+                plane_warp.amount,
+                elapsed_secs,
+                8.0 + anchor.style.depth * 1.5,
+                mobius_progress,
+            ) + anchor.style.offset;
+            transform.translation = plane_transform.transform_point(local_position);
+            transform.rotation = plane_transform.rotation * object_rotation;
+            transform.scale = object_scale;
+            *visibility = Visibility::Visible;
+        } else {
+            transform.translation = Vec3::new(
+                layout.center_x + anchor.style.offset.x,
+                layout.center_y + bob + anchor.style.offset.y,
+                CURSOR_DEPTH + anchor.style.depth * 4.0 + anchor.style.offset.z,
+            );
+            transform.rotation = object_rotation;
+            transform.scale = object_scale;
+            *visibility = Visibility::Visible;
         }
     }
 }
@@ -1109,7 +1079,7 @@ pub fn animate_terminal_plane_warp(
 
     let needs_update = match presentation.mode {
         TerminalPresentationMode::Flat2d => false,
-        TerminalPresentationMode::Plane3d => {
+        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Persp3d => {
             presentation.is_changed() || warp.is_changed() || warp.amount > 0.0
         }
         // Reapply the strip every frame so mode switches and time-based motion are visible.
@@ -1216,7 +1186,7 @@ fn apply_plane_warp(
         position[1] = point.y;
         position[2] = match mode {
             TerminalPresentationMode::Plane3d => point.z * direction,
-            TerminalPresentationMode::Flat2d | TerminalPresentationMode::Mobius3d => point.z,
+            TerminalPresentationMode::Flat2d | TerminalPresentationMode::Mobius3d | TerminalPresentationMode::Persp3d => point.z,
         };
     }
 }
@@ -1309,17 +1279,17 @@ fn cursor_pose(
         0.0
     };
 
-    let (translation, rotation, visibility) = match ctx.mode {
-        TerminalPresentationMode::Flat2d => (
-            Vec3::new(local_x, local_y + bob, CURSOR_DEPTH),
-            Quat::from_rotation_y(spin) * Quat::from_rotation_x(-0.25),
-            if !app_config.cursor.model.visible || screen.hide_cursor() {
-                Visibility::Hidden
-            } else {
-                Visibility::Visible
-            },
-        ),
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
+    let (translation, rotation, visibility) = if ctx.mode.is_3d() {
+            (
+                Vec3::new(local_x, local_y + bob, CURSOR_DEPTH),
+                Quat::from_rotation_y(spin) * Quat::from_rotation_x(-0.25),
+                if !app_config.cursor.model.visible || screen.hide_cursor() {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Visible
+                },
+            )
+        } else {
             let Ok(plane_transform) = ctx.plane_query.single() else {
                 return (Vec3::ZERO, Quat::IDENTITY, scale, Visibility::Hidden);
             };
@@ -1344,7 +1314,6 @@ fn cursor_pose(
                     Visibility::Hidden
                 },
             )
-        }
     };
 
     (translation, rotation, scale, visibility)
@@ -1373,7 +1342,7 @@ fn plane_surface_point(
 ) -> Vec3 {
     match mode {
         TerminalPresentationMode::Flat2d => Vec3::new(local_x, local_y, depth_offset),
-        TerminalPresentationMode::Plane3d => Vec3::new(
+        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Persp3d => Vec3::new(
             local_x,
             local_y,
             plane_surface_z(local_x, local_y, warp_amount, elapsed_secs) + depth_offset,

@@ -4,8 +4,6 @@ mod mobius;
 
 pub use mobius::{MobiusTransition, MobiusTransitionDirection};
 
-use std::f32::consts::PI;
-
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::ClearColorConfig;
 use bevy::ecs::query::With;
@@ -73,6 +71,8 @@ pub enum TerminalPresentationMode {
     Flat2d,
     /// Warped 3D presentation.
     Plane3d,
+    /// Perspective 3D presentation.
+    Persp3d,
     /// Mobius-strip 3D presentation.
     Mobius3d,
 }
@@ -101,8 +101,18 @@ impl TerminalPresentation {
     pub fn toggle_plane_mode(&mut self) {
         self.mode = match self.mode {
             TerminalPresentationMode::Flat2d => TerminalPresentationMode::Plane3d,
-            TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
+            TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d | TerminalPresentationMode::Persp3d => {
                 TerminalPresentationMode::Flat2d
+            }
+        };
+    }
+
+    /// Toggles the Perspective projection terminal view.
+    pub fn toggle_persp_mode(&mut self) {
+        self.mode = match self.mode {
+            TerminalPresentationMode::Persp3d => TerminalPresentationMode::Flat2d,
+            TerminalPresentationMode::Flat2d | TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
+                TerminalPresentationMode::Persp3d
             }
         };
     }
@@ -111,7 +121,7 @@ impl TerminalPresentation {
     pub fn toggle_mobius_mode(&mut self) {
         self.mode = match self.mode {
             TerminalPresentationMode::Mobius3d => TerminalPresentationMode::Flat2d,
-            TerminalPresentationMode::Flat2d | TerminalPresentationMode::Plane3d => {
+            TerminalPresentationMode::Flat2d | TerminalPresentationMode::Plane3d | TerminalPresentationMode::Persp3d => {
                 TerminalPresentationMode::Mobius3d
             }
         };
@@ -173,7 +183,7 @@ type PlaneTransformQuery<'w, 's> = Query<'w, 's, &'static mut Transform, With<Te
 type PlaneBackTransformQuery<'w, 's> =
     Query<'w, 's, &'static mut Transform, With<TerminalPlaneBack>>;
 type PlaneCameraQuery<'w, 's> =
-    Query<'w, 's, (&'static mut Projection, &'static mut Transform), With<TerminalPlaneCamera>>;
+    Query<'w, 's, (&'static mut Projection, &'static mut Transform, &'static mut Camera), With<TerminalPlaneCamera>>;
 
 #[derive(SystemParam)]
 pub(crate) struct PresentationParams<'w, 's> {
@@ -237,6 +247,23 @@ pub fn setup_scene(
         Transform::from_xyz(0.0, 0.0, 800.0).looking_at(Vec3::ZERO, Vec3::Y),
         Msaa::Off,
     ));
+    commands.spawn((
+        TerminalPlaneCamera,
+        Camera3d::default(),
+        Camera {
+            order: 2,
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        Projection::Orthographic(OrthographicProjection {
+            near: -2000.0,
+            far: 2000.0,
+            ..OrthographicProjection::default_3d()
+        }),
+        Transform::from_xyz(0.0, 0.0, 800.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Msaa::Off,
+    ));
+
 
     let pixmap = terminal.pixmap_dimensions();
     let pixmap_width = pixmap.x;
@@ -463,14 +490,32 @@ pub(crate) fn apply_terminal_presentation(
         }
     }
 
-    for (mut projection, mut transform) in &mut plane_transforms.p2() {
+    for (mut projection, mut transform, mut camera) in &mut plane_transforms.p2() {
+        let active = &mut camera.is_active;
         if let Projection::Perspective(persp) = projection.as_mut() {
-            let zoom = if is_mobius && mobius_transition.active {
-                mobius_transition.current_zoom()
+            if presentation.mode == TerminalPresentationMode::Persp3d {
+                *active = true;
+                let zoom = if is_mobius && mobius_transition.active {
+                    mobius_transition.current_zoom()
+                } else {
+                    plane_view.zoom
+                };
+                persp.fov = if is_3d { zoom } else { 1.0 };
             } else {
-                plane_view.zoom
-            };
-            persp.fov = if is_3d { zoom } else { 1.0 };
+                *active = false;
+            }
+        } else if let Projection::Orthographic(ortho) = projection.as_mut() {
+            if presentation.mode != TerminalPresentationMode::Persp3d {
+                *active = true;
+                let zoom = if is_mobius && mobius_transition.active {
+                    mobius_transition.current_zoom()
+                } else {
+                    plane_view.zoom
+                };
+                ortho.scale = if is_3d { zoom } else { 1.0 };
+            } else {
+                *active = false;
+            }
         }
 
         let offset = if is_3d {

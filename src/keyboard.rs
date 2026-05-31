@@ -59,13 +59,22 @@ impl FromWorld for TerminalKeyBindings {
         let app_config = world.resource::<AppConfig>();
         let mut bindings = vec![
             KeyBinding::new(
-                KeyCode::Enter,
+                KeyCode::KeyO,
                 BindingModifiers {
                     control: true,
                     alt: true,
                     ..default()
                 },
-                BindingAction::Toggle3DMode,
+                BindingAction::ToggleOrtho3DMode,
+            ),
+            KeyBinding::new(
+                KeyCode::KeyP,
+                BindingModifiers {
+                    control: true,
+                    alt: true,
+                    ..default()
+                },
+                BindingAction::TogglePersp3DMode,
             ),
             KeyBinding::new(
                 KeyCode::KeyM,
@@ -353,8 +362,15 @@ pub fn handle_keyboard_input(
 
             match action {
                 BindingAction::None => {}
-                BindingAction::Toggle3DMode => {
+                BindingAction::ToggleOrtho3DMode => {
                     params.presentation.toggle_plane_mode();
+                    params.mobius_transition.stop();
+                    params.selection.clear();
+                    params.redraw.request();
+                    continue;
+                },
+                BindingAction::TogglePersp3DMode => {
+                    params.presentation.toggle_persp_mode();
                     params.mobius_transition.stop();
                     params.selection.clear();
                     params.redraw.request();

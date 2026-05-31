@@ -236,10 +236,7 @@ pub(crate) fn handle_mouse_input(
             continue;
         }
 
-        if matches!(
-            presentation.mode,
-            TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-        ) {
+        if presentation.mode.is_3d() {
             if plane_view.rotating {
                 if let Some(last) = plane_view.last_rotate_cursor {
                     let delta = event.position - last;
@@ -316,10 +313,7 @@ pub(crate) fn handle_mouse_input(
                         runtime.write_input(&encode_mouse_event(cell, 0, false, mouse_encoding));
                         forwarded_mouse.last_cell = Some(cell);
                     }
-                } else if matches!(
-                    presentation.mode,
-                    TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-                ) {
+                } else if presentation.mode.is_3d() {
                     plane_view.rotating = true;
                     plane_view.last_rotate_cursor = selection.cursor_position();
                 } else if let Some(pos) = selection.cursor_position()
@@ -340,10 +334,7 @@ pub(crate) fn handle_mouse_input(
                         runtime.write_input(&encode_mouse_event(cell, 0, true, mouse_encoding));
                         forwarded_mouse.last_cell = Some(cell);
                     }
-                } else if matches!(
-                    presentation.mode,
-                    TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-                ) {
+                } else if presentation.mode.is_3d() {
                     plane_view.rotating = false;
                     plane_view.last_rotate_cursor = selection.cursor_position();
                 } else {
@@ -395,19 +386,13 @@ pub(crate) fn handle_mouse_input(
                 }
             }
             (MouseButton::Right, ButtonState::Pressed)
-                if matches!(
-                    presentation.mode,
-                    TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-                ) =>
+                if presentation.mode.is_3d() =>
             {
                 plane_view.panning = true;
                 plane_view.last_pan_cursor = selection.cursor_position();
             }
             (MouseButton::Right, ButtonState::Released)
-                if matches!(
-                    presentation.mode,
-                    TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-                ) =>
+                if presentation.mode.is_3d() =>
             {
                 plane_view.panning = false;
                 plane_view.last_pan_cursor = selection.cursor_position();
@@ -461,10 +446,7 @@ pub(crate) fn handle_mouse_input(
                 selection.clear();
                 redraw.request();
             }
-        } else if matches!(
-            presentation.mode,
-            TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-        ) && delta != 0.0
+        } else if presentation.mode.is_3d() && delta != 0.0
         {
             plane_view.zoom = (plane_view.zoom - delta).clamp(0.1, 4.0);
             redraw.request();
