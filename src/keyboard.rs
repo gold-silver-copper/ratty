@@ -16,6 +16,7 @@ use crate::scene::{
     TerminalPresentationMode, TerminalViewport,
 };
 use crate::terminal::{TerminalRedrawState, TerminalSurface};
+use crate::inline::{TerminalCameraViewSlots};
 
 /// Clipboard bridge for terminal copy and paste.
 pub struct TerminalClipboard {
@@ -320,6 +321,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     selection: ResMut<'w, TerminalSelection>,
     plane_warp: ResMut<'w, TerminalPlaneWarp>,
     plane_view: ResMut<'w, TerminalPlaneView>,
+    camera_slots: Res<'w, TerminalCameraViewSlots>,
     presentation: ResMut<'w, TerminalPresentation>,
     mobius_transition: ResMut<'w, MobiusTransition>,
     clipboard: NonSendMut<'w, TerminalClipboard>,
@@ -337,6 +339,9 @@ pub fn handle_keyboard_input(
     mut keyboard: Local<TerminalKeyboard>,
     mut params: KeyboardSystemParams,
 ) {
+    params.presentation.mode = params.camera_slots.slots[params.camera_slots.current_slot].1.mode;
+    let view: &mut TerminalPlaneView = params.plane_view.as_mut();
+    *view = params.camera_slots.slots[params.camera_slots.current_slot].0;
     for event in keyboard_events.read() {
         let binding_key_code = navigation_key_code(&event.logical_key).unwrap_or(event.key_code);
         let modifiers = current_modifiers(&params.keys).union(keyboard.modifiers());

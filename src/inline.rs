@@ -13,6 +13,8 @@ use crate::rgp::{
     RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, RgpRegisterSource,
     consume_sequence as consume_rgp_sequence, support_reply,
 };
+use crate::scene::{ TerminalPlaneView, TerminalPresentation };
+
 const APC_START: &[u8] = b"\x1b_";
 const ST: &[u8] = b"\x1b\\";
 const C1_ST: u8 = 0x9c;
@@ -30,6 +32,15 @@ pub struct TerminalInlineObjectPlane;
 pub struct TerminalRgpObject {
     /// Registered object identifier.
     pub object_id: u32,
+}
+
+/// Holds the slots for the camera presets
+#[derive(Resource, Default)]
+pub struct TerminalCameraViewSlots {
+    /// The current slot in use
+    pub current_slot: usize,
+    /// The list of all slots, accessed with ctrl + alt + [0-9] or set through the Ratty Graphics Protocol
+    pub slots: [(TerminalPlaneView, TerminalPresentation); 10],
 }
 
 /// Inline object registry and anchor state.
@@ -52,6 +63,7 @@ impl TerminalInlineObjects {
         &mut self,
         chunk: &[u8],
         parser: &mut vt100::Parser<CB>,
+        camera_slots: &mut TerminalCameraViewSlots,
     ) -> Vec<Vec<u8>> {
         self.pending_bytes.extend_from_slice(chunk);
         let mut replies = Vec::new();
@@ -80,7 +92,7 @@ impl TerminalInlineObjects {
             };
             let sequence = self.pending_bytes[start..end].to_vec();
             let (handled, reply) =
-                self.handle_apc_sequence(&sequence, parser.screen().cursor_position());
+                self.handle_apc_sequence(&sequence, parser.screen().cursor_position(), camera_slots);
             if let Some(reply) = reply {
                 replies.push(reply);
             }
@@ -170,8 +182,9 @@ impl TerminalInlineObjects {
         &mut self,
         sequence: &[u8],
         cursor_position: (u16, u16),
+        camera_slots: &mut TerminalCameraViewSlots,
     ) -> (bool, Option<Vec<u8>>) {
-        if let Some(reply) = self.handle_rgp_sequence(sequence) {
+        if let Some(reply) = self.handle_rgp_sequence(sequence, camera_slots) {
             return (true, reply);
         }
 
@@ -239,10 +252,47 @@ impl TerminalInlineObjects {
         }
     }
 
-    fn handle_rgp_sequence(&mut self, sequence: &[u8]) -> Option<Option<Vec<u8>>> {
+    fn handle_rgp_sequence(&mut self,
+                           sequence: &[u8],
+                           camera_slots: &mut TerminalCameraViewSlots) -> Option<Option<Vec<u8>>> {
         let operation = consume_rgp_sequence(sequence)?;
         Some(match operation {
             RgpOperation::SupportQuery => Some(support_reply()),
+            RgpOperation::Camera {
+                camera_slot, switch_immediately, settings
+            } => {
+                //info!("camera settings for slot {}: set {}; rotation: ({},{},{})", camera_slot, switch_immediately, settings.rotation[0].unwrap_or(0.0), settings.rotation[1].unwrap_or(0.0), settings.rotation[2].unwrap_or(0.0));
+                if (camera_slot as usize) < camera_slots.slots.len() {
+                    if switch_immediately {
+                        camera_slots.current_slot = camera_slot as usize;
+                    }
+                    if let Some(ctype) = settings.camera_type {
+                        camera_slots.slots[camera_slot as usize].1 = TerminalPresentation { mode: ctype };
+                    }
+                    if let Some(px) = settings.offset[0] {
+                        camera_slots.slots[camera_slot as usize].0.camera_offset[0] = px;
+                    }
+                    if let Some(py) = settings.offset[1] {
+                        camera_slots.slots[camera_slot as usize].0.camera_offset[1] = py;
+                    }
+                    if let Some(pz) = settings.offset[2] {
+                        camera_slots.slots[camera_slot as usize].0.camera_offset[2] = pz;
+                    }
+                    if let Some(rx) = settings.rotation[0] {
+                        camera_slots.slots[camera_slot as usize].0.yaw = rx;
+                    }
+                    if let Some(_ry) = settings.rotation[1] {
+                        /*camera_slots.slots[camera_slot as usize].0.roll = ry;*/
+                    }
+                    if let Some(rz) = settings.rotation[2] {
+                        camera_slots.slots[camera_slot as usize].0.pitch = rz;
+                    }
+                    if let Some(scale) = settings.scale {
+                        camera_slots.slots[camera_slot as usize].0.zoom = scale;
+                    }
+                }
+                None
+            },
             RgpOperation::Register {
                 object_id,
                 format,

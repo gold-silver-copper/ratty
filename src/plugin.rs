@@ -25,8 +25,8 @@ impl Plugin for TerminalPlugin {
             .init_non_send_resource::<TerminalClipboard>()
             .add_systems(Startup, setup_scene)
             .add_systems(Update, pump_pty_output)
-            .add_systems(Update, handle_keyboard_input)
-            .add_systems(Update, handle_mouse_input)
+            .add_systems(Update, handle_keyboard_input.after(pump_pty_output))
+            .add_systems(Update, handle_mouse_input.after(handle_keyboard_input))
             .add_systems(Update, handle_window_resize)
             .add_systems(
                 Update,
@@ -42,7 +42,7 @@ impl Plugin for TerminalPlugin {
                 Update,
                 redraw_soft_terminal
                     .after(handle_mouse_input)
-                    .after(pump_pty_output),
+                    .after(pump_pty_output).after(apply_inline_objects),
             )
             .add_systems(Update, sync_inline_objects.after(redraw_soft_terminal))
             .add_systems(Update, sync_rgp_objects.after(sync_inline_objects))

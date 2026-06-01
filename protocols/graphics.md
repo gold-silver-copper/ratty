@@ -65,7 +65,7 @@ ESC _ ratty;g;s ESC \
 Ratty replies:
 
 ```text
-ESC _ ratty;g;s;v=1;fmt=obj|glb;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1 ESC \
+ESC _ ratty;g;s;v=1;fmt=obj|glb;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;camera=1;transform=1;update=1 ESC \
 ```
 
 Fields:
@@ -79,6 +79,7 @@ Fields:
 - `depth=1`: `depth=<f32>` placement is supported
 - `color=1`: `color=<RRGGBB>` placement is supported
 - `brightness=1`: `brightness=<f32>` placement is supported
+- `camera=1`: `c` camera updates are supported
 - `transform=1`: transform fields such as rotation and offsets are supported
 - `update=1`: `u` object updates are supported
 
@@ -209,6 +210,22 @@ Delete all Ratty graphics objects:
 ```text
 ESC _ ratty;g;d ESC \
 ```
+
+### 6. Camera controls
+
+Updates the rotation, transform or mode of a camera setting slot (there are 10 camera setting slots 0-9, they're the `id` field).
+
+```text
+ESC _ ratty;g;c;id=0;set=0;type=Ortho;px=0.25;scale=1.0 ESC \
+```
+
+- `set`: if 1, changes the current camera settings to those of the slot referred to by `id`. Defaults to 0.
+
+Optional fields (these camera settings will not be updated if the fields are not specified):
+- `type`: one of `Flat`, `Ortho`, `Persp`, `Mobius`.
+- `scale`: zoom/fov depending on the camera type, does nothing for `Flat` mode
+- `px`, `py`, `pz`: camera offset from terminal plane origin
+- `rx`, `ry`, `rz`: camera roll, pitch, yaw
 
 ## Example Session
 

@@ -15,6 +15,7 @@ use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFor
 
 use crate::config::AppConfig;
 use crate::terminal::TerminalSurface;
+use crate::inline::TerminalCameraViewSlots;
 
 /// Marker for the 2D terminal sprite.
 #[derive(Component)]
@@ -65,10 +66,10 @@ pub struct TerminalViewport {
 }
 
 /// Terminal presentation mode.
-#[derive(Resource, Clone, Copy, PartialEq, Eq)]
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerminalPresentationMode {
     /// Flat 2D presentation.
-    Flat2d,
+    #[default] Flat2d ,
     /// Warped 3D presentation.
     Plane3d,
     /// Perspective 3D presentation.
@@ -90,7 +91,7 @@ impl TerminalPresentationMode {
 }
 
 /// Active terminal presentation.
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct TerminalPresentation {
     /// Current presentation mode.
     pub mode: TerminalPresentationMode,
@@ -129,7 +130,7 @@ impl TerminalPresentation {
 }
 
 /// Camera state for 3D presentation.
-#[derive(Resource)]
+#[derive(Resource, Copy, Clone)]
 pub struct TerminalPlaneView {
     /// Camera yaw.
     pub yaw: f32,
@@ -379,6 +380,7 @@ pub fn setup_scene(
         mode: TerminalPresentationMode::Flat2d,
     });
     commands.insert_resource(TerminalPlaneView::default());
+    commands.insert_resource(TerminalCameraViewSlots::default());
     commands.insert_resource(MobiusTransition::default());
     commands.insert_resource(ModelLoadState {
         loaded: false,

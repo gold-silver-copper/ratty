@@ -24,7 +24,7 @@ use std::sync::mpsc::TryRecvError;
 use crate::config::{AppConfig, CURSOR_DEPTH};
 use crate::inline::{
     InlineObject, TerminalInlineObjectPlane, TerminalInlineObjectSprite, TerminalInlineObjects,
-    TerminalRgpObject,
+    TerminalRgpObject, TerminalCameraViewSlots,
 };
 use crate::model::CursorModel;
 use crate::model::spawn_cursor_model;
@@ -116,6 +116,7 @@ type PlaneBackResizeQuery<'w, 's> = Query<
 pub fn pump_pty_output(
     mut runtime: NonSendMut<TerminalRuntime>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
+    mut camera_slots: ResMut<TerminalCameraViewSlots>,
     mut app_exit: MessageWriter<AppExit>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
@@ -135,7 +136,7 @@ pub fn pump_pty_output(
                 } else {
                     None
                 };
-                let mut replies = inline_objects.consume_pty_output(&chunk, &mut runtime.parser);
+                let mut replies = inline_objects.consume_pty_output(&chunk, &mut runtime.parser, camera_slots.as_mut());
                 replies.extend(runtime.parser.callbacks_mut().take_replies());
                 for reply in replies {
                     runtime.write_input(&reply);
@@ -857,6 +858,9 @@ pub(crate) struct BrightnessParams<'w, 's> {
     rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     cursor_roots: Query<'w, 's, Entity, With<CursorModel>>,
     parent_query: Query<'w, 's, &'static ChildOf>,
+    camera_slots: ResMut<'w, TerminalCameraViewSlots>,
+    plane_view: Res<'w, TerminalPlaneView>,
+    presentation: Res<'w, TerminalPresentation>,
     material_query: Query<
         'w,
         's,
@@ -887,10 +891,19 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
         rgp_roots,
         cursor_roots,
         parent_query,
+        camera_slots,
+        plane_view,
+        presentation,
         material_query,
         materials,
         commands,
     } = &mut params;
+
+    let slot = camera_slots.current_slot;
+    let plane = plane_view.as_ref();
+    camera_slots.slots[slot].1.mode = presentation.mode;
+    camera_slots.slots[slot].0 = *plane;
+
     if material_query.is_empty() {
         return;
     }

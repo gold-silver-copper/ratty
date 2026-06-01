@@ -1,6 +1,9 @@
 //! Ratty Graphics Protocol parsing.
 
 use base64::Engine as _;
+use bevy::prelude::*;
+
+use crate::scene::TerminalPresentationMode;
 
 /// Ratty Graphics Protocol APC prefix.
 pub const RGP_APC_START: &[u8] = b"\x1b_ratty;g;";
@@ -28,8 +31,21 @@ pub struct RgpPlacementStyle {
     pub scale3: [f32; 3],
 }
 
-/// Partial update for an RGP object placement.
+/// Settings for an RGP Camera.
 #[derive(Clone, Copy, Default)]
+pub struct RgpCameraSettings {
+    /// Camera type, currently of "Flat","Proj","Pers","Mobs"
+    pub camera_type: Option<TerminalPresentationMode>,
+    /// Scale multiplier (FOV/Zoom depending on if orthogonal/perspective)
+    pub scale: Option<f32>,
+    /// Translation offset relative to the terminal plane.
+    pub offset: [Option<f32>; 3],
+    /// Rotation in degrees.
+    pub rotation: [Option<f32>; 3],
+}
+
+/// Partial update for an RGP object placement.
+#[derive(Clone, Copy)]
 pub struct RgpPlacementUpdate {
     /// Updates the default animation flag.
     pub animate: Option<bool>,
@@ -86,9 +102,11 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
     let mut id = None;
     let mut format = None;
     let mut path = None;
+    let mut ctype = None;
     let mut source = None;
     let mut more = None;
     let mut name = None;
+    let mut set: Option<u8> = None;
     let mut row = None;
     let mut col = None;
     let mut width = None;
@@ -120,9 +138,11 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
             "id" => id = value.parse().ok(),
             "fmt" => format = Some(value.to_string()),
             "path" => path = Some(value.to_string()),
+            "type" => ctype = Some(value.to_string()),
             "source" => source = Some(value.to_string()),
             "more" => more = parse_bool(value),
             "name" => name = Some(value.to_string()),
+            "set" => set = value.parse().ok(),
             "row" => row = value.parse().ok(),
             "col" => col = value.parse().ok(),
             "w" => width = value.parse().ok(),
@@ -151,6 +171,26 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
 
     match verb {
         "s" => Some(RgpOperation::SupportQuery),
+        "c" => Some(RgpOperation::Camera {
+            camera_slot: id?,
+            switch_immediately: set.unwrap_or(0) != 0,
+            settings: RgpCameraSettings {
+                camera_type: if let Some(my_camera_type) = ctype {
+                    match my_camera_type.as_str() {
+                        "Flat" => Some(TerminalPresentationMode::Flat2d),
+                        "Ortho" => Some(TerminalPresentationMode::Plane3d),
+                        "Persp" => Some(TerminalPresentationMode::Persp3d),
+                        "Mobius" => Some(TerminalPresentationMode::Mobius3d),
+                        _ => None
+                    }
+                } else {
+                    None
+                },
+                scale,
+                offset: [px, py, pz],
+                rotation: [rx, ry, rz],
+            }
+        }),
         "r" => Some(RgpOperation::Register {
             object_id: id?,
             format: format?,
@@ -235,6 +275,15 @@ pub enum RgpOperation {
         /// Register source.
         source: RgpRegisterSource,
     },
+    /// Camera manipulation
+    Camera {
+        /// Camera slot, 0 to just modify current camera
+        camera_slot: u32,
+        /// Defaults to 0, switches to the camera upon setting or not
+        switch_immediately: bool,
+        /// The settings: zoom/FOV, rotation, offset
+        settings: RgpCameraSettings
+    },
     /// Object placement.
     Place {
         /// Object identifier.
@@ -260,7 +309,7 @@ pub enum RgpOperation {
 
 /// Returns the RGP support reply sequence.
 pub fn support_reply() -> Vec<u8> {
-    b"\x1b_ratty;g;s;v=1;fmt=obj|glb;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1\x1b\\".to_vec()
+    b"\x1b_ratty;g;s;v=1;fmt=obj|glb;path=1;payload=1;chunk=1;anim=1;depth=1;color=1;brightness=1;transform=1;update=1;camera=1;\x1b\\".to_vec()
 }
 
 fn parse_color(value: &str) -> Option<[u8; 3]> {
