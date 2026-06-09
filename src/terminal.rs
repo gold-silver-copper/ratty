@@ -8,12 +8,12 @@ use parley_ratatui::ratatui::buffer::Buffer;
 use parley_ratatui::ratatui::layout::Rect;
 use parley_ratatui::ratatui::style::{Color as TuiColor, Modifier, Style};
 use parley_ratatui::ratatui::widgets::Widget;
-use parley_ratatui::vello::wgpu;
-use parley_ratatui::{
-    FontOptions, GpuRenderer, ParleyBackend, TerminalRenderer, TextureReadback, TextureTarget,
-};
+use parley_ratatui::{FontOptions, ParleyBackend, TerminalRenderer};
 
-use crate::config::{AppConfig, FontConfig, FontStyleConfig, TERMINAL_TEXTURE_LABEL, ThemeConfig};
+use crate::config::{AppConfig, FontConfig, FontStyleConfig, ThemeConfig};
+use crate::direct_render::{
+    DirectTerminalSceneExchange, resize_terminal_image, update_direct_terminal_frame,
+};
 use crate::mouse::TerminalSelection;
 
 /// Minimum interval between terminal redraws.
@@ -69,59 +69,6 @@ pub struct TerminalSurface {
     font: FontConfig,
     theme: ThemeConfig,
     renderer: TerminalRenderer,
-    gpu: Option<OffscreenGpu>,
-}
-
-struct OffscreenGpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    renderer: GpuRenderer,
-    target: TextureTarget,
-    readback: TextureReadback,
-    rgba: Vec<u8>,
-}
-
-impl OffscreenGpu {
-    async fn new(width: u32, height: u32) -> anyhow::Result<Self> {
-        let instance = wgpu::Instance::default();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .map_err(|_| anyhow::anyhow!("failed to request wgpu adapter for parley_ratatui"))?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await?;
-        let target = TextureTarget::new(
-            &device,
-            width,
-            height,
-            wgpu::TextureFormat::Rgba8Unorm,
-            Some(TERMINAL_TEXTURE_LABEL),
-        );
-        let renderer = GpuRenderer::new(&device)?;
-        Ok(Self {
-            device,
-            queue,
-            renderer,
-            target,
-            readback: TextureReadback::new(),
-            rgba: Vec::new(),
-        })
-    }
-
-    fn resize(&mut self, width: u32, height: u32) {
-        if self.target.width == width && self.target.height == height {
-            return;
-        }
-
-        self.target = TextureTarget::new(
-            &self.device,
-            width,
-            height,
-            self.target.format,
-            Some(TERMINAL_TEXTURE_LABEL),
-        );
-    }
 }
 
 impl TerminalSurface {
@@ -154,7 +101,6 @@ impl TerminalSurface {
             font: config.font.clone(),
             theme: config.theme.clone(),
             renderer,
-            gpu: None,
         })
     }
 
@@ -167,12 +113,6 @@ impl TerminalSurface {
 
         self.font.size = new_size;
         self.renderer = build_terminal_renderer(&self.font, &self.theme, self.window_opacity);
-        if let Some(gpu) = self.gpu.as_mut() {
-            let (width, height) = self
-                .renderer
-                .texture_size_for_buffer(self.tui.backend().buffer());
-            gpu.resize(width, height);
-        }
         true
     }
 
@@ -196,13 +136,6 @@ impl TerminalSurface {
         }
         self.cols = cols;
         self.rows = rows;
-
-        if let Some(gpu) = self.gpu.as_mut() {
-            let (width, height) = self
-                .renderer
-                .texture_size_for_buffer(self.tui.backend().buffer());
-            gpu.resize(width, height);
-        }
     }
 
     /// Returns the rendered cell size in pixels.
@@ -227,59 +160,36 @@ impl TerminalSurface {
     /// # Errors
     ///
     /// Returns an error if the offscreen renderer cannot be initialized or rendered.
-    pub fn sync_image(
+    pub(crate) fn sync_image(
         &mut self,
         images: &mut Assets<Image>,
+        exchange: &DirectTerminalSceneExchange,
         elapsed_secs: f32,
     ) -> anyhow::Result<()> {
         let Some(handle) = self.image_handle.as_ref() else {
             return Ok(());
         };
-        let Some(image) = images.get_mut(handle) else {
+        let Some(mut image) = images.get_mut(handle) else {
             return Ok(());
         };
 
         let (width, height) = self
             .renderer
             .texture_size_for_buffer(self.tui.backend().buffer());
-        if self.gpu.is_none() {
-            self.gpu = Some(pollster::block_on(OffscreenGpu::new(width, height))?);
-        }
-        let Some(gpu) = self.gpu.as_mut() else {
-            anyhow::bail!("offscreen GPU renderer should be initialized");
-        };
-        gpu.resize(width, height);
+        resize_terminal_image(&mut image, width, height);
 
         let buffer = self.tui.backend().buffer();
         let cursor = Some(self.tui.backend().cursor_position());
         let cursor_visible = self.tui.backend().cursor_visible();
-
-        gpu.renderer.render_to_rgba8_with_elapsed_into(
+        update_direct_terminal_frame(
+            exchange,
+            handle.clone(),
             &mut self.renderer,
-            &mut gpu.readback,
-            &gpu.device,
-            &gpu.queue,
-            &gpu.target,
             buffer,
             cursor,
             cursor_visible,
             elapsed_secs,
-            &mut gpu.rgba,
-        )?;
-
-        image.resize(bevy::render::render_resource::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        });
-        let data = image.data.get_or_insert_with(Vec::new);
-        let target_len = width as usize * height as usize * 4;
-        if data.len() != target_len {
-            data.resize(target_len, 0);
-        }
-        if gpu.rgba.len() == target_len {
-            data.copy_from_slice(&gpu.rgba);
-        }
+        );
 
         Ok(())
     }

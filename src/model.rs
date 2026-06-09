@@ -112,7 +112,7 @@ pub fn spawn_cursor_model(
         Ok((source, ObjectSource::Gltf(asset_path))) => {
             info!("loading cursor model from {}", source);
             commands.entity(root).with_children(|parent| {
-                parent.spawn(SceneRoot(
+                parent.spawn(WorldAssetRoot(
                     asset_server.load(GltfAssetLabel::Scene(0).from_asset(asset_path)),
                 ));
             });

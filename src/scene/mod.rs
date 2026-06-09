@@ -14,6 +14,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 
 use crate::config::AppConfig;
+use crate::direct_render::new_terminal_image;
 use crate::terminal::TerminalSurface;
 
 /// Marker for the 2D terminal sprite.
@@ -241,10 +242,11 @@ pub fn setup_scene(
     let pixmap_height = pixmap.y;
 
     let terminal_alpha = (terminal_opacity * 255.0).round() as u8;
-    let mut image = create_terminal_image(pixmap_width, pixmap_height, [0, 0, 0, 0]);
-    image.data = Some(vec![0; (pixmap_width * pixmap_height * 4) as usize]);
-
-    let image_handle = images.add(image);
+    let image_handle = images.add(new_terminal_image(
+        pixmap_width,
+        pixmap_height,
+        crate::config::TERMINAL_TEXTURE_LABEL,
+    ));
     terminal.image_handle = Some(image_handle.clone());
 
     let [r, g, b] = app_config.theme.background;
@@ -324,7 +326,7 @@ pub fn setup_scene(
         PointLight {
             intensity: 190_000.0,
             range: 2200.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_xyz(220.0, 320.0, 1000.0),
@@ -332,7 +334,7 @@ pub fn setup_scene(
     commands.spawn((
         DirectionalLight {
             illuminance: 15_000.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::ZYX, 0.0, -0.9, -0.45)),
@@ -341,7 +343,7 @@ pub fn setup_scene(
         PointLight {
             intensity: 45_000.0,
             range: 1800.0,
-            shadows_enabled: false,
+            shadow_maps_enabled: false,
             ..default()
         },
         Transform::from_xyz(-280.0, -120.0, 700.0),
@@ -433,7 +435,7 @@ pub(crate) fn apply_terminal_presentation(
     }
 
     if let Ok(front_material) = plane_materials.single()
-        && let Some(material) = materials.get_mut(&front_material.0)
+        && let Some(mut material) = materials.get_mut(&front_material.0)
     {
         material.cull_mode = if is_mobius { None } else { Some(Face::Back) };
     }

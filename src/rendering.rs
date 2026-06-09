@@ -22,7 +22,7 @@ pub fn sync_terminal_debug_image(
     let Some(handle) = terminal.back_image_handle.as_ref() else {
         return;
     };
-    let Some(image) = images.get_mut(handle) else {
+    let Some(mut image) = images.get_mut(handle) else {
         return;
     };
 
@@ -56,7 +56,7 @@ pub fn sync_plane_texture<'a>(
     };
 
     for material_handle in material_handles {
-        if let Some(material) = materials.get_mut(&material_handle.0) {
+        if let Some(mut material) = materials.get_mut(&material_handle.0) {
             material.base_color_texture = Some(image_handle.clone());
         }
     }
