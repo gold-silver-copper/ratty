@@ -6,7 +6,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use anyhow::Context;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -173,16 +173,19 @@ pub struct TerminalRuntime {
     /// PTY output channel.
     pub rx: Receiver<Vec<u8>>,
     /// PTY input writer.
-    pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    pub writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     /// PTY master handle.
-    pub _master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
     /// Child process handle.
-    pub _child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    /// PTY reader thread.
+    reader_thread: Option<JoinHandle<()>>,
     /// Terminal parser.
     pub parser: Parser<TerminalParserCallbacks>,
     scrollback_len: usize,
     /// Indicates PTY shutdown.
     pub pty_disconnected: bool,
+    shutdown_started: bool,
 }
 
 /// Returns the default shell for the current platform.
@@ -319,7 +322,7 @@ impl TerminalRuntime {
             .context("failed to create PTY writer")?;
 
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
-        thread::spawn(move || {
+        let reader_thread = thread::spawn(move || {
             let mut buf = [0_u8; 16 * 1024];
             loop {
                 match reader.read(&mut buf) {
@@ -337,9 +340,10 @@ impl TerminalRuntime {
 
         Ok(Self {
             rx,
-            writer: Arc::new(Mutex::new(writer)),
-            _master: pair.master,
-            _child: child,
+            writer: Arc::new(Mutex::new(Some(writer))),
+            master: Some(pair.master),
+            child: Some(child),
+            reader_thread: Some(reader_thread),
             parser: Parser::new_with_callbacks(
                 rows,
                 cols,
@@ -348,6 +352,7 @@ impl TerminalRuntime {
             ),
             scrollback_len: config.terminal.scrollback,
             pty_disconnected: false,
+            shutdown_started: false,
         })
     }
 
@@ -357,7 +362,9 @@ impl TerminalRuntime {
             return;
         }
 
-        if let Ok(mut writer) = self.writer.lock() {
+        if let Ok(mut writer) = self.writer.lock()
+            && let Some(writer) = writer.as_mut()
+        {
             let _ = writer.write_all(bytes);
             let _ = writer.flush();
         }
@@ -369,12 +376,14 @@ impl TerminalRuntime {
             return;
         }
 
-        let _ = self._master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: pw,
-            pixel_height: ph,
-        });
+        if let Some(master) = self.master.as_ref() {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: pw,
+                pixel_height: ph,
+            });
+        }
 
         let (_, old_cols) = self.parser.screen().size();
         if old_cols == cols || self.parser.screen().alternate_screen() {
@@ -396,5 +405,39 @@ impl TerminalRuntime {
     /// Returns the active xterm `modifyOtherKeys` level.
     pub fn modify_other_keys(&self) -> Option<u8> {
         self.parser.callbacks().modify_other_keys()
+    }
+
+    /// Shuts down the PTY runtime without blocking the Bevy main thread indefinitely.
+    pub fn shutdown(&mut self) {
+        if self.shutdown_started {
+            return;
+        }
+        self.shutdown_started = true;
+        self.pty_disconnected = true;
+
+        if let Ok(mut writer) = self.writer.lock() {
+            writer.take();
+        }
+
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        self.child.take();
+        self.master.take();
+
+        if self
+            .reader_thread
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(reader_thread) = self.reader_thread.take()
+        {
+            let _ = reader_thread.join();
+        }
+    }
+}
+
+impl Drop for TerminalRuntime {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
