@@ -2,6 +2,7 @@
 
 use bevy::prelude::*;
 
+use crate::direct_render::DirectTerminalRenderPlugin;
 use crate::inline::TerminalInlineObjects;
 use crate::keyboard::{TerminalClipboard, TerminalKeyBindings, handle_keyboard_input};
 use crate::mouse::{TerminalSelection, handle_mouse_input};
@@ -22,7 +23,7 @@ impl Plugin for TerminalPlugin {
             .init_resource::<TerminalInlineObjects>()
             .init_resource::<TerminalRedrawState>()
             .init_resource::<TerminalKeyBindings>()
-            .init_non_send_resource::<TerminalClipboard>()
+            .init_non_send::<TerminalClipboard>()
             .add_systems(Startup, setup_scene)
             .add_systems(Update, pump_pty_output)
             .add_systems(Update, handle_keyboard_input)
@@ -52,6 +53,7 @@ impl Plugin for TerminalPlugin {
             .add_systems(
                 Update,
                 sync_asset_to_terminal_cursor.after(redraw_soft_terminal),
-            );
+            )
+            .add_plugins(DirectTerminalRenderPlugin);
     }
 }

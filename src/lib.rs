@@ -8,6 +8,7 @@
 
 pub mod cli;
 pub mod config;
+mod direct_render;
 pub mod inline;
 pub mod keyboard;
 pub mod kitty;

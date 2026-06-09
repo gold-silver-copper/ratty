@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::TryRecvError;
 
 use crate::config::{AppConfig, CURSOR_DEPTH};
+use crate::direct_render::DirectTerminalSceneExchange;
 use crate::inline::{
     InlineObject, TerminalInlineObjectPlane, TerminalInlineObjectSprite, TerminalInlineObjects,
     TerminalRgpObject,
@@ -38,6 +39,7 @@ use crate::scene::{
 };
 use crate::terminal::{TerminalRedrawState, TerminalSurface, TerminalWidget};
 use bevy::app::AppExit;
+use bevy::asset::AssetMut;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::system::SystemParam;
 use bevy::gltf::GltfAssetLabel;
@@ -191,6 +193,7 @@ pub(crate) struct ResizeParams<'w, 's> {
         Query<'w, 's, &'static mut Transform, (With<TerminalPlane>, Without<TerminalSprite>)>,
     plane_back_query: PlaneBackResizeQuery<'w, 's>,
     images: ResMut<'w, Assets<Image>>,
+    direct_render: Res<'w, DirectTerminalSceneExchange>,
 }
 
 /// Handles primary window resize events.
@@ -215,6 +218,7 @@ pub(crate) fn handle_window_resize(
         plane_query,
         plane_back_query,
         images,
+        direct_render,
     } = &mut params;
     let Ok(primary_window) = primary_window.single() else {
         return;
@@ -241,7 +245,7 @@ pub(crate) fn handle_window_resize(
 
     runtime.resize(cols, rows, viewport_size.x as u16, viewport_size.y as u16);
     terminal.resize(cols, rows);
-    let _ = terminal.sync_image(images, 0.0);
+    let _ = terminal.sync_image(images, direct_render, 0.0);
     redraw.request();
 
     for mut sprite in sprite_query.iter_mut() {
@@ -305,6 +309,7 @@ pub(crate) struct RedrawParams<'w, 's> {
     time: Res<'w, Time>,
     redraw: ResMut<'w, TerminalRedrawState>,
     images: ResMut<'w, Assets<Image>>,
+    direct_render: Res<'w, DirectTerminalSceneExchange>,
     model_load_state: ResMut<'w, ModelLoadState>,
     commands: Commands<'w, 's>,
     meshes: ResMut<'w, Assets<Mesh>>,
@@ -333,6 +338,7 @@ pub(crate) fn redraw_soft_terminal(mut params: RedrawParams) {
         time,
         redraw,
         images,
+        direct_render,
         model_load_state,
         commands,
         meshes,
@@ -368,7 +374,7 @@ pub(crate) fn redraw_soft_terminal(mut params: RedrawParams) {
         }
     });
 
-    let _ = terminal.sync_image(images, time.elapsed_secs());
+    let _ = terminal.sync_image(images, direct_render, time.elapsed_secs());
     if matches!(
         presentation.mode,
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
@@ -751,7 +757,7 @@ fn spawn_rgp_object(
                 TerminalRgpObject { object_id },
                 Transform::default(),
                 Visibility::Visible,
-                SceneRoot(handle),
+                WorldAssetRoot(handle),
             ));
         }
     }
@@ -1188,14 +1194,14 @@ fn active_mobius_progress(
 }
 
 fn apply_plane_warp(
-    mesh: Option<&mut Mesh>,
+    mesh: Option<AssetMut<'_, Mesh>>,
     mode: TerminalPresentationMode,
     pulse: f32,
     elapsed_secs: f32,
     direction: f32,
     mobius_progress: f32,
 ) {
-    let Some(mesh) = mesh else {
+    let Some(mut mesh) = mesh else {
         return;
     };
     let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0) else {

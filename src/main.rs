@@ -55,9 +55,9 @@ fn main() -> anyhow::Result<()> {
             (app_config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
         )))
         .insert_resource(app_config.clone())
-        .insert_non_send_resource(runtime)
-        .insert_non_send_resource(terminal)
-        .insert_non_send_resource(AppWindowIcon { icon: window_icon })
+        .insert_non_send(runtime)
+        .insert_non_send(terminal)
+        .insert_non_send(AppWindowIcon { icon: window_icon })
         .insert_resource(WinitSettings {
             focused_mode: UpdateMode::reactive_low_power(FOCUSED_UPDATE_INTERVAL),
             unfocused_mode: UpdateMode::Continuous,
