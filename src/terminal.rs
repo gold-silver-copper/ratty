@@ -299,11 +299,20 @@ impl TerminalSurface {
 pub fn render_scale_for_window(window: &Window) -> f32 {
     let logical_size = window.resolution.size().max(Vec2::ONE);
     let physical_size = window.resolution.physical_size();
+    let scale_factor = window.scale_factor();
+    // A Bevy scale-factor override already defines the physical/logical ratio. Applying the
+    // backend scale factor on top of it over-sizes fullscreen terminal textures.
+    let base_scale_factor = if window.resolution.scale_factor_override().is_some() {
+        scale_factor
+    } else {
+        window.resolution.base_scale_factor()
+    };
+
     PresentationScale::new(
         [logical_size.x, logical_size.y],
         [physical_size.x, physical_size.y],
-        window.scale_factor(),
-        window.resolution.base_scale_factor(),
+        scale_factor,
+        base_scale_factor,
     )
     .render_scale()
 }
