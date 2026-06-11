@@ -12,10 +12,14 @@ use bevy::image::ImageSampler;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
+use bevy::window::PrimaryWindow;
 
 use crate::config::AppConfig;
 use crate::direct_render::new_terminal_image;
-use crate::terminal::TerminalSurface;
+use crate::runtime::TerminalRuntime;
+use crate::terminal::{
+    TerminalLayout, TerminalSurface, render_scale_for_window, snapped_translation,
+};
 
 /// Marker for the 2D terminal sprite.
 #[derive(Component)]
@@ -173,6 +177,20 @@ type PlaneBackTransformQuery<'w, 's> =
     Query<'w, 's, &'static mut Transform, With<TerminalPlaneBack>>;
 type PlaneCameraQuery<'w, 's> =
     Query<'w, 's, (&'static mut Projection, &'static mut Transform), With<TerminalPlaneCamera>>;
+pub(crate) type TerminalSpriteLayoutQuery<'w, 's> =
+    Query<'w, 's, (&'static mut Sprite, &'static mut Transform), With<TerminalSprite>>;
+pub(crate) type TerminalPlaneLayoutQuery<'w, 's> =
+    Query<'w, 's, &'static mut Transform, (With<TerminalPlane>, Without<TerminalSprite>)>;
+pub(crate) type TerminalPlaneBackLayoutQuery<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Transform,
+    (
+        With<TerminalPlaneBack>,
+        Without<TerminalPlane>,
+        Without<TerminalSprite>,
+    ),
+>;
 
 #[derive(SystemParam)]
 pub(crate) struct PresentationParams<'w, 's> {
@@ -198,19 +216,45 @@ pub(crate) struct PresentationParams<'w, 's> {
     >,
 }
 
+#[derive(SystemParam)]
+pub(crate) struct SetupSceneParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    app_config: Res<'w, AppConfig>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    images: ResMut<'w, Assets<Image>>,
+    primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    runtime: NonSendMut<'w, TerminalRuntime>,
+    terminal: NonSendMut<'w, TerminalSurface>,
+}
+
 /// Sets up the terminal presentation scene.
 ///
 /// This startup system creates the 2D and 3D cameras, terminal sprite, terminal plane meshes,
 /// backing images, lighting and presentation resources used by later update systems.
-pub fn setup_scene(
-    mut commands: Commands,
-    app_config: Res<AppConfig>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
-    mut terminal: NonSendMut<TerminalSurface>,
-) {
+pub(crate) fn setup_scene(mut params: SetupSceneParams) {
+    let SetupSceneParams {
+        commands,
+        app_config,
+        meshes,
+        materials,
+        images,
+        primary_window,
+        runtime,
+        terminal,
+    } = &mut params;
     let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
+    let window = primary_window.single().expect("primary window");
+    let window_size = window.resolution.size().max(Vec2::ONE);
+    let render_scale = render_scale_for_window(window);
+    let layout = terminal.resize_to_fit(window_size, render_scale);
+    let pty_pixels = layout.pty_pixels();
+    runtime.resize(
+        layout.cols,
+        layout.rows,
+        pty_pixels.x as u16,
+        pty_pixels.y as u16,
+    );
 
     commands.spawn((
         Camera2d,
@@ -237,22 +281,18 @@ pub fn setup_scene(
         Msaa::Off,
     ));
 
-    let pixmap = terminal.pixmap_dimensions();
-    let pixmap_width = pixmap.x;
-    let pixmap_height = pixmap.y;
-
     let terminal_alpha = (terminal_opacity * 255.0).round() as u8;
     let image_handle = images.add(new_terminal_image(
-        pixmap_width,
-        pixmap_height,
+        layout.texture_size.x,
+        layout.texture_size.y,
         crate::config::TERMINAL_TEXTURE_LABEL,
     ));
     terminal.image_handle = Some(image_handle.clone());
 
     let [r, g, b] = app_config.theme.background;
     let back_image = create_terminal_image(
-        pixmap_width,
-        pixmap_height,
+        layout.texture_size.x,
+        layout.texture_size.y,
         [
             r.saturating_sub(13),
             g.saturating_sub(11),
@@ -263,23 +303,19 @@ pub fn setup_scene(
     let back_image_handle = images.add(back_image);
     terminal.back_image_handle = Some(back_image_handle.clone());
 
-    let viewport_size = Vec2::new(
-        app_config.window.width as f32,
-        app_config.window.height as f32,
-    );
     let viewport_center = Vec2::ZERO;
     commands.insert_resource(TerminalViewport {
-        size: viewport_size,
+        size: layout.logical_size,
         center: viewport_center,
     });
 
     let mut sprite = Sprite::from_image(image_handle);
-    sprite.custom_size = Some(viewport_size);
+    sprite.custom_size = Some(layout.logical_size);
     sprite.color = Color::srgba(1.0, 1.0, 1.0, terminal_opacity);
     commands.spawn((
         TerminalSprite,
         sprite,
-        Transform::from_translation(Vec3::new(viewport_center.x, viewport_center.y, 0.0)),
+        Transform::from_translation(snapped_translation(viewport_center, render_scale).extend(0.0)),
     ));
 
     let front_mesh = meshes.add(terminal_plane_mesh(32, 20));
@@ -300,7 +336,7 @@ pub fn setup_scene(
             unlit: true,
             ..default()
         })),
-        Transform::from_scale(viewport_size.extend(1.0)),
+        Transform::from_scale(layout.logical_size.extend(1.0)),
         Visibility::Hidden,
     ));
 
@@ -317,7 +353,7 @@ pub fn setup_scene(
         Transform {
             translation: Vec3::new(0.0, 0.0, -2.0),
             rotation: Quat::from_rotation_y(std::f32::consts::PI),
-            scale: viewport_size.extend(1.0),
+            scale: layout.logical_size.extend(1.0),
         },
         Visibility::Hidden,
     ));
@@ -357,6 +393,32 @@ pub fn setup_scene(
         loaded: false,
         first_frame_uploaded: false,
     });
+}
+
+/// Synchronizes Bevy presentation entities to the terminal texture layout.
+pub(crate) fn sync_terminal_layout(
+    layout: TerminalLayout,
+    viewport: &mut TerminalViewport,
+    sprite_query: &mut TerminalSpriteLayoutQuery,
+    plane_query: &mut TerminalPlaneLayoutQuery,
+    plane_back_query: &mut TerminalPlaneBackLayoutQuery,
+) {
+    viewport.size = layout.logical_size;
+    viewport.center = Vec2::ZERO;
+
+    for (mut sprite, mut transform) in sprite_query.iter_mut() {
+        sprite.custom_size = Some(layout.logical_size);
+        transform.translation = snapped_translation(viewport.center, layout.render_scale)
+            .extend(transform.translation.z);
+    }
+
+    for mut transform in plane_query.iter_mut() {
+        transform.scale = layout.logical_size.extend(1.0);
+    }
+
+    for mut transform in plane_back_query.iter_mut() {
+        transform.scale = layout.logical_size.extend(1.0);
+    }
 }
 
 fn create_terminal_image(width: u32, height: u32, fill: [u8; 4]) -> Image {

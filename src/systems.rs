@@ -33,11 +33,14 @@ use crate::mouse::TerminalSelection;
 use crate::rendering::{sync_plane_texture, sync_terminal_debug_image};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
-    MobiusTransition, ModelLoadState, TerminalPlane, TerminalPlaneBack, TerminalPlaneMeshes,
-    TerminalPlaneView, TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode,
-    TerminalSprite, TerminalViewport,
+    MobiusTransition, ModelLoadState, TerminalPlane, TerminalPlaneBack,
+    TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery, TerminalPlaneMeshes, TerminalPlaneView,
+    TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode, TerminalSpriteLayoutQuery,
+    TerminalViewport, sync_terminal_layout,
 };
-use crate::terminal::{TerminalRedrawState, TerminalSurface, TerminalWidget};
+use crate::terminal::{
+    TerminalRedrawState, TerminalSurface, TerminalWidget, render_scale_for_window,
+};
 use bevy::app::AppExit;
 use bevy::asset::AssetMut;
 use bevy::ecs::message::{MessageReader, MessageWriter};
@@ -48,7 +51,7 @@ use bevy::mesh::{Indices, VertexAttributeValues};
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::window::{PrimaryWindow, WindowCloseRequested, WindowResized};
+use bevy::window::{PrimaryWindow, Window, WindowCloseRequested, WindowResized};
 
 struct InlineLayout {
     columns: u32,
@@ -95,16 +98,6 @@ type CursorTransformQuery<'w, 's> = Query<
     's,
     (&'static mut Transform, &'static mut Visibility),
     (With<CursorModel>, Without<TerminalPlane>),
->;
-type PlaneBackResizeQuery<'w, 's> = Query<
-    'w,
-    's,
-    &'static mut Transform,
-    (
-        With<TerminalPlaneBack>,
-        Without<TerminalPlane>,
-        Without<TerminalSprite>,
-    ),
 >;
 
 /// Requests application exit as soon as the primary window is asked to close.
@@ -225,17 +218,14 @@ fn infer_upward_scroll(prev_rows: &[String], next_rows: &[String]) -> u16 {
 
 #[derive(SystemParam)]
 pub(crate) struct ResizeParams<'w, 's> {
-    primary_window: Query<'w, 's, Entity, With<PrimaryWindow>>,
+    primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
     runtime: NonSendMut<'w, TerminalRuntime>,
     terminal: NonSendMut<'w, TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
     viewport: ResMut<'w, TerminalViewport>,
-    sprite_query: Query<'w, 's, &'static mut Sprite, With<TerminalSprite>>,
-    plane_query:
-        Query<'w, 's, &'static mut Transform, (With<TerminalPlane>, Without<TerminalSprite>)>,
-    plane_back_query: PlaneBackResizeQuery<'w, 's>,
-    images: ResMut<'w, Assets<Image>>,
-    direct_render: Res<'w, DirectTerminalSceneExchange>,
+    sprite_query: TerminalSpriteLayoutQuery<'w, 's>,
+    plane_query: TerminalPlaneLayoutQuery<'w, 's>,
+    plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
 }
 
 /// Handles primary window resize events.
@@ -244,8 +234,8 @@ pub(crate) struct ResizeParams<'w, 's> {
 /// [`TerminalRuntime`], [`TerminalSurface`], [`TerminalViewport`], the 2D terminal sprite and the
 /// front and back terminal plane transforms.
 ///
-/// The updated terminal image is uploaded immediately so later systems in the same frame see the
-/// new geometry.
+/// The redraw system runs after this system and uploads the resized terminal image in the same
+/// frame.
 pub(crate) fn handle_window_resize(
     mut resize_events: MessageReader<WindowResized>,
     mut params: ResizeParams,
@@ -259,10 +249,8 @@ pub(crate) fn handle_window_resize(
         sprite_query,
         plane_query,
         plane_back_query,
-        images,
-        direct_render,
     } = &mut params;
-    let Ok(primary_window) = primary_window.single() else {
+    let Ok((primary_window, window)) = primary_window.single() else {
         return;
     };
 
@@ -277,30 +265,23 @@ pub(crate) fn handle_window_resize(
         return;
     };
 
-    let viewport_size = Vec2::new(window_size.x.max(1.0), window_size.y.max(1.0));
-    viewport.size = viewport_size;
-    viewport.center = Vec2::ZERO;
-
-    let char_dims = terminal.char_dimensions().max(UVec2::ONE);
-    let cols = ((viewport_size.x / char_dims.x as f32).floor() as u16).max(1);
-    let rows = ((viewport_size.y / char_dims.y as f32).floor() as u16).max(1);
-
-    runtime.resize(cols, rows, viewport_size.x as u16, viewport_size.y as u16);
-    terminal.resize(cols, rows);
-    let _ = terminal.sync_image(images, direct_render, 0.0);
-    redraw.request();
-
-    for mut sprite in sprite_query.iter_mut() {
-        sprite.custom_size = Some(viewport_size);
-    }
-
-    for mut transform in plane_query.iter_mut() {
-        transform.scale = viewport_size.extend(1.0);
-    }
-
-    for mut transform in plane_back_query.iter_mut() {
-        transform.scale = viewport_size.extend(1.0);
-    }
+    let window_size = window_size.max(Vec2::ONE);
+    let layout = terminal.resize_to_fit(window_size, render_scale_for_window(window));
+    let pty_pixels = layout.pty_pixels();
+    runtime.resize(
+        layout.cols,
+        layout.rows,
+        pty_pixels.x as u16,
+        pty_pixels.y as u16,
+    );
+    sync_terminal_layout(
+        layout,
+        viewport,
+        sprite_query,
+        plane_query,
+        plane_back_query,
+    );
+    redraw.request_immediate();
 }
 
 /// Applies inline object visibility for the current presentation mode.

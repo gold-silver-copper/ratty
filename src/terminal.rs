@@ -8,7 +8,10 @@ use parley_ratatui::ratatui::buffer::Buffer;
 use parley_ratatui::ratatui::layout::Rect;
 use parley_ratatui::ratatui::style::{Color as TuiColor, Modifier, Style};
 use parley_ratatui::ratatui::widgets::Widget;
-use parley_ratatui::{FontOptions, ParleyBackend, TerminalRenderer};
+use parley_ratatui::{
+    FontOptions, ParleyBackend, PresentationScale, TerminalRenderer, TexturePresentation,
+    snap_logical_position_to_physical_pixel,
+};
 
 use crate::config::{AppConfig, FontConfig, FontStyleConfig, ThemeConfig};
 use crate::direct_render::{
@@ -18,6 +21,38 @@ use crate::mouse::TerminalSelection;
 
 /// Minimum interval between terminal redraws.
 const REDRAW_THROTTLE: Duration = Duration::from_millis(16);
+
+/// Terminal grid and presentation dimensions.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalLayout {
+    /// Terminal column count.
+    pub cols: u16,
+    /// Terminal row count.
+    pub rows: u16,
+    /// Physical texture size in pixels.
+    pub texture_size: UVec2,
+    /// Logical presentation size in Bevy world units.
+    pub logical_size: Vec2,
+    /// Physical render scale used for the terminal texture.
+    pub render_scale: f32,
+}
+
+impl TerminalLayout {
+    fn new(cols: u16, rows: u16, texture_size: UVec2, render_scale: f32) -> Self {
+        Self {
+            cols,
+            rows,
+            texture_size,
+            logical_size: texture_logical_size(texture_size, render_scale),
+            render_scale,
+        }
+    }
+
+    /// Returns PTY pixel dimensions clamped to portable-pty's `u16` API.
+    pub fn pty_pixels(self) -> UVec2 {
+        self.texture_size.min(UVec2::splat(u16::MAX as u32))
+    }
+}
 
 /// Terminal redraw flag.
 #[derive(Resource)]
@@ -39,6 +74,12 @@ impl TerminalRedrawState {
     /// Requests a terminal redraw.
     pub fn request(&mut self) {
         self.needs_redraw = true;
+    }
+
+    /// Requests a redraw without waiting for the throttle interval.
+    pub fn request_immediate(&mut self) {
+        self.needs_redraw = true;
+        self.last_redraw = Instant::now() - REDRAW_THROTTLE;
     }
 
     /// Returns whether a redraw was pending.
@@ -68,6 +109,7 @@ pub struct TerminalSurface {
     window_opacity: f32,
     font: FontConfig,
     theme: ThemeConfig,
+    render_scale: f32,
     renderer: TerminalRenderer,
 }
 
@@ -88,7 +130,13 @@ impl TerminalSurface {
         } else {
             tui.show_cursor()?;
         }
-        let renderer = build_terminal_renderer(&config.font, &config.theme, config.window.opacity);
+        let render_scale = config.window.scale_factor.max(1.0);
+        let renderer = build_terminal_renderer(
+            &config.font,
+            &config.theme,
+            config.window.opacity,
+            render_scale,
+        );
 
         Ok(Self {
             tui,
@@ -100,6 +148,7 @@ impl TerminalSurface {
             window_opacity: config.window.opacity.clamp(0.0, 1.0),
             font: config.font.clone(),
             theme: config.theme.clone(),
+            render_scale,
             renderer,
         })
     }
@@ -112,13 +161,45 @@ impl TerminalSurface {
         }
 
         self.font.size = new_size;
-        self.renderer = build_terminal_renderer(&self.font, &self.theme, self.window_opacity);
+        self.rebuild_renderer();
         true
     }
 
     /// Returns the current font size.
     pub fn font_size(&self) -> i32 {
         self.font.size
+    }
+
+    /// Updates the physical render scale.
+    pub fn set_render_scale(&mut self, render_scale: f32) -> bool {
+        let render_scale = render_scale.max(1.0);
+        if (render_scale - self.render_scale).abs() < f32::EPSILON {
+            return false;
+        }
+
+        self.render_scale = render_scale;
+        self.rebuild_renderer();
+        true
+    }
+
+    /// Resizes the terminal grid to fit a logical window size.
+    pub fn resize_to_fit(&mut self, logical_size: Vec2, render_scale: f32) -> TerminalLayout {
+        self.set_render_scale(render_scale);
+
+        let metrics = self.renderer.logical_metrics(self.render_scale);
+        let logical_size = logical_size.max(Vec2::ONE);
+        let cols = (logical_size.x / metrics.cell_width)
+            .floor()
+            .clamp(1.0, u16::MAX as f32) as u16;
+        let rows = (logical_size.y / metrics.cell_height)
+            .floor()
+            .clamp(1.0, u16::MAX as f32) as u16;
+
+        if cols != self.cols || rows != self.rows {
+            self.resize(cols, rows);
+        }
+
+        self.layout()
     }
 
     /// Resizes the terminal grid.
@@ -140,7 +221,7 @@ impl TerminalSurface {
 
     /// Returns the rendered cell size in pixels.
     pub fn char_dimensions(&self) -> UVec2 {
-        let metrics = self.renderer.metrics();
+        let metrics = self.renderer.logical_metrics(self.render_scale);
         UVec2::new(
             metrics.cell_width.ceil().max(1.0) as u32,
             metrics.cell_height.ceil().max(1.0) as u32,
@@ -153,6 +234,16 @@ impl TerminalSurface {
             .renderer
             .texture_size_for_buffer(self.tui.backend().buffer());
         UVec2::new(width, height)
+    }
+
+    /// Returns the current terminal layout.
+    pub fn layout(&self) -> TerminalLayout {
+        TerminalLayout::new(
+            self.cols,
+            self.rows,
+            self.pixmap_dimensions(),
+            self.render_scale,
+        )
     }
 
     /// Synchronizes the rendered terminal image.
@@ -193,12 +284,48 @@ impl TerminalSurface {
 
         Ok(())
     }
+
+    fn rebuild_renderer(&mut self) {
+        self.renderer = build_terminal_renderer(
+            &self.font,
+            &self.theme,
+            self.window_opacity,
+            self.render_scale,
+        );
+    }
+}
+
+/// Computes the physical render scale for a Bevy window.
+pub fn render_scale_for_window(window: &Window) -> f32 {
+    let logical_size = window.resolution.size().max(Vec2::ONE);
+    let physical_size = window.resolution.physical_size();
+    PresentationScale::new(
+        [logical_size.x, logical_size.y],
+        [physical_size.x, physical_size.y],
+        window.scale_factor(),
+        window.resolution.base_scale_factor(),
+    )
+    .render_scale()
+}
+
+/// Returns the logical size for a physical terminal texture.
+pub fn texture_logical_size(texture_size: UVec2, render_scale: f32) -> Vec2 {
+    let [width, height] =
+        TexturePresentation::new([texture_size.x, texture_size.y], render_scale).logical_size();
+    Vec2::new(width, height)
+}
+
+/// Snaps a logical position to the physical pixel grid.
+pub fn snapped_translation(position: Vec2, render_scale: f32) -> Vec2 {
+    let [x, y] = snap_logical_position_to_physical_pixel([position.x, position.y], render_scale);
+    Vec2::new(x, y)
 }
 
 fn build_terminal_renderer(
     font: &FontConfig,
     theme_config: &ThemeConfig,
     window_opacity: f32,
+    render_scale: f32,
 ) -> TerminalRenderer {
     let palette = theme_config
         .palette()
@@ -223,12 +350,13 @@ fn build_terminal_renderer(
         palette,
     };
     let font_options = FontOptions::default().with_family(font.family.clone());
-    TerminalRenderer::new(
+    TerminalRenderer::new_scaled(
         FontOptions {
             size: font.size as f32,
             ..font_options
         },
         theme,
+        render_scale,
     )
 }
 
