@@ -33,6 +33,16 @@ struct AppWindowIcon {
     icon: Option<Icon>,
 }
 
+/// Builds the primary window resolution, overriding the display scale factor
+/// only when the config asks for it.
+fn window_resolution(app_config: &AppConfig) -> WindowResolution {
+    let resolution = WindowResolution::new(app_config.window.width, app_config.window.height);
+    match app_config.window.scale_factor {
+        Some(scale_factor) => resolution.with_scale_factor_override(scale_factor),
+        None => resolution,
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let app_config = AppConfig::load_from_path(cli.config_file.as_deref())?;
@@ -70,11 +80,7 @@ fn main() -> anyhow::Result<()> {
                     primary_window: Some(Window {
                         title: window_title.clone(),
                         name: Some(window_title),
-                        resolution: WindowResolution::new(
-                            app_config.window.width,
-                            app_config.window.height,
-                        )
-                        .with_scale_factor_override(app_config.window.scale_factor),
+                        resolution: window_resolution(&app_config),
                         transparent: app_config.window.opacity < 1.0,
                         visible: false,
                         ..default()

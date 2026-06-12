@@ -9,8 +9,8 @@ use parley_ratatui::ratatui::layout::Rect;
 use parley_ratatui::ratatui::style::{Color as TuiColor, Modifier, Style};
 use parley_ratatui::ratatui::widgets::Widget;
 use parley_ratatui::{
-    FontOptions, ParleyBackend, PresentationScale, TerminalRenderer, TexturePresentation,
-    snap_logical_position_to_physical_pixel,
+    CellQuantization, FontOptions, ParleyBackend, PresentationScale, TerminalRenderer,
+    TexturePresentation, snap_logical_position_to_physical_pixel,
 };
 
 use crate::config::{AppConfig, FontConfig, FontStyleConfig, ThemeConfig};
@@ -130,7 +130,9 @@ impl TerminalSurface {
         } else {
             tui.show_cursor()?;
         }
-        let render_scale = config.window.scale_factor.max(1.0);
+        // The real scale arrives with the first `resize_to_fit` once the
+        // window exists; an explicit override seeds it early.
+        let render_scale = config.window.scale_factor.unwrap_or(1.0).max(1.0);
         let renderer = build_terminal_renderer(
             &config.font,
             &config.theme,
@@ -219,13 +221,10 @@ impl TerminalSurface {
         self.rows = rows;
     }
 
-    /// Returns the rendered cell size in pixels.
-    pub fn char_dimensions(&self) -> UVec2 {
+    /// Returns the rendered cell size in logical pixels.
+    pub fn char_dimensions(&self) -> Vec2 {
         let metrics = self.renderer.logical_metrics(self.render_scale);
-        UVec2::new(
-            metrics.cell_width.ceil().max(1.0) as u32,
-            metrics.cell_height.ceil().max(1.0) as u32,
-        )
+        Vec2::new(metrics.cell_width.max(1.0), metrics.cell_height.max(1.0))
     }
 
     /// Returns the terminal pixmap dimensions in pixels.
@@ -358,10 +357,16 @@ fn build_terminal_renderer(
         ),
         palette,
     };
-    let font_options = FontOptions::default().with_family(font.family.clone());
+    // Config font sizes are points; Parley takes pixels (1pt = 4/3px at 96dpi).
+    const PT_TO_PX: f32 = 96.0 / 72.0;
+    let font_options = FontOptions::default()
+        .with_family(font.family.clone())
+        // Fractional cells keep font-size zoom proportional on both axes even
+        // when a single step moves the glyph advance by less than one pixel.
+        .with_cell_quantization(CellQuantization::Fractional);
     TerminalRenderer::new_scaled(
         FontOptions {
-            size: font.size as f32,
+            size: font.size as f32 * PT_TO_PX,
             ..font_options
         },
         theme,
@@ -483,6 +488,44 @@ fn ansi_index_to_tui(index: u8, theme_palette: &[TuiColor; 16]) -> TuiColor {
         232..=255 => {
             let shade = 8 + (index - 232) * 10;
             TuiColor::Rgb(shade, shade, shade)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for vertical-only zoom steps (#97): with fractional
+    /// cell quantization, every font-size step must grow both axes.
+    #[test]
+    fn font_size_steps_scale_cells_on_both_axes() {
+        for render_scale in [1.0, 2.0] {
+            let mut previous: Option<(f32, f32)> = None;
+            for size in 8..=24 {
+                let font = FontConfig {
+                    size,
+                    ..FontConfig::default()
+                };
+                let renderer =
+                    build_terminal_renderer(&font, &ThemeConfig::default(), 1.0, render_scale);
+                let metrics = renderer.logical_metrics(render_scale);
+                if let Some((width, height)) = previous {
+                    assert!(
+                        metrics.cell_width > width,
+                        "cell width must grow at size {size} (scale {render_scale}): \
+                         {width} -> {}",
+                        metrics.cell_width
+                    );
+                    assert!(
+                        metrics.cell_height > height,
+                        "cell height must grow at size {size} (scale {render_scale}): \
+                         {height} -> {}",
+                        metrics.cell_height
+                    );
+                }
+                previous = Some((metrics.cell_width, metrics.cell_height));
+            }
         }
     }
 }

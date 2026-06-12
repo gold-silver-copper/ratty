@@ -1,7 +1,8 @@
 [window]
 width = 960
 height = 620
-scale_factor = 1.0
+# Overrides the display scale factor; leave unset to render at native scale.
+# scale_factor = 1.0
 opacity = 0.8
 
 [terminal]
@@ -19,6 +20,7 @@ TERM = "xterm-256color"
 [font]
 family = "DejaVu Sans Mono"
 style = "Regular"
+# Font size in points.
 size = 18
 
 [cursor.model]

@@ -509,7 +509,7 @@ pub(crate) fn handle_mouse_input(
             let amount = match event.unit {
                 MouseScrollUnit::Line => event.y.round() as isize,
                 MouseScrollUnit::Pixel => {
-                    let char_height = terminal.char_dimensions().y.max(1) as f32;
+                    let char_height = terminal.char_dimensions().y;
                     local_scroll.pixel_remainder += event.y / char_height;
                     let amount = local_scroll.pixel_remainder.trunc() as isize;
                     local_scroll.pixel_remainder -= amount as f32;
