@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
+use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
@@ -28,9 +29,7 @@ impl Plugin for DirectTerminalRenderPlugin {
             .clone();
 
         let render_app = app.sub_app_mut(RenderApp);
-        render_app
-            .world_mut()
-            .insert_non_send(DirectTerminalRenderState::default());
+        render_app.init_resource::<DirectTerminalRenderState>();
         render_app.world_mut().insert_resource(exchange);
         render_app.init_resource::<ExtractedDirectTerminalFrame>();
         render_app.add_systems(ExtractSchedule, extract_terminal_frame);
@@ -58,9 +57,23 @@ struct DirectTerminalSceneExchangeInner {
     recycled: Mutex<Option<Scene>>,
 }
 
-#[derive(Default)]
+/// Render-world Vello renderer state.
+///
+/// `vello::Renderer` is `Send` but not `Sync`, so the renderer lives in a
+/// [`SyncCell`] to qualify as a regular [`Resource`]. A non-send resource
+/// would pin [`render_terminal_frame`] to a specific thread, which deadlocks
+/// the pipelined render app on its final update during shutdown.
+#[derive(Resource)]
 struct DirectTerminalRenderState {
-    renderer: Option<GpuRenderer>,
+    renderer: SyncCell<Option<GpuRenderer>>,
+}
+
+impl Default for DirectTerminalRenderState {
+    fn default() -> Self {
+        Self {
+            renderer: SyncCell::new(None),
+        }
+    }
 }
 
 #[derive(Resource, Default)]
@@ -180,7 +193,7 @@ fn extract_terminal_frame(
 }
 
 fn render_terminal_frame(
-    mut state: NonSendMut<DirectTerminalRenderState>,
+    mut state: ResMut<DirectTerminalRenderState>,
     exchange: Res<DirectTerminalSceneExchange>,
     mut frame: ResMut<ExtractedDirectTerminalFrame>,
     gpu_images: Res<RenderAssets<GpuImage>>,
@@ -204,6 +217,7 @@ fn render_terminal_frame(
     let device = render_device.wgpu_device();
     let renderer = state
         .renderer
+        .get()
         .get_or_insert_with(|| GpuRenderer::new(device).expect("vello renderer"));
 
     renderer
