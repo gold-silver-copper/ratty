@@ -222,19 +222,37 @@ and [Bevy](https://bevyengine.org/) for scene presentation.
 
 Current workflow:
 
-1. Ratatui buffer on CPU
-2. Parley/Vello renders on GPU
-3. Read back RGBA to CPU
-4. Copy into Bevy image
-5. Bevy presents that image in 2D and 3D
+1. PTY output is parsed by `vt100` and drawn into a Ratatui buffer on CPU
+2. `parley_ratatui` shapes the buffer with Parley and records it as a Vello scene
+3. The scene is handed to Bevy's render world through a double-buffered
+   exchange (scenes are recycled between frames, never cloned or re-recorded)
+4. Vello renders the scene directly into the Bevy-owned GPU texture on Bevy's
+   render-world device, with no CPU readback in between
+5. Bevy presents that texture in the 2D and 3D scenes
 
-Terminal drawing is GPU-rendered through Parley/Vello, but the main terminal
-image still crosses back through CPU memory before Bevy presents it. This is a
-GPU-powered bridge, not a fully GPU-resident shared-texture path.
+The terminal image is fully GPU-resident: the only data crossing from the main
+world to the render world each frame is the recorded scene, not pixels.
 
-If the project later moves to a fully GPU-resident path, that will require a
-dedicated Bevy render integration that renders into a Bevy-owned texture on
-Bevy's render-world device instead of using the current readback bridge.
+### Sizing and scale
+
+Cell metrics drive every layout decision, so it helps to know where each
+number comes from:
+
+- The configured font size is in points and converts to pixels at 96 dpi
+  (1pt = 4/3px). Metrics are measured at physical pixel size, i.e. after
+  multiplying by the render scale.
+- The render scale comes from the display by default (2.0 on HiDPI screens).
+  Setting `window.scale_factor` in the config overrides it explicitly.
+- Measured cell dimensions stay fractional
+  (`CellQuantization::Fractional`). Rounding them to whole pixels would make
+  font-size zoom steps uneven: a +1pt step grows the cell height by more than
+  a pixel but the cell width by well under one, so quantized widths can stay
+  unchanged while the height grows and the zoom collapses into a
+  vertical-only stretch.
+- The grid is sized as `cols/rows = floor(logical window size / logical cell
+  size)`; the texture is `ceil(cols × cell width)` by `ceil(rows × cell
+  height)` in physical pixels and is presented at `texture size / render
+  scale` logical units, so the texture is never resampled.
 
 ## Endorsements
 
