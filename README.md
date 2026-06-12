@@ -233,27 +233,6 @@ Current workflow:
 The terminal image is fully GPU-resident: the only data crossing from the main
 world to the render world each frame is the recorded scene, not pixels.
 
-### Sizing and scale
-
-Cell metrics drive every layout decision, so it helps to know where each
-number comes from:
-
-- The configured font size is in points and converts to pixels at 96 dpi
-  (1pt = 4/3px). Metrics are measured at physical pixel size, i.e. after
-  multiplying by the render scale.
-- The render scale comes from the display by default (2.0 on HiDPI screens).
-  Setting `window.scale_factor` in the config overrides it explicitly.
-- Measured cell dimensions stay fractional
-  (`CellQuantization::Fractional`). Rounding them to whole pixels would make
-  font-size zoom steps uneven: a +1pt step grows the cell height by more than
-  a pixel but the cell width by well under one, so quantized widths can stay
-  unchanged while the height grows and the zoom collapses into a
-  vertical-only stretch.
-- The grid is sized as `cols/rows = floor(logical window size / logical cell
-  size)`; the texture is `ceil(cols × cell width)` by `ceil(rows × cell
-  height)` in physical pixels and is presented at `texture size / render
-  scale` logical units, so the texture is never resampled.
-
 ## Endorsements
 
 - _"This is like a legitimately cool project but also I just spent like 20 minutes adjusting the config for the rat spinning to see him spin faster and more erratically and it cracked me up"_ - [@vimlena.com](https://bsky.app/profile/vimlena.com/post/3mkoshbzpvs2y)
