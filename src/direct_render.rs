@@ -7,7 +7,9 @@ use bevy::image::ImageSampler;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages};
+use bevy::render::render_resource::{
+    Extent3d, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+};
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::texture::GpuImage;
 use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderSystems};
@@ -124,20 +126,34 @@ impl DirectTerminalSceneExchange {
     }
 }
 
+/// Creates the terminal render target.
+///
+/// Vello requires an `Rgba8Unorm` storage texture and writes sRGB-encoded,
+/// display-ready bytes into it. Bevy samples through a separate
+/// `Rgba8UnormSrgb` view so those bytes are decoded on sample instead of
+/// being re-encoded at the swapchain (which washes out colors). The data is
+/// zero-filled so a frame that samples the texture before Vello first writes
+/// it shows transparent black rather than uninitialized memory.
 pub(crate) fn new_terminal_image(width: u32, height: u32, label: &'static str) -> Image {
-    let mut image = Image::new_uninit(
+    let mut image = Image::new_fill(
         Extent3d {
             width,
             height,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
+        &[0, 0, 0, 0],
         TextureFormat::Rgba8Unorm,
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     );
     image.texture_descriptor.label = Some(label);
     image.texture_descriptor.usage =
         TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING;
+    image.texture_descriptor.view_formats = &[TextureFormat::Rgba8UnormSrgb];
+    image.texture_view_descriptor = Some(TextureViewDescriptor {
+        format: Some(TextureFormat::Rgba8UnormSrgb),
+        ..Default::default()
+    });
     image.sampler = ImageSampler::linear();
     image
 }
@@ -200,17 +216,24 @@ fn render_terminal_frame(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
 ) {
-    let Some(frame) = frame.0.take() else {
+    let Some(current) = frame.0.take() else {
         return;
     };
-    let Some(gpu_image) = gpu_images.get(&frame.image) else {
-        exchange.recycle_scene(frame.scene);
+    // Retain undrawable frames and retry on the next render frame; a newer
+    // published frame supersedes a retained one during extraction.
+    let Some(gpu_image) = gpu_images.get(&current.image) else {
+        debug!("retaining terminal frame: GPU image not yet prepared");
+        frame.0 = Some(current);
         return;
     };
 
     let size = gpu_image.texture_descriptor.size;
-    if size.width != frame.width || size.height != frame.height {
-        exchange.recycle_scene(frame.scene);
+    if size.width != current.width || size.height != current.height {
+        debug!(
+            "retaining terminal frame: texture is {}x{}, frame is {}x{}",
+            size.width, size.height, current.width, current.height
+        );
+        frame.0 = Some(current);
         return;
     }
 
@@ -220,17 +243,25 @@ fn render_terminal_frame(
         .get()
         .get_or_insert_with(|| GpuRenderer::new(device).expect("vello renderer"));
 
+    // The GPU image's own view decodes sRGB for sampling; Vello needs a plain
+    // `Rgba8Unorm` view to bind the texture as a storage target.
+    let storage_view = gpu_image.texture.create_view(&TextureViewDescriptor {
+        label: Some("terminal vello storage view"),
+        format: Some(TextureFormat::Rgba8Unorm),
+        ..Default::default()
+    });
+
     renderer
         .render_scene_to_texture_view(
             device,
             &render_queue,
-            &gpu_image.texture_view,
-            frame.width,
-            frame.height,
-            frame.base_color,
-            &frame.scene,
+            &storage_view,
+            current.width,
+            current.height,
+            current.base_color,
+            &current.scene,
         )
         .expect("render terminal scene into Bevy texture");
 
-    exchange.recycle_scene(frame.scene);
+    exchange.recycle_scene(current.scene);
 }
