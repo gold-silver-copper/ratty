@@ -8,10 +8,11 @@ use crate::keyboard::{TerminalClipboard, TerminalKeyBindings, handle_keyboard_in
 use crate::mouse::{TerminalSelection, handle_mouse_input};
 use crate::scene::{apply_terminal_presentation, setup_scene};
 use crate::systems::{
-    animate_mobius_transition, animate_terminal_plane_warp, apply_inline_objects,
-    apply_instance_brightness, handle_window_resize, pump_pty_output, redraw_soft_terminal,
+    TerminalFrameDirty, TerminalRedrawSet, animate_mobius_transition, animate_terminal_plane_warp,
+    apply_inline_objects, apply_instance_brightness, finish_terminal_model_load,
+    handle_window_resize, pump_pty_output, render_terminal_widget,
     request_exit_on_primary_window_close, shutdown_terminal_runtime_on_exit,
-    sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects,
+    sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects, sync_terminal_materials,
 };
 use crate::terminal::TerminalRedrawState;
 
@@ -24,6 +25,7 @@ impl Plugin for TerminalPlugin {
             .init_resource::<TerminalInlineObjects>()
             .init_resource::<TerminalRedrawState>()
             .init_resource::<TerminalKeyBindings>()
+            .init_resource::<TerminalFrameDirty>()
             .init_non_send::<TerminalClipboard>()
             .add_systems(Startup, setup_scene)
             .add_systems(Update, request_exit_on_primary_window_close)
@@ -41,22 +43,32 @@ impl Plugin for TerminalPlugin {
                 Update,
                 apply_inline_objects.after(apply_terminal_presentation),
             )
-            .add_systems(
+            .configure_sets(
                 Update,
-                redraw_soft_terminal
+                TerminalRedrawSet
                     .after(handle_mouse_input)
                     .after(handle_keyboard_input)
                     .after(handle_window_resize)
                     .after(pump_pty_output),
             )
-            .add_systems(Update, sync_inline_objects.after(redraw_soft_terminal))
+            .add_systems(
+                Update,
+                (
+                    render_terminal_widget,
+                    sync_terminal_materials,
+                    finish_terminal_model_load,
+                )
+                    .chain()
+                    .in_set(TerminalRedrawSet),
+            )
+            .add_systems(Update, sync_inline_objects.after(TerminalRedrawSet))
             .add_systems(Update, sync_rgp_objects.after(sync_inline_objects))
             .add_systems(Update, apply_instance_brightness.after(sync_rgp_objects))
             .add_systems(Update, animate_mobius_transition)
             .add_systems(Update, animate_terminal_plane_warp)
             .add_systems(
                 Update,
-                sync_asset_to_terminal_cursor.after(redraw_soft_terminal),
+                sync_asset_to_terminal_cursor.after(TerminalRedrawSet),
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
             .add_plugins(DirectTerminalRenderPlugin);

@@ -316,8 +316,8 @@ pub struct KeyboardSystemParams<'w, 's> {
     presentation: ResMut<'w, TerminalPresentation>,
     mobius_transition: ResMut<'w, MobiusTransition>,
     clipboard: NonSendMut<'w, TerminalClipboard>,
-    runtime: NonSendMut<'w, TerminalRuntime>,
-    terminal: NonSendMut<'w, TerminalSurface>,
+    runtime: ResMut<'w, TerminalRuntime>,
+    terminal: ResMut<'w, TerminalSurface>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     viewport: ResMut<'w, TerminalViewport>,
     sprite_query: TerminalSpriteLayoutQuery<'w, 's>,
@@ -505,7 +505,7 @@ pub fn handle_keyboard_input(
                             &mut params.plane_query,
                             &mut params.plane_back_query,
                         );
-                        params.redraw.request_immediate();
+                        params.redraw.request();
                     }
                     continue;
                 }

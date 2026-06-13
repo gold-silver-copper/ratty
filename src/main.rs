@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use anyhow::anyhow;
 use bevy::asset::AssetPlugin;
@@ -7,7 +5,7 @@ use bevy::prelude::*;
 use bevy::render::RenderPlugin;
 use bevy::render::settings::{WgpuSettings, WgpuSettingsPriority};
 use bevy::window::{PrimaryWindow, WindowCreated, WindowResolution};
-use bevy::winit::{UpdateMode, WINIT_WINDOWS, WinitSettings};
+use bevy::winit::{WINIT_WINDOWS, WinitSettings};
 use clap::Parser;
 
 #[cfg(target_os = "windows")]
@@ -21,8 +19,6 @@ use ratty::plugin::TerminalPlugin;
 use ratty::runtime::{RuntimeOptions, TerminalRuntime};
 use ratty::terminal::TerminalSurface;
 
-/// Focused-window update interval for low-power winit mode.
-const FOCUSED_UPDATE_INTERVAL: Duration = Duration::from_millis(33);
 // Matches the default icon id used by `winresource::WindowsResource::set_icon`.
 #[cfg(target_os = "windows")]
 const WINDOW_ICON_RESOURCE_ID: u16 = 1;
@@ -67,13 +63,13 @@ fn main() -> anyhow::Result<()> {
             (app_config.window.opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
         )))
         .insert_resource(app_config.clone())
-        .insert_non_send(runtime)
-        .insert_non_send(terminal)
+        .insert_resource(runtime)
+        .insert_resource(terminal)
         .insert_non_send(AppWindowIcon { icon: window_icon })
-        .insert_resource(WinitSettings {
-            focused_mode: UpdateMode::reactive_low_power(FOCUSED_UPDATE_INTERVAL),
-            unfocused_mode: UpdateMode::Continuous,
-        })
+        // Always update continuously, focused or not. Bevy's default switches
+        // unfocused windows to a reactive mode, which would delay background
+        // PTY output.
+        .insert_resource(WinitSettings::continuous())
         .add_plugins(
             DefaultPlugins
                 .set(WindowPlugin {

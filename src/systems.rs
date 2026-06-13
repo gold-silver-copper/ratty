@@ -8,7 +8,7 @@
 //! - [`handle_window_resize`]
 //! - [`crate::scene::apply_terminal_presentation`]
 //! - [`apply_inline_objects`]
-//! - [`redraw_soft_terminal`]
+//! - [`render_terminal_widget`]
 //! - [`sync_inline_objects`]
 //! - [`sync_rgp_objects`]
 //! - [`apply_instance_brightness`]
@@ -128,7 +128,7 @@ pub(crate) fn request_exit_on_primary_window_close(
 /// Shuts down the PTY runtime when Bevy begins exiting.
 pub(crate) fn shutdown_terminal_runtime_on_exit(
     mut app_exit: MessageReader<AppExit>,
-    mut runtime: NonSendMut<TerminalRuntime>,
+    mut runtime: ResMut<TerminalRuntime>,
     mut shutdown_started: Local<bool>,
 ) {
     if *shutdown_started {
@@ -144,14 +144,14 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 
 /// Pumps PTY output into the terminal parser.
 ///
-/// This runs early in the update schedule, before [`redraw_soft_terminal`]. It drains PTY output
+/// This runs early in the update schedule, before [`render_terminal_widget`]. It drains PTY output
 /// from [`TerminalRuntime`], feeds it through [`TerminalInlineObjects::consume_pty_output`] and
 /// requests a redraw through [`TerminalRedrawState`] when terminal state changed.
 ///
 /// It also updates scroll-coupled inline anchors before the redraw and sync passes rebuild the
 /// scene.
 pub fn pump_pty_output(
-    mut runtime: NonSendMut<TerminalRuntime>,
+    mut runtime: ResMut<TerminalRuntime>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
     mut app_exit: MessageWriter<AppExit>,
     mut redraw: ResMut<TerminalRedrawState>,
@@ -163,7 +163,7 @@ pub fn pump_pty_output(
 
     let mut processed_output = false;
     loop {
-        match runtime.rx.try_recv() {
+        match runtime.try_recv() {
             Ok(chunk) => {
                 let track_scroll = inline_objects.has_scroll_tracked_anchors();
                 let prev_rows: Option<Vec<String>> = if track_scroll {
@@ -219,8 +219,8 @@ fn infer_upward_scroll(prev_rows: &[String], next_rows: &[String]) -> u16 {
 #[derive(SystemParam)]
 pub(crate) struct ResizeParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
-    runtime: NonSendMut<'w, TerminalRuntime>,
-    terminal: NonSendMut<'w, TerminalSurface>,
+    runtime: ResMut<'w, TerminalRuntime>,
+    terminal: ResMut<'w, TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
     viewport: ResMut<'w, TerminalViewport>,
     sprite_query: TerminalSpriteLayoutQuery<'w, 's>,
@@ -281,7 +281,7 @@ pub(crate) fn handle_window_resize(
         plane_query,
         plane_back_query,
     );
-    redraw.request_immediate();
+    redraw.request();
 }
 
 /// Applies inline object visibility for the current presentation mode.
@@ -322,37 +322,38 @@ pub fn apply_inline_objects(
 }
 
 /// Redraw system parameters.
+/// Tracks whether the terminal frame was redrawn during the current update.
+#[derive(Resource, Default)]
+pub(crate) struct TerminalFrameDirty(pub bool);
+
+/// Ordered terminal redraw pipeline:
+/// [`render_terminal_widget`] → [`sync_terminal_materials`] →
+/// [`finish_terminal_model_load`].
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TerminalRedrawSet;
+
 #[derive(SystemParam)]
-pub(crate) struct RedrawParams<'w, 's> {
+pub(crate) struct RenderWidgetParams<'w> {
     app_config: Res<'w, AppConfig>,
-    runtime: NonSend<'w, TerminalRuntime>,
-    terminal: NonSendMut<'w, TerminalSurface>,
+    runtime: Res<'w, TerminalRuntime>,
+    terminal: ResMut<'w, TerminalSurface>,
     selection: Res<'w, TerminalSelection>,
     presentation: Res<'w, TerminalPresentation>,
     time: Res<'w, Time>,
     redraw: ResMut<'w, TerminalRedrawState>,
     images: ResMut<'w, Assets<Image>>,
     direct_render: Res<'w, DirectTerminalSceneExchange>,
-    model_load_state: ResMut<'w, ModelLoadState>,
-    commands: Commands<'w, 's>,
-    meshes: ResMut<'w, Assets<Mesh>>,
-    materials: ResMut<'w, Assets<StandardMaterial>>,
-    plane_materials: Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlane>>,
-    plane_back_materials:
-        Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlaneBack>>,
-    asset_server: Res<'w, AssetServer>,
+    model_load_state: Res<'w, ModelLoadState>,
+    frame_dirty: ResMut<'w, TerminalFrameDirty>,
 }
 
-/// Redraws the terminal surface.
+/// Redraws the Ratatui buffer and publishes the rendered terminal frame.
 ///
-/// This runs after [`pump_pty_output`] and [`crate::mouse::handle_mouse_input`]. It redraws the
-/// Ratatui buffer into [`TerminalSurface`], uploads the rendered image, refreshes the debug back
-/// texture and synchronizes the front and back plane materials to the latest terminal images.
-///
-/// On the first successful upload it defers cursor-model spawning to the next frame. After that,
-/// it ensures the cursor model exists so [`sync_asset_to_terminal_cursor`] can position it.
-pub(crate) fn redraw_soft_terminal(mut params: RedrawParams) {
-    let RedrawParams {
+/// This runs after [`pump_pty_output`] and [`crate::mouse::handle_mouse_input`]. It records
+/// whether the frame changed in [`TerminalFrameDirty`] so the rest of [`TerminalRedrawSet`]
+/// can skip its work on clean frames.
+pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
+    let RenderWidgetParams {
         app_config,
         runtime,
         terminal,
@@ -363,19 +364,15 @@ pub(crate) fn redraw_soft_terminal(mut params: RedrawParams) {
         images,
         direct_render,
         model_load_state,
-        commands,
-        meshes,
-        materials,
-        plane_materials,
-        plane_back_materials,
-        asset_server,
+        frame_dirty,
     } = &mut params;
     let needs_redraw = redraw.take();
     let force_live_redraw = matches!(
         presentation.mode,
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
     ) && !app_config.cursor.model.visible;
-    if !needs_redraw && !force_live_redraw && model_load_state.loaded {
+    frame_dirty.0 = needs_redraw || force_live_redraw || !model_load_state.loaded;
+    if !frame_dirty.0 {
         return;
     }
 
@@ -398,23 +395,84 @@ pub(crate) fn redraw_soft_terminal(mut params: RedrawParams) {
     });
 
     let _ = terminal.sync_image(images, direct_render, time.elapsed_secs());
-    if matches!(
+}
+
+#[derive(SystemParam)]
+pub(crate) struct SyncMaterialsParams<'w, 's> {
+    runtime: Res<'w, TerminalRuntime>,
+    terminal: Res<'w, TerminalSurface>,
+    presentation: Res<'w, TerminalPresentation>,
+    images: ResMut<'w, Assets<Image>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    plane_materials: Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlane>>,
+    plane_back_materials:
+        Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlaneBack>>,
+    frame_dirty: Res<'w, TerminalFrameDirty>,
+}
+
+/// Refreshes the debug back texture and plane materials after a redraw.
+pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
+    let SyncMaterialsParams {
+        runtime,
+        terminal,
+        presentation,
+        images,
+        materials,
+        plane_materials,
+        plane_back_materials,
+        frame_dirty,
+    } = &mut params;
+    if !frame_dirty.0 {
+        return;
+    }
+
+    let in_3d = matches!(
         presentation.mode,
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-    ) {
-        sync_terminal_debug_image(terminal, images, screen);
+    );
+    if in_3d {
+        sync_terminal_debug_image(terminal, images, runtime.parser.screen());
     }
 
     sync_plane_texture(terminal.image_handle.as_ref(), plane_materials, materials);
-    if matches!(
-        presentation.mode,
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-    ) {
+    if in_3d {
         sync_plane_texture(
             terminal.back_image_handle.as_ref(),
             plane_back_materials,
             materials,
         );
+    }
+}
+
+#[derive(SystemParam)]
+pub(crate) struct ModelLoadParams<'w, 's> {
+    app_config: Res<'w, AppConfig>,
+    model_load_state: ResMut<'w, ModelLoadState>,
+    redraw: ResMut<'w, TerminalRedrawState>,
+    commands: Commands<'w, 's>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<StandardMaterial>>,
+    asset_server: Res<'w, AssetServer>,
+    frame_dirty: Res<'w, TerminalFrameDirty>,
+}
+
+/// Completes deferred cursor-model loading once the first frame is uploaded.
+///
+/// The first successful upload defers cursor-model spawning to the next frame. After that, it
+/// ensures the cursor model exists so [`sync_asset_to_terminal_cursor`] can position it.
+pub(crate) fn finish_terminal_model_load(mut params: ModelLoadParams) {
+    let ModelLoadParams {
+        app_config,
+        model_load_state,
+        redraw,
+        commands,
+        meshes,
+        materials,
+        asset_server,
+        frame_dirty,
+    } = &mut params;
+    if !frame_dirty.0 {
+        return;
     }
 
     if !model_load_state.first_frame_uploaded {
@@ -436,7 +494,7 @@ pub(crate) fn redraw_soft_terminal(mut params: RedrawParams) {
 pub(crate) struct SyncInlineParams<'w, 's> {
     commands: Commands<'w, 's>,
     inline_objects: ResMut<'w, TerminalInlineObjects>,
-    terminal: NonSend<'w, TerminalSurface>,
+    terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     plane_warp: Res<'w, TerminalPlaneWarp>,
@@ -453,7 +511,7 @@ pub(crate) struct SyncInlineParams<'w, 's> {
 
 /// Synchronizes Kitty inline object entities.
 ///
-/// This runs after [`redraw_soft_terminal`]. It rebuilds the scene entities for registered
+/// This runs after [`render_terminal_widget`]. It rebuilds the scene entities for registered
 /// [`InlineObject::KittyImage`] values and clears stale inline entities first so the scene matches
 /// the latest terminal anchors exactly.
 ///
@@ -830,7 +888,7 @@ fn spawn_rgp_object(
 #[derive(SystemParam)]
 pub(crate) struct RgpSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
-    terminal: NonSend<'w, TerminalSurface>,
+    terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
@@ -1297,8 +1355,8 @@ fn apply_plane_warp(
 #[derive(SystemParam)]
 pub(crate) struct CursorSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
-    runtime: NonSend<'w, TerminalRuntime>,
-    terminal: NonSend<'w, TerminalSurface>,
+    runtime: Res<'w, TerminalRuntime>,
+    terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
     presentation: Res<'w, TerminalPresentation>,
     mobius_transition: Res<'w, MobiusTransition>,
@@ -1310,7 +1368,7 @@ pub(crate) struct CursorSyncParams<'w, 's> {
 
 /// Synchronizes the 3D cursor model with the terminal cursor.
 ///
-/// This runs after [`redraw_soft_terminal`], once the cursor model has been spawned and the latest
+/// This runs after [`render_terminal_widget`], once the cursor model has been spawned and the latest
 /// terminal cursor position is available from [`TerminalRuntime`]. It updates the [`CursorModel`]
 /// transform and visibility for both 2D and 3D presentation modes.
 ///

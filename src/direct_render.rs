@@ -10,9 +10,9 @@ use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{
     Extent3d, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
 };
-use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::render::renderer::{RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue};
 use bevy::render::texture::GpuImage;
-use bevy::render::{Extract, ExtractSchedule, Render, RenderApp, RenderSystems};
+use bevy::render::{Extract, ExtractSchedule, RenderApp};
 use parley_ratatui::ratatui::buffer::Buffer;
 use parley_ratatui::ratatui::layout::Position;
 use parley_ratatui::vello::Scene;
@@ -35,7 +35,13 @@ impl Plugin for DirectTerminalRenderPlugin {
         render_app.world_mut().insert_resource(exchange);
         render_app.init_resource::<ExtractedDirectTerminalFrame>();
         render_app.add_systems(ExtractSchedule, extract_terminal_frame);
-        render_app.add_systems(Render, render_terminal_frame.in_set(RenderSystems::Prepare));
+        // Render inside the render-graph schedule so Vello's submission is
+        // ordered with the frame's GPU work: `Begin` runs before the camera
+        // passes that sample the terminal texture.
+        render_app.add_systems(
+            RenderGraph,
+            render_terminal_frame.in_set(RenderGraphSystems::Begin),
+        );
     }
 }
 

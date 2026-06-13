@@ -1,7 +1,5 @@
 //! Terminal surface rendering and Ratatui integration.
 
-use std::time::{Duration, Instant};
-
 use bevy::prelude::*;
 use parley_ratatui::ratatui::Terminal;
 use parley_ratatui::ratatui::buffer::Buffer;
@@ -18,9 +16,6 @@ use crate::direct_render::{
     DirectTerminalSceneExchange, resize_terminal_image, update_direct_terminal_frame,
 };
 use crate::mouse::TerminalSelection;
-
-/// Minimum interval between terminal redraws.
-const REDRAW_THROTTLE: Duration = Duration::from_millis(16);
 
 /// Terminal grid and presentation dimensions.
 #[derive(Clone, Copy, Debug)]
@@ -58,15 +53,11 @@ impl TerminalLayout {
 #[derive(Resource)]
 pub struct TerminalRedrawState {
     needs_redraw: bool,
-    last_redraw: Instant,
 }
 
 impl Default for TerminalRedrawState {
     fn default() -> Self {
-        Self {
-            needs_redraw: true,
-            last_redraw: Instant::now() - REDRAW_THROTTLE,
-        }
+        Self { needs_redraw: true }
     }
 }
 
@@ -76,24 +67,14 @@ impl TerminalRedrawState {
         self.needs_redraw = true;
     }
 
-    /// Requests a redraw without waiting for the throttle interval.
-    pub fn request_immediate(&mut self) {
-        self.needs_redraw = true;
-        self.last_redraw = Instant::now() - REDRAW_THROTTLE;
-    }
-
     /// Returns whether a redraw was pending.
     pub fn take(&mut self) -> bool {
-        if !self.needs_redraw || self.last_redraw.elapsed() < REDRAW_THROTTLE {
-            return false;
-        }
-        self.needs_redraw = false;
-        self.last_redraw = Instant::now();
-        true
+        std::mem::take(&mut self.needs_redraw)
     }
 }
 
 /// Terminal surface and render state.
+#[derive(Resource)]
 pub struct TerminalSurface {
     /// Ratatui terminal backend.
     pub tui: Terminal<ParleyBackend>,
