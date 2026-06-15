@@ -56,7 +56,12 @@ pub fn sync_plane_texture<'a>(
     };
 
     for material_handle in material_handles {
-        if let Some(mut material) = materials.get_mut(&material_handle.0) {
+        // `get_mut` marks the material modified and re-prepares it on the GPU;
+        // only take it when the texture handle actually changes.
+        let needs_update = materials
+            .get(&material_handle.0)
+            .is_some_and(|material| material.base_color_texture.as_ref() != Some(image_handle));
+        if needs_update && let Some(mut material) = materials.get_mut(&material_handle.0) {
             material.base_color_texture = Some(image_handle.clone());
         }
     }

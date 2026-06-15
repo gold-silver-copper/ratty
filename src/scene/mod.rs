@@ -214,6 +214,8 @@ pub(crate) struct PresentationParams<'w, 's> {
             PlaneCameraQuery<'w, 's>,
         ),
     >,
+    camera_2d: Query<'w, 's, &'static mut Camera, (With<Camera2d>, Without<TerminalPlaneCamera>)>,
+    camera_3d: Query<'w, 's, &'static mut Camera, (With<TerminalPlaneCamera>, Without<Camera2d>)>,
 }
 
 #[derive(SystemParam)]
@@ -449,6 +451,8 @@ pub(crate) fn apply_terminal_presentation(
         plane_materials,
         materials,
         plane_transforms,
+        camera_2d,
+        camera_3d,
     } = &mut params;
     let is_3d = presentation.mode.is_3d();
     let is_mobius = presentation.mode.is_mobius();
@@ -496,10 +500,35 @@ pub(crate) fn apply_terminal_presentation(
         };
     }
 
-    if let Ok(front_material) = plane_materials.single()
-        && let Some(mut material) = materials.get_mut(&front_material.0)
-    {
-        material.cull_mode = if is_mobius { None } else { Some(Face::Back) };
+    if let Ok(front_material) = plane_materials.single() {
+        let cull_mode = if is_mobius { None } else { Some(Face::Back) };
+        // `get_mut` marks the material modified and re-prepares it on the
+        // GPU; only take it when the cull mode actually changes.
+        let needs_update = materials
+            .get(&front_material.0)
+            .is_some_and(|material| material.cull_mode != cull_mode);
+        if needs_update && let Some(mut material) = materials.get_mut(&front_material.0) {
+            material.cull_mode = cull_mode;
+        }
+    }
+
+    // The 2D camera only contributes in flat mode; the 3D camera stays active
+    // everywhere because the cursor model and RGP objects render through it
+    // even in 2D mode. Whichever camera renders first owns the screen clear.
+    for mut camera in camera_2d.iter_mut() {
+        let active = !is_3d;
+        if camera.is_active != active {
+            camera.is_active = active;
+        }
+    }
+    // This system only runs when presentation state changes, so assigning
+    // unconditionally does not churn change detection every frame.
+    for mut camera in camera_3d.iter_mut() {
+        camera.clear_color = if is_3d {
+            ClearColorConfig::Default
+        } else {
+            ClearColorConfig::None
+        };
     }
 
     for mut transform in &mut plane_transforms.p0() {

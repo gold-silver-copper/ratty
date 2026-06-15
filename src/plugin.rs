@@ -2,11 +2,17 @@
 
 use bevy::prelude::*;
 
+use crate::config::AppConfig;
 use crate::direct_render::DirectTerminalRenderPlugin;
-use crate::inline::TerminalInlineObjects;
+use crate::inline::{
+    TerminalInlineObjectPlane, TerminalInlineObjectSprite, TerminalInlineObjects, TerminalRgpObject,
+};
 use crate::keyboard::{TerminalClipboard, TerminalKeyBindings, handle_keyboard_input};
 use crate::mouse::{TerminalSelection, handle_mouse_input};
-use crate::scene::{apply_terminal_presentation, setup_scene};
+use crate::scene::{
+    MobiusTransition, TerminalPlaneView, TerminalPresentation, TerminalPresentationMode,
+    apply_terminal_presentation, setup_scene,
+};
 use crate::systems::{
     TerminalFrameDirty, TerminalRedrawSet, animate_mobius_transition, animate_terminal_plane_warp,
     apply_inline_objects, apply_instance_brightness, finish_terminal_model_load,
@@ -15,6 +21,17 @@ use crate::systems::{
     sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects, sync_terminal_materials,
 };
 use crate::terminal::TerminalRedrawState;
+
+/// Inline object entities spawned since the visibility pass last ran.
+type AddedInlineObjects<'w, 's> = Query<
+    'w,
+    's,
+    (),
+    Or<(
+        Added<TerminalInlineObjectSprite>,
+        Added<TerminalInlineObjectPlane>,
+    )>,
+>;
 
 /// Main terminal plugin.
 pub struct TerminalPlugin;
@@ -37,11 +54,26 @@ impl Plugin for TerminalPlugin {
                 Update,
                 apply_terminal_presentation
                     .after(handle_keyboard_input)
-                    .after(handle_mouse_input),
+                    .after(handle_mouse_input)
+                    .run_if(
+                        |presentation: Res<TerminalPresentation>,
+                         plane_view: Res<TerminalPlaneView>,
+                         mobius_transition: Res<MobiusTransition>| {
+                            presentation.is_changed()
+                                || plane_view.is_changed()
+                                || mobius_transition.is_changed()
+                        },
+                    ),
             )
             .add_systems(
                 Update,
-                apply_inline_objects.after(apply_terminal_presentation),
+                apply_inline_objects
+                    .after(apply_terminal_presentation)
+                    .run_if(
+                        |presentation: Res<TerminalPresentation>, added: AddedInlineObjects| {
+                            presentation.is_changed() || !added.is_empty()
+                        },
+                    ),
             )
             .configure_sets(
                 Update,
@@ -62,13 +94,34 @@ impl Plugin for TerminalPlugin {
                     .in_set(TerminalRedrawSet),
             )
             .add_systems(Update, sync_inline_objects.after(TerminalRedrawSet))
-            .add_systems(Update, sync_rgp_objects.after(sync_inline_objects))
-            .add_systems(Update, apply_instance_brightness.after(sync_rgp_objects))
-            .add_systems(Update, animate_mobius_transition)
-            .add_systems(Update, animate_terminal_plane_warp)
             .add_systems(
                 Update,
-                sync_asset_to_terminal_cursor.after(TerminalRedrawSet),
+                sync_rgp_objects
+                    .after(sync_inline_objects)
+                    .run_if(|objects: Query<(), With<TerminalRgpObject>>| !objects.is_empty()),
+            )
+            .add_systems(Update, apply_instance_brightness.after(sync_rgp_objects))
+            .add_systems(
+                Update,
+                animate_mobius_transition.run_if(
+                    |presentation: Res<TerminalPresentation>,
+                     mobius_transition: Res<MobiusTransition>| {
+                        presentation.mode == TerminalPresentationMode::Mobius3d
+                            || mobius_transition.active
+                    },
+                ),
+            )
+            .add_systems(
+                Update,
+                animate_terminal_plane_warp.run_if(|presentation: Res<TerminalPresentation>| {
+                    presentation.mode != TerminalPresentationMode::Flat2d
+                }),
+            )
+            .add_systems(
+                Update,
+                sync_asset_to_terminal_cursor
+                    .after(TerminalRedrawSet)
+                    .run_if(|config: Res<AppConfig>| config.cursor.model.visible),
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
             .add_plugins(DirectTerminalRenderPlugin);

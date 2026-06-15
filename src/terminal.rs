@@ -240,14 +240,20 @@ impl TerminalSurface {
         let Some(handle) = self.image_handle.as_ref() else {
             return Ok(());
         };
-        let Some(mut image) = images.get_mut(handle) else {
-            return Ok(());
-        };
-
         let (width, height) = self
             .renderer
             .texture_size_for_buffer(self.tui.backend().buffer());
-        resize_terminal_image(&mut image, width, height);
+        // `get_mut` marks the asset modified, which makes Bevy re-extract and
+        // re-upload the CPU-side buffer; only take it when the size changes.
+        let Some(image) = images.get(handle) else {
+            return Ok(());
+        };
+        let size = image.texture_descriptor.size;
+        if (size.width != width || size.height != height)
+            && let Some(mut image) = images.get_mut(handle)
+        {
+            resize_terminal_image(&mut image, width, height);
+        }
 
         let buffer = self.tui.backend().buffer();
         let cursor = Some(self.tui.backend().cursor_position());

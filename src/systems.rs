@@ -332,19 +332,23 @@ pub(crate) struct TerminalFrameDirty(pub bool);
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct TerminalRedrawSet;
 
+/// Half-period of the fastest blink cadence the renderer supports (rapid
+/// blink); slow blink (0.5s) is a multiple of it.
+const BLINK_TICK_SECS: f32 = 0.25;
+
 #[derive(SystemParam)]
-pub(crate) struct RenderWidgetParams<'w> {
+pub(crate) struct RenderWidgetParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     runtime: Res<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
     selection: Res<'w, TerminalSelection>,
-    presentation: Res<'w, TerminalPresentation>,
     time: Res<'w, Time>,
     redraw: ResMut<'w, TerminalRedrawState>,
     images: ResMut<'w, Assets<Image>>,
     direct_render: Res<'w, DirectTerminalSceneExchange>,
     model_load_state: Res<'w, ModelLoadState>,
     frame_dirty: ResMut<'w, TerminalFrameDirty>,
+    blink_phase: Local<'s, u64>,
 }
 
 /// Redraws the Ratatui buffer and publishes the rendered terminal frame.
@@ -358,20 +362,22 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         runtime,
         terminal,
         selection,
-        presentation,
         time,
         redraw,
         images,
         direct_render,
         model_load_state,
         frame_dirty,
+        blink_phase,
     } = &mut params;
     let needs_redraw = redraw.take();
-    let force_live_redraw = matches!(
-        presentation.mode,
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
-    ) && !app_config.cursor.model.visible;
-    frame_dirty.0 = needs_redraw || force_live_redraw || !model_load_state.loaded;
+    // The texture content only changes with terminal state or blink phase;
+    // warp and camera animations are mesh- and camera-side. Rebuilding on
+    // blink ticks instead of every frame keeps idle scene builds at 4Hz.
+    let phase = (time.elapsed_secs() / BLINK_TICK_SECS) as u64;
+    let blink_ticked = **blink_phase != phase;
+    **blink_phase = phase;
+    frame_dirty.0 = needs_redraw || blink_ticked || !model_load_state.loaded;
     if !frame_dirty.0 {
         return;
     }
