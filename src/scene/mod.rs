@@ -15,7 +15,7 @@ use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFor
 use bevy::window::PrimaryWindow;
 
 use crate::config::AppConfig;
-use crate::direct_render::new_terminal_image;
+use crate::direct_render::{new_terminal_image, new_terminal_render_image};
 use crate::runtime::TerminalRuntime;
 use crate::terminal::{
     TerminalLayout, TerminalSurface, render_scale_for_window, snapped_translation,
@@ -284,6 +284,13 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     ));
 
     let terminal_alpha = (terminal_opacity * 255.0).round() as u8;
+    let render_image_handle = images.add(new_terminal_render_image(
+        layout.texture_size.x,
+        layout.texture_size.y,
+        crate::config::TERMINAL_RENDER_TEXTURE_LABEL,
+    ));
+    terminal.render_image_handle = Some(render_image_handle);
+
     let image_handle = images.add(new_terminal_image(
         layout.texture_size.x,
         layout.texture_size.y,

@@ -78,8 +78,11 @@ impl TerminalRedrawState {
 pub struct TerminalSurface {
     /// Ratatui terminal backend.
     pub tui: Terminal<ParleyBackend>,
-    /// Front texture image handle.
+    /// Front texture image handle (sampled by the plane material and sprite).
     pub image_handle: Option<Handle<Image>>,
+    /// Vello render-target handle. Vello rasterizes into this storage texture
+    /// and it is copied into [`Self::image_handle`] each frame.
+    pub render_image_handle: Option<Handle<Image>>,
     /// Back texture image handle.
     pub back_image_handle: Option<Handle<Image>>,
     /// Terminal column count.
@@ -124,6 +127,7 @@ impl TerminalSurface {
         Ok(Self {
             tui,
             image_handle: None,
+            render_image_handle: None,
             back_image_handle: None,
             cols,
             rows,
@@ -237,22 +241,28 @@ impl TerminalSurface {
         exchange: &DirectTerminalSceneExchange,
         elapsed_secs: f32,
     ) -> anyhow::Result<()> {
-        let Some(handle) = self.image_handle.as_ref() else {
+        let (Some(render_handle), Some(present_handle)) =
+            (self.render_image_handle.clone(), self.image_handle.clone())
+        else {
             return Ok(());
         };
         let (width, height) = self
             .renderer
             .texture_size_for_buffer(self.tui.backend().buffer());
-        // `get_mut` marks the asset modified, which makes Bevy re-extract and
-        // re-upload the CPU-side buffer; only take it when the size changes.
-        let Some(image) = images.get(handle) else {
-            return Ok(());
-        };
-        let size = image.texture_descriptor.size;
-        if (size.width != width || size.height != height)
-            && let Some(mut image) = images.get_mut(handle)
-        {
-            resize_terminal_image(&mut image, width, height);
+        // The render and present textures are kept the same size so the copy is
+        // a plain texel copy. `get_mut` marks the asset modified, which makes
+        // Bevy re-extract and re-upload the CPU-side buffer; only take it when
+        // the size changes.
+        for handle in [&render_handle, &present_handle] {
+            let Some(image) = images.get(handle) else {
+                continue;
+            };
+            let size = image.texture_descriptor.size;
+            if (size.width != width || size.height != height)
+                && let Some(mut image) = images.get_mut(handle)
+            {
+                resize_terminal_image(&mut image, width, height);
+            }
         }
 
         let buffer = self.tui.backend().buffer();
@@ -260,7 +270,8 @@ impl TerminalSurface {
         let cursor_visible = self.tui.backend().cursor_visible();
         update_direct_terminal_frame(
             exchange,
-            handle.clone(),
+            render_handle,
+            present_handle,
             &mut self.renderer,
             buffer,
             cursor,

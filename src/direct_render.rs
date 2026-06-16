@@ -8,7 +8,8 @@ use bevy::platform::cell::SyncCell;
 use bevy::prelude::*;
 use bevy::render::render_asset::RenderAssets;
 use bevy::render::render_resource::{
-    Extent3d, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+    CommandEncoderDescriptor, Extent3d, TextureDimension, TextureFormat, TextureUsages,
+    TextureViewDescriptor,
 };
 use bevy::render::renderer::{RenderDevice, RenderGraph, RenderGraphSystems, RenderQueue};
 use bevy::render::texture::GpuImage;
@@ -46,7 +47,11 @@ impl Plugin for DirectTerminalRenderPlugin {
 }
 
 struct DirectTerminalFrame {
-    image: Handle<Image>,
+    /// Plain `Rgba8Unorm` storage texture Vello rasterizes into.
+    render_image: Handle<Image>,
+    /// `Rgba8Unorm` texture (sampled via an sRGB view) the render image is
+    /// copied into for the materials to sample.
+    present_image: Handle<Image>,
     width: u32,
     height: u32,
     base_color: PenikoColor,
@@ -132,14 +137,18 @@ impl DirectTerminalSceneExchange {
     }
 }
 
-/// Creates the terminal render target.
+/// Creates the terminal **present** texture that the plane material and sprite
+/// sample.
 ///
-/// Vello requires an `Rgba8Unorm` storage texture and writes sRGB-encoded,
-/// display-ready bytes into it. Bevy samples through a separate
-/// `Rgba8UnormSrgb` view so those bytes are decoded on sample instead of
-/// being re-encoded at the swapchain (which washes out colors). The data is
-/// zero-filled so a frame that samples the texture before Vello first writes
-/// it shows transparent black rather than uninitialized memory.
+/// Vello renders into the separate [`new_terminal_render_image`] storage
+/// texture and writes sRGB-encoded, display-ready bytes; those bytes are copied
+/// here each frame (same `Rgba8Unorm` format) and sampled through an
+/// `Rgba8UnormSrgb` view so they are decoded on sample instead of being
+/// re-encoded at the swapchain (which washes out colors). This texture has no
+/// `STORAGE_BINDING`, so the sRGB view is valid on every backend — wgpu rejects
+/// an sRGB view of a storage texture. The data is zero-filled so a frame
+/// sampled before the first copy shows transparent black rather than
+/// uninitialized memory.
 pub(crate) fn new_terminal_image(width: u32, height: u32, label: &'static str) -> Image {
     let mut image = Image::new_fill(
         Extent3d {
@@ -153,8 +162,7 @@ pub(crate) fn new_terminal_image(width: u32, height: u32, label: &'static str) -
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     );
     image.texture_descriptor.label = Some(label);
-    image.texture_descriptor.usage =
-        TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING;
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
     image.texture_descriptor.view_formats = &[TextureFormat::Rgba8UnormSrgb];
     image.texture_view_descriptor = Some(TextureViewDescriptor {
         format: Some(TextureFormat::Rgba8UnormSrgb),
@@ -166,6 +174,32 @@ pub(crate) fn new_terminal_image(width: u32, height: u32, label: &'static str) -
     // as pixelation. Cell-edge seams are prevented at authoring time in
     // parley_ratatui (pixel-snapped cell fills), not by the sampler.
     image.sampler = ImageSampler::linear();
+    image
+}
+
+/// Creates the terminal **render** texture that Vello rasterizes into.
+///
+/// Vello binds it as a compute storage target, so it must be a plain
+/// `Rgba8Unorm` texture with no sRGB view: wgpu rejects an sRGB view of a
+/// storage texture (`STORAGE_BINDING`), which crashes bind-group creation on
+/// strict backends. Its sRGB-encoded contents are copied into the
+/// [`new_terminal_image`] present texture for sampling, so this texture is only
+/// ever a copy source and is never sampled directly.
+pub(crate) fn new_terminal_render_image(width: u32, height: u32, label: &'static str) -> Image {
+    let mut image = Image::new_fill(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+    );
+    image.texture_descriptor.label = Some(label);
+    image.texture_descriptor.usage =
+        TextureUsages::STORAGE_BINDING | TextureUsages::COPY_SRC | TextureUsages::COPY_DST;
     image
 }
 
@@ -185,7 +219,8 @@ pub(crate) fn resize_terminal_image(image: &mut Image, width: u32, height: u32) 
 
 pub(crate) fn update_direct_terminal_frame(
     exchange: &DirectTerminalSceneExchange,
-    image: Handle<Image>,
+    render_image: Handle<Image>,
+    present_image: Handle<Image>,
     terminal_renderer: &mut TerminalRenderer,
     buffer: &Buffer,
     cursor: Option<Position>,
@@ -200,7 +235,8 @@ pub(crate) fn update_direct_terminal_frame(
     let scene = terminal_renderer.replace_scene(spare_scene);
 
     exchange.publish_frame(DirectTerminalFrame {
-        image,
+        render_image,
+        present_image,
         width,
         height,
         base_color,
@@ -232,17 +268,30 @@ fn render_terminal_frame(
     };
     // Retain undrawable frames and retry on the next render frame; a newer
     // published frame supersedes a retained one during extraction.
-    let Some(gpu_image) = gpu_images.get(&current.image) else {
+    let (Some(render_image), Some(present_image)) = (
+        gpu_images.get(&current.render_image),
+        gpu_images.get(&current.present_image),
+    ) else {
         debug!("retaining terminal frame: GPU image not yet prepared");
         frame.0 = Some(current);
         return;
     };
 
-    let size = gpu_image.texture_descriptor.size;
-    if size.width != current.width || size.height != current.height {
+    let render_size = render_image.texture_descriptor.size;
+    let present_size = present_image.texture_descriptor.size;
+    if render_size.width != current.width
+        || render_size.height != current.height
+        || present_size.width != current.width
+        || present_size.height != current.height
+    {
         debug!(
-            "retaining terminal frame: texture is {}x{}, frame is {}x{}",
-            size.width, size.height, current.width, current.height
+            "retaining terminal frame: render {}x{}, present {}x{}, frame {}x{}",
+            render_size.width,
+            render_size.height,
+            present_size.width,
+            present_size.height,
+            current.width,
+            current.height
         );
         frame.0 = Some(current);
         return;
@@ -254,25 +303,36 @@ fn render_terminal_frame(
         .get()
         .get_or_insert_with(|| GpuRenderer::new(device).expect("vello renderer"));
 
-    // The GPU image's own view decodes sRGB for sampling; Vello needs a plain
-    // `Rgba8Unorm` view to bind the texture as a storage target.
-    let storage_view = gpu_image.texture.create_view(&TextureViewDescriptor {
-        label: Some("terminal vello storage view"),
-        format: Some(TextureFormat::Rgba8Unorm),
-        ..Default::default()
-    });
-
+    // Vello rasterizes into the plain `Rgba8Unorm` storage texture; its default
+    // view is storage-compatible (no sRGB reinterpretation).
     renderer
         .render_scene_to_texture_view(
             device,
             &render_queue,
-            &storage_view,
+            &render_image.texture_view,
             current.width,
             current.height,
             current.base_color,
             &current.scene,
         )
         .expect("render terminal scene into Bevy texture");
+
+    // Copy the rendered, sRGB-encoded bytes into the present texture, which the
+    // materials sample through an `Rgba8UnormSrgb` view to decode them. Both
+    // textures are `Rgba8Unorm`, so this is a plain same-format texel copy.
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("terminal present copy"),
+    });
+    encoder.copy_texture_to_texture(
+        render_image.texture.as_image_copy(),
+        present_image.texture.as_image_copy(),
+        Extent3d {
+            width: current.width,
+            height: current.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    render_queue.submit([encoder.finish()]);
 
     exchange.recycle_scene(current.scene);
 }
