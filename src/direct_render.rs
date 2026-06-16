@@ -46,6 +46,14 @@ impl Plugin for DirectTerminalRenderPlugin {
     }
 }
 
+/// The pair of textures a terminal frame is rendered through: Vello rasterizes
+/// into `render` (a plain `Rgba8Unorm` storage texture) and it is copied into
+/// `present` (sampled via an sRGB view) for the materials to sample.
+pub(crate) struct TerminalImages {
+    pub render: Handle<Image>,
+    pub present: Handle<Image>,
+}
+
 struct DirectTerminalFrame {
     /// Plain `Rgba8Unorm` storage texture Vello rasterizes into.
     render_image: Handle<Image>,
@@ -219,8 +227,7 @@ pub(crate) fn resize_terminal_image(image: &mut Image, width: u32, height: u32) 
 
 pub(crate) fn update_direct_terminal_frame(
     exchange: &DirectTerminalSceneExchange,
-    render_image: Handle<Image>,
-    present_image: Handle<Image>,
+    images: TerminalImages,
     terminal_renderer: &mut TerminalRenderer,
     buffer: &Buffer,
     cursor: Option<Position>,
@@ -235,8 +242,8 @@ pub(crate) fn update_direct_terminal_frame(
     let scene = terminal_renderer.replace_scene(spare_scene);
 
     exchange.publish_frame(DirectTerminalFrame {
-        render_image,
-        present_image,
+        render_image: images.render,
+        present_image: images.present,
         width,
         height,
         base_color,

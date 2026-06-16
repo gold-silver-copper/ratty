@@ -13,7 +13,7 @@ use parley_ratatui::{
 
 use crate::config::{AppConfig, FontConfig, FontStyleConfig, ThemeConfig};
 use crate::direct_render::{
-    DirectTerminalSceneExchange, resize_terminal_image, update_direct_terminal_frame,
+    DirectTerminalSceneExchange, TerminalImages, resize_terminal_image, update_direct_terminal_frame,
 };
 use crate::mouse::TerminalSelection;
 
@@ -270,8 +270,10 @@ impl TerminalSurface {
         let cursor_visible = self.tui.backend().cursor_visible();
         update_direct_terminal_frame(
             exchange,
-            render_handle,
-            present_handle,
+            TerminalImages {
+                render: render_handle,
+                present: present_handle,
+            },
             &mut self.renderer,
             buffer,
             cursor,
