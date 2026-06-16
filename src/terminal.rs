@@ -13,7 +13,8 @@ use parley_ratatui::{
 
 use crate::config::{AppConfig, FontConfig, FontStyleConfig, ThemeConfig};
 use crate::direct_render::{
-    DirectTerminalSceneExchange, TerminalImages, resize_terminal_image, update_direct_terminal_frame,
+    DirectTerminalSceneExchange, TerminalImages, resize_terminal_image,
+    update_direct_terminal_frame,
 };
 use crate::mouse::TerminalSelection;
 
