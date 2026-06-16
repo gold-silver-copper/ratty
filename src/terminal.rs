@@ -159,7 +159,7 @@ impl TerminalSurface {
     }
 
     /// Updates the physical render scale.
-    pub fn set_render_scale(&mut self, render_scale: f32) -> bool {
+    fn set_render_scale(&mut self, render_scale: f32) -> bool {
         let render_scale = render_scale.max(1.0);
         if (render_scale - self.render_scale).abs() < f32::EPSILON {
             return false;
@@ -222,7 +222,7 @@ impl TerminalSurface {
     }
 
     /// Returns the current terminal layout.
-    pub fn layout(&self) -> TerminalLayout {
+    fn layout(&self) -> TerminalLayout {
         TerminalLayout::new(
             self.cols,
             self.rows,
