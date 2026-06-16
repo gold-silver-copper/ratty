@@ -226,9 +226,11 @@ Current workflow:
 2. `parley_ratatui` shapes the buffer with Parley and records it as a Vello scene
 3. The scene is handed to Bevy's render world through a double-buffered
    exchange (scenes are recycled between frames, never cloned or re-recorded)
-4. Vello renders the scene directly into the Bevy-owned GPU texture on Bevy's
-   render-world device, with no CPU readback in between
-5. Bevy presents that texture in the 2D and 3D scenes
+4. Vello renders the scene on Bevy's render-world device into a plain
+   `Rgba8Unorm` storage texture, with no CPU readback in between
+5. That storage texture is copied into an `Rgba8UnormSrgb` present texture
+   (sampled through an sRGB view, so Vello's sRGB-encoded output is decoded on
+   sample instead of re-encoded), which Bevy presents in the 2D and 3D scenes
 
 The terminal image is fully GPU-resident: the only data crossing from the main
 world to the render world each frame is the recorded scene, not pixels.
