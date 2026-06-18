@@ -1,9 +1,8 @@
 [window]
 width = 960
 height = 620
-# Overrides the display scale factor; leave unset to render at native scale.
-# scale_factor = 1.0
 opacity = 0.8
+# scale_factor = 1.0
 
 [terminal]
 default_cols = 104
@@ -20,8 +19,7 @@ TERM = "xterm-256color"
 [font]
 family = "DejaVu Sans Mono"
 style = "Regular"
-# Font size in points.
-size = 18
+size = 12
 
 [cursor.model]
 path = "CairoSpinyMouse.obj"
