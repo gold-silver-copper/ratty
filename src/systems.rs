@@ -264,6 +264,13 @@ pub(crate) fn handle_window_resize(
         return;
     };
 
+    // Minimizing the window reports a 0x0 size. Skip it so the terminal keeps
+    // its last good grid instead of collapsing to a degenerate size that the
+    // vt100 parser can't safely process.
+    if window_size.x < 1.0 || window_size.y < 1.0 {
+        return;
+    }
+
     let window_size = window_size.max(Vec2::ONE);
     let layout = terminal.resize_to_fit(window_size, render_scale_for_window(window));
     let pty_pixels = layout.pty_pixels();

@@ -175,12 +175,16 @@ impl TerminalSurface {
 
         let metrics = self.renderer.logical_metrics(self.render_scale);
         let logical_size = logical_size.max(Vec2::ONE);
+        // A single-column grid makes vt100's wide-character wrap logic
+        // underflow (`cols - width` for a 2-cell glyph), so keep at least two.
         let cols = (logical_size.x / metrics.cell_width)
             .floor()
-            .clamp(1.0, u16::MAX as f32) as u16;
+            .clamp(2.0, u16::MAX as f32) as u16;
+        // Likewise, a single-row grid makes vt100's wrap/scroll bookkeeping
+        // underflow (`prev_row - scrolled`), so keep at least two rows.
         let rows = (logical_size.y / metrics.cell_height)
             .floor()
-            .clamp(1.0, u16::MAX as f32) as u16;
+            .clamp(2.0, u16::MAX as f32) as u16;
 
         if cols != self.cols || rows != self.rows {
             self.resize(cols, rows);

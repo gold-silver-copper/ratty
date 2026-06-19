@@ -4,7 +4,7 @@ use bevy::asset::AssetPlugin;
 use bevy::prelude::*;
 use bevy::render::RenderPlugin;
 use bevy::render::settings::{WgpuSettings, WgpuSettingsPriority};
-use bevy::window::{PrimaryWindow, WindowCreated, WindowResolution};
+use bevy::window::{PrimaryWindow, WindowCreated, WindowResizeConstraints, WindowResolution};
 use bevy::winit::{WINIT_WINDOWS, WinitSettings};
 use clap::Parser;
 
@@ -77,6 +77,11 @@ fn main() -> anyhow::Result<()> {
                         title: window_title.clone(),
                         name: Some(window_title),
                         resolution: window_resolution(&app_config),
+                        resize_constraints: WindowResizeConstraints {
+                            min_width: 1.0,
+                            min_height: 1.0,
+                            ..default()
+                        },
                         transparent: app_config.window.opacity < 1.0,
                         visible: false,
                         ..default()
