@@ -16,7 +16,7 @@ exclude = ["website/**", ".github/**", "widget/**"]
 anyhow = "1.0"
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 base64 = "0.22"
-bevy = { version = "0.19.0-rc.2", default-features = false, features = [
+bevy = { version = "0.19.0", default-features = false, features = [
     "std",
     "async_executor",
     "bevy_asset",

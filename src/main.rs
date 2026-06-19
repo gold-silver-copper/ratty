@@ -88,12 +88,12 @@ fn main() -> anyhow::Result<()> {
                     ..default()
                 })
                 .set(RenderPlugin {
-                    render_creation: bevy::render::settings::RenderCreation::Automatic(
+                    render_creation: bevy::render::settings::RenderCreation::Automatic(Box::new(
                         WgpuSettings {
-                            priority: WgpuSettingsPriority::Compatibility,
+                            priority: WgpuSettingsPriority::WebGPU,
                             ..default()
                         },
-                    ),
+                    )),
                     ..default()
                 }),
         )
