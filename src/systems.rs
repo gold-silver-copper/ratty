@@ -30,6 +30,7 @@ use crate::inline::{
 use crate::model::CursorModel;
 use crate::model::spawn_cursor_model;
 use crate::mouse::TerminalSelection;
+use crate::present::TerminalPresentMaterial;
 use crate::rendering::{sync_plane_texture, sync_terminal_debug_image};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
@@ -413,6 +414,8 @@ pub(crate) struct SyncMaterialsParams<'w, 's> {
     plane_materials: Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlane>>,
     plane_back_materials:
         Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlaneBack>>,
+    present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
+    present_query: Query<'w, 's, &'static MeshMaterial2d<TerminalPresentMaterial>>,
     frame_dirty: Res<'w, TerminalFrameDirty>,
 }
 
@@ -426,10 +429,26 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
         materials,
         plane_materials,
         plane_back_materials,
+        present_materials,
+        present_query,
         frame_dirty,
     } = &mut params;
     if !frame_dirty.0 {
         return;
+    }
+
+    // The present texture's GpuImage is recreated when the terminal resizes (window
+    // resize / font zoom), which invalidates the 2D present material's cached bind
+    // group. Writing the texture handle — not merely touching the asset with
+    // `get_mut` — advances the material's change tick so Bevy re-prepares the bind
+    // group against the current GpuImage; a no-op touch leaves the quad sampling a
+    // stale texture and the flat view freezes. Matches the plane handling.
+    if let Some(present_image) = terminal.image_handle.as_ref() {
+        for present_handle in present_query.iter() {
+            if let Some(mut material) = present_materials.get_mut(&present_handle.0) {
+                material.texture = present_image.clone();
+            }
+        }
     }
 
     let in_3d = matches!(

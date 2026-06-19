@@ -7,8 +7,8 @@ use parley_ratatui::ratatui::layout::Rect;
 use parley_ratatui::ratatui::style::{Color as TuiColor, Modifier, Style};
 use parley_ratatui::ratatui::widgets::Widget;
 use parley_ratatui::{
-    CellQuantization, FontOptions, ParleyBackend, PresentationScale, TerminalRenderer,
-    TexturePresentation, snap_logical_position_to_physical_pixel,
+    CellQuantization, FontOptions, ParleyBackend, TerminalRenderer, TexturePresentation,
+    snap_logical_position_to_physical_pixel,
 };
 
 use crate::config::{AppConfig, FontConfig, FontStyleConfig, ThemeConfig};
@@ -297,24 +297,19 @@ impl TerminalSurface {
 
 /// Computes the physical render scale for a Bevy window.
 pub fn render_scale_for_window(window: &Window) -> f32 {
-    let logical_size = window.resolution.size().max(Vec2::ONE);
-    let physical_size = window.resolution.physical_size();
-    let scale_factor = window.scale_factor();
-    // A Bevy scale-factor override already defines the physical/logical ratio. Applying the
-    // backend scale factor on top of it over-sizes fullscreen terminal textures.
-    let base_scale_factor = if window.resolution.scale_factor_override().is_some() {
-        scale_factor
-    } else {
-        window.resolution.base_scale_factor()
-    };
-
-    PresentationScale::new(
-        [logical_size.x, logical_size.y],
-        [physical_size.x, physical_size.y],
-        scale_factor,
-        base_scale_factor,
-    )
-    .render_scale()
+    // The presenting window's *actual* framebuffer ratio (physical / logical), so the
+    // terminal texture is rasterized at exactly the framebuffer resolution and can be
+    // presented 1:1 with physical pixels. Deriving it from the real physical size —
+    // rather than the reported scale factor — keeps it correct when they disagree.
+    //
+    // The previous version took the max with the backend's base scale factor; on a
+    // mixed-DPI multi-monitor setup that leaked a higher-DPI monitor's scale, over-sizing
+    // the texture so it had to be resampled onto the low-DPI window.
+    let logical = window.resolution.size().max(Vec2::ONE);
+    let physical = window.resolution.physical_size().as_vec2();
+    (physical.x / logical.x)
+        .min(physical.y / logical.y)
+        .max(1.0)
 }
 
 /// Returns the logical size for a physical terminal texture.

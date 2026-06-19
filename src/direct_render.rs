@@ -176,12 +176,12 @@ pub(crate) fn new_terminal_image(width: u32, height: u32, label: &'static str) -
         format: Some(TextureFormat::Rgba8UnormSrgb),
         ..Default::default()
     });
-    // Linear filtering: the terminal texture is mapped onto transformable 3D
-    // geometry (warped/tilted/Mobius plane modes) and scaled to fit, so it is
-    // sampled at non-integer ratios. Point sampling would expose the texel grid
-    // as pixelation. Cell-edge seams are prevented at authoring time in
-    // parley_ratatui (pixel-snapped cell fills), not by the sampler.
-    image.sampler = ImageSampler::linear();
+    // Nearest (point) filtering: the texture is authored at physical resolution
+    // and the flat 2D view presents it 1:1 via `textureLoad` (no sampler), so the
+    // 3D plane modes use point sampling too for a consistent, crisp pixel grid.
+    // Cell-edge seams are prevented at authoring time in parley_ratatui
+    // (pixel-snapped cell fills), not by linear blending.
+    image.sampler = ImageSampler::nearest();
     image
 }
 

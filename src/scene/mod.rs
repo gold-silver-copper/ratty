@@ -14,8 +14,11 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 use bevy::window::PrimaryWindow;
 
+use bevy::camera::visibility::NoFrustumCulling;
+
 use crate::config::AppConfig;
 use crate::direct_render::{new_terminal_image, new_terminal_render_image};
+use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
 use crate::terminal::{
     TerminalLayout, TerminalSurface, render_scale_for_window, snapped_translation,
@@ -225,6 +228,7 @@ pub(crate) struct SetupSceneParams<'w, 's> {
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     images: ResMut<'w, Assets<Image>>,
+    present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
@@ -241,6 +245,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         meshes,
         materials,
         images,
+        present_materials,
         primary_window,
         runtime,
         terminal,
@@ -318,13 +323,19 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         center: viewport_center,
     });
 
-    let mut sprite = Sprite::from_image(image_handle);
-    sprite.custom_size = Some(layout.logical_size);
-    sprite.color = Color::srgba(1.0, 1.0, 1.0, terminal_opacity);
+    // Present the terminal texture 1:1 with physical pixels via a fullscreen quad
+    // whose shader fetches each texel by pixel coordinate (no resampling), rather
+    // than a world-positioned sprite whose interpolated UVs resample it. The
+    // `TerminalSprite` marker is kept so the flat/3D visibility toggle applies.
     commands.spawn((
         TerminalSprite,
-        sprite,
-        Transform::from_translation(snapped_translation(viewport_center, render_scale).extend(0.0)),
+        Mesh2d(meshes.add(fullscreen_quad())),
+        MeshMaterial2d(present_materials.add(TerminalPresentMaterial {
+            texture: image_handle,
+        })),
+        Transform::default(),
+        Visibility::Visible,
+        NoFrustumCulling,
     ));
 
     let front_mesh = meshes.add(terminal_plane_mesh(32, 20));

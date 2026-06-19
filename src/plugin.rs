@@ -9,6 +9,7 @@ use crate::inline::{
 };
 use crate::keyboard::{TerminalClipboard, TerminalKeyBindings, handle_keyboard_input};
 use crate::mouse::{TerminalSelection, handle_mouse_input};
+use crate::present::TerminalPresentPlugin;
 use crate::scene::{
     MobiusTransition, TerminalPlaneView, TerminalPresentation, TerminalPresentationMode,
     apply_terminal_presentation, setup_scene,
@@ -124,6 +125,7 @@ impl Plugin for TerminalPlugin {
                     .run_if(|config: Res<AppConfig>| config.cursor.model.visible),
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
-            .add_plugins(DirectTerminalRenderPlugin);
+            .add_plugins(DirectTerminalRenderPlugin)
+            .add_plugins(TerminalPresentPlugin);
     }
 }
