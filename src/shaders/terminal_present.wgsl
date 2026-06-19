@@ -26,8 +26,16 @@ fn vertex(in: Vertex) -> VertexOutput {
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_size = vec2<f32>(textureDimensions(terminal_texture));
-    // Center the texture in the viewport, snapped to a whole physical pixel.
-    let origin = view.viewport.xy + floor((view.viewport.zw - tex_size) * 0.5);
+    // Normally center the texture in the viewport. But when it is taller than
+    // the viewport (only at the clamped 2-row minimum, when the window is too
+    // short to show both rows), anchor to the bottom edge instead so the last
+    // terminal row stays visible and the top row clips first. Snapped to a whole
+    // physical pixel.
+    let origin_x = view.viewport.x + floor((view.viewport.z - tex_size.x) * 0.5);
+    let centered_y = view.viewport.y + floor((view.viewport.w - tex_size.y) * 0.5);
+    let bottom_y = view.viewport.y + view.viewport.w - tex_size.y;
+    let origin_y = select(centered_y, bottom_y, tex_size.y > view.viewport.w);
+    let origin = vec2<f32>(origin_x, floor(origin_y));
     let p = in.position.xy - origin;
     if (p.x < 0.0 || p.y < 0.0 || p.x >= tex_size.x || p.y >= tex_size.y) {
         // Outside the terminal: transparent, so the camera clear shows through.
