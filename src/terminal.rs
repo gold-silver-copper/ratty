@@ -8,7 +8,6 @@ use parley_ratatui::ratatui::style::{Color as TuiColor, Modifier, Style};
 use parley_ratatui::ratatui::widgets::Widget;
 use parley_ratatui::{
     CellQuantization, FontOptions, ParleyBackend, TerminalRenderer, TexturePresentation,
-    snap_logical_position_to_physical_pixel,
 };
 
 use crate::config::{AppConfig, FontConfig, FontStyleConfig, ThemeConfig};
@@ -317,12 +316,6 @@ pub fn texture_logical_size(texture_size: UVec2, render_scale: f32) -> Vec2 {
     let [width, height] =
         TexturePresentation::new([texture_size.x, texture_size.y], render_scale).logical_size();
     Vec2::new(width, height)
-}
-
-/// Snaps a logical position to the physical pixel grid.
-pub fn snapped_translation(position: Vec2, render_scale: f32) -> Vec2 {
-    let [x, y] = snap_logical_position_to_physical_pixel([position.x, position.y], render_scale);
-    Vec2::new(x, y)
 }
 
 fn build_terminal_renderer(

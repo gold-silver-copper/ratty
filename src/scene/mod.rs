@@ -20,9 +20,7 @@ use crate::config::AppConfig;
 use crate::direct_render::{new_terminal_image, new_terminal_render_image};
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
-use crate::terminal::{
-    TerminalLayout, TerminalSurface, render_scale_for_window, snapped_translation,
-};
+use crate::terminal::{TerminalLayout, TerminalSurface, render_scale_for_window};
 
 /// Marker for the 2D terminal sprite.
 #[derive(Component)]
@@ -180,8 +178,6 @@ type PlaneBackTransformQuery<'w, 's> =
     Query<'w, 's, &'static mut Transform, With<TerminalPlaneBack>>;
 type PlaneCameraQuery<'w, 's> =
     Query<'w, 's, (&'static mut Projection, &'static mut Transform), With<TerminalPlaneCamera>>;
-pub(crate) type TerminalSpriteLayoutQuery<'w, 's> =
-    Query<'w, 's, (&'static mut Sprite, &'static mut Transform), With<TerminalSprite>>;
 pub(crate) type TerminalPlaneLayoutQuery<'w, 's> =
     Query<'w, 's, &'static mut Transform, (With<TerminalPlane>, Without<TerminalSprite>)>;
 pub(crate) type TerminalPlaneBackLayoutQuery<'w, 's> = Query<
@@ -419,18 +415,11 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
 pub(crate) fn sync_terminal_layout(
     layout: TerminalLayout,
     viewport: &mut TerminalViewport,
-    sprite_query: &mut TerminalSpriteLayoutQuery,
     plane_query: &mut TerminalPlaneLayoutQuery,
     plane_back_query: &mut TerminalPlaneBackLayoutQuery,
 ) {
     viewport.size = layout.logical_size;
     viewport.center = Vec2::ZERO;
-
-    for (mut sprite, mut transform) in sprite_query.iter_mut() {
-        sprite.custom_size = Some(layout.logical_size);
-        transform.translation = snapped_translation(viewport.center, layout.render_scale)
-            .extend(transform.translation.z);
-    }
 
     for mut transform in plane_query.iter_mut() {
         transform.scale = layout.logical_size.extend(1.0);

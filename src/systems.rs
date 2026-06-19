@@ -36,8 +36,8 @@ use crate::runtime::TerminalRuntime;
 use crate::scene::{
     MobiusTransition, ModelLoadState, TerminalPlane, TerminalPlaneBack,
     TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery, TerminalPlaneMeshes, TerminalPlaneView,
-    TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode, TerminalSpriteLayoutQuery,
-    TerminalViewport, sync_terminal_layout,
+    TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode, TerminalViewport,
+    sync_terminal_layout,
 };
 use crate::terminal::{
     TerminalRedrawState, TerminalSurface, TerminalWidget, render_scale_for_window,
@@ -224,7 +224,6 @@ pub(crate) struct ResizeParams<'w, 's> {
     terminal: ResMut<'w, TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
     viewport: ResMut<'w, TerminalViewport>,
-    sprite_query: TerminalSpriteLayoutQuery<'w, 's>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
 }
@@ -247,7 +246,6 @@ pub(crate) fn handle_window_resize(
         terminal,
         redraw,
         viewport,
-        sprite_query,
         plane_query,
         plane_back_query,
     } = &mut params;
@@ -275,13 +273,7 @@ pub(crate) fn handle_window_resize(
         pty_pixels.x as u16,
         pty_pixels.y as u16,
     );
-    sync_terminal_layout(
-        layout,
-        viewport,
-        sprite_query,
-        plane_query,
-        plane_back_query,
-    );
+    sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
     redraw.request();
 }
 

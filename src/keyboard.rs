@@ -14,8 +14,8 @@ use crate::mouse::{TerminalSelection, encode_mouse_wheel};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
     MobiusTransition, TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery, TerminalPlaneView,
-    TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode, TerminalSpriteLayoutQuery,
-    TerminalViewport, sync_terminal_layout,
+    TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode, TerminalViewport,
+    sync_terminal_layout,
 };
 use crate::terminal::{TerminalRedrawState, TerminalSurface, render_scale_for_window};
 
@@ -320,7 +320,6 @@ pub struct KeyboardSystemParams<'w, 's> {
     terminal: ResMut<'w, TerminalSurface>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
     viewport: ResMut<'w, TerminalViewport>,
-    sprite_query: TerminalSpriteLayoutQuery<'w, 's>,
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
     bindings: Res<'w, TerminalKeyBindings>,
@@ -501,7 +500,6 @@ pub fn handle_keyboard_input(
                         sync_terminal_layout(
                             layout,
                             &mut params.viewport,
-                            &mut params.sprite_query,
                             &mut params.plane_query,
                             &mut params.plane_back_query,
                         );
