@@ -17,7 +17,8 @@ Inspired by TempleOS | Built with Rust & Ratatui
 
 ["Rodent-obsessed developer creates Ratty to bring 3D graphics to the command line"](https://www.theregister.com/software/2026/05/11/ratty-terminal-emulator-brings-3d-graphics-to-the-command-line/5238299) - The Register  
 ["This New Terminal is Absurd (But Totally Fun)"](https://itsfoss.com/ratty-terminal/) - It's FOSS  
-["10 weird OSS projects you need right now... "](https://www.youtube.com/watch?v=qPuzWFvRajk) - Fireship
+["10 weird OSS projects you need right now... "](https://www.youtube.com/watch?v=qPuzWFvRajk) - Fireship  
+["Your terminal can render in 3D now, and Rust made it surprisingly usable"](https://www.makeuseof.com/terminal-render-3d-rust-made-surprisingly-usable/) - MakeUseOf
 
 ## Features
 
@@ -57,6 +58,14 @@ cargo install ratty
 
 ```bash
 sudo pacman -S ratty
+```
+
+### [Nix](nix/README.md)
+
+See the [Nix packaging docs](nix/README.md) for flake, NixOS, and Home Manager usage.
+
+```bash
+nix run github:orhun/ratty
 ```
 
 ### Binary releases
@@ -165,6 +174,14 @@ Split-pane drawing demo with a 2D canvas on the left and a live 3D preview on th
 
 <div>
   <video width="80%" src="https://github.com/user-attachments/assets/8b53515b-b887-4d03-a54c-7e7aa7ea128c"/>
+</div>
+
+#### [Rubik's cube](widget/examples/rubiks_cube.rs)
+
+Interactive 3D Rubik's cube demo:
+
+<div>
+  <video width="80%" src="https://github.com/user-attachments/assets/9c5828d5-890a-45ac-80f6-cbc0b22384e6"/>
 </div>
 
 ### Apps

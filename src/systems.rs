@@ -46,7 +46,7 @@ use bevy::mesh::{Indices, VertexAttributeValues};
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use bevy::window::{PrimaryWindow, WindowResized};
+use bevy::window::{PrimaryWindow, WindowCloseRequested, WindowResized};
 
 struct InlineLayout {
     columns: u32,
@@ -104,6 +104,48 @@ type PlaneBackResizeQuery<'w, 's> = Query<
         Without<TerminalSprite>,
     ),
 >;
+
+/// Requests application exit as soon as the primary window is asked to close.
+pub(crate) fn request_exit_on_primary_window_close(
+    mut close_events: MessageReader<WindowCloseRequested>,
+    primary_window: Query<Entity, With<PrimaryWindow>>,
+    mut app_exit: MessageWriter<AppExit>,
+    mut exit_requested: Local<bool>,
+) {
+    if *exit_requested {
+        close_events.clear();
+        return;
+    }
+
+    let Ok(primary_window) = primary_window.single() else {
+        return;
+    };
+
+    if close_events
+        .read()
+        .any(|event| event.window == primary_window)
+    {
+        *exit_requested = true;
+        app_exit.write(AppExit::Success);
+    }
+}
+
+/// Shuts down the PTY runtime when Bevy begins exiting.
+pub(crate) fn shutdown_terminal_runtime_on_exit(
+    mut app_exit: MessageReader<AppExit>,
+    mut runtime: NonSendMut<TerminalRuntime>,
+    mut shutdown_started: Local<bool>,
+) {
+    if *shutdown_started {
+        app_exit.clear();
+        return;
+    }
+
+    if app_exit.read().next().is_some() {
+        *shutdown_started = true;
+        runtime.shutdown();
+    }
+}
 
 /// Pumps PTY output into the terminal parser.
 ///
@@ -839,8 +881,11 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
             *visibility = Visibility::Visible;
         } else {
             transform.translation = Vec3::new(
-                layout.center_x + anchor.style.offset.x*(terminal.pixmap_dimensions().x as f32),
-                layout.center_y + bob + anchor.style.offset.y*(terminal.pixmap_dimensions().y as f32),
+                layout.center_x
+                    + anchor.style.offset.x * (terminal.pixmap_dimensions().x as f32),
+                layout.center_y
+                    + bob
+                    + anchor.style.offset.y * (terminal.pixmap_dimensions().y as f32),
                 CURSOR_DEPTH + anchor.style.depth * 4.0 + anchor.style.offset.z,
             );
             transform.rotation = object_rotation;
