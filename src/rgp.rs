@@ -194,9 +194,9 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
                     match my_camera_type.as_str() {
                         "Flat" => Some(TerminalPresentationMode::Flat2d),
                         "Ortho" => Some(TerminalPresentationMode::Plane3d),
-                        "Persp" => Some(TerminalPresentationMode::Persp3d),
+                        "Persp" => Some(TerminalPresentationMode::Perspective3d),
                         "Mobius" => Some(TerminalPresentationMode::Mobius3d),
-                        _ => None
+                        _ => None,
                     }
                 } else {
                     None
@@ -204,7 +204,7 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
                 scale,
                 offset: [px, py, pz],
                 rotation: [rx, ry, rz],
-            }
+            },
         }),
         "r" => Some(RgpOperation::Register {
             object_id: id?,
@@ -295,14 +295,14 @@ pub enum RgpOperation {
         /// Register source.
         source: RgpRegisterSource,
     },
-    /// Camera manipulation
+    /// Camera manipulation.
     Camera {
         /// Camera slot, 0 to just modify current camera
         camera_slot: u32,
         /// Defaults to 0, switches to the camera upon setting or not
         switch_immediately: bool,
         /// The settings: zoom/FOV, rotation, offset
-        settings: RgpCameraSettings
+        settings: RgpCameraSettings,
     },
     /// Object placement.
     Place {

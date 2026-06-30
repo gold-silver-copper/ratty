@@ -44,7 +44,8 @@ impl Plugin for TerminalPlugin {
                 Update,
                 redraw_soft_terminal
                     .after(handle_mouse_input)
-                    .after(pump_pty_output).after(apply_inline_objects),
+                    .after(pump_pty_output)
+                    .after(apply_inline_objects),
             )
             .add_systems(Update, sync_inline_objects.after(redraw_soft_terminal))
             .add_systems(Update, sync_rgp_objects.after(sync_inline_objects))

@@ -9,6 +9,7 @@ use bevy::prelude::*;
 use arboard::Clipboard;
 
 use crate::config::{AppConfig, BindingAction, FontConfig, KeyBindingConfig};
+use crate::inline::TerminalCameraViewSlots;
 use crate::mouse::{TerminalSelection, encode_mouse_wheel};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
@@ -16,7 +17,6 @@ use crate::scene::{
     TerminalPresentationMode, TerminalViewport,
 };
 use crate::terminal::{TerminalRedrawState, TerminalSurface};
-use crate::inline::{TerminalCameraViewSlots};
 
 /// Clipboard bridge for terminal copy and paste.
 pub struct TerminalClipboard {
@@ -339,7 +339,9 @@ pub fn handle_keyboard_input(
     mut keyboard: Local<TerminalKeyboard>,
     mut params: KeyboardSystemParams,
 ) {
-    params.presentation.mode = params.camera_slots.slots[params.camera_slots.current_slot].1.mode;
+    params.presentation.mode = params.camera_slots.slots[params.camera_slots.current_slot]
+        .1
+        .mode;
     let view: &mut TerminalPlaneView = params.plane_view.as_mut();
     *view = params.camera_slots.slots[params.camera_slots.current_slot].0;
     for event in keyboard_events.read() {
@@ -373,9 +375,9 @@ pub fn handle_keyboard_input(
                     params.selection.clear();
                     params.redraw.request();
                     continue;
-                },
+                }
                 BindingAction::TogglePersp3DMode => {
-                    params.presentation.toggle_persp_mode();
+                    params.presentation.toggle_perspective_mode();
                     params.mobius_transition.stop();
                     params.selection.clear();
                     params.redraw.request();

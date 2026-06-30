@@ -16,7 +16,7 @@ use crate::rgp::{
     RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, RgpRegisterSource,
     consume_sequence as consume_rgp_sequence, support_reply,
 };
-use crate::scene::{ TerminalPlaneView, TerminalPresentation };
+use crate::scene::{TerminalPlaneView, TerminalPresentation};
 
 const APC_START: &[u8] = b"\x1b_";
 const ST: &[u8] = b"\x1b\\";
@@ -94,8 +94,11 @@ impl TerminalInlineObjects {
                 return replies;
             };
             let sequence = self.pending_bytes[start..end].to_vec();
-            let (handled, reply) =
-                self.handle_apc_sequence(&sequence, parser.screen().cursor_position(), camera_slots);
+            let (handled, reply) = self.handle_apc_sequence(
+                &sequence,
+                parser.screen().cursor_position(),
+                camera_slots,
+            );
             if let Some(reply) = reply {
                 replies.push(reply);
             }
@@ -255,14 +258,18 @@ impl TerminalInlineObjects {
         }
     }
 
-    fn handle_rgp_sequence(&mut self,
-                           sequence: &[u8],
-                           camera_slots: &mut TerminalCameraViewSlots) -> Option<Option<Vec<u8>>> {
+    fn handle_rgp_sequence(
+        &mut self,
+        sequence: &[u8],
+        camera_slots: &mut TerminalCameraViewSlots,
+    ) -> Option<Option<Vec<u8>>> {
         let operation = consume_rgp_sequence(sequence)?;
         Some(match operation {
             RgpOperation::SupportQuery => Some(support_reply()),
             RgpOperation::Camera {
-                camera_slot, switch_immediately, settings
+                camera_slot,
+                switch_immediately,
+                settings,
             } => {
                 //info!("camera settings for slot {}: set {}; rotation: ({},{},{})", camera_slot, switch_immediately, settings.rotation[0].unwrap_or(0.0), settings.rotation[1].unwrap_or(0.0), settings.rotation[2].unwrap_or(0.0));
                 if (camera_slot as usize) < camera_slots.slots.len() {
@@ -270,7 +277,8 @@ impl TerminalInlineObjects {
                         camera_slots.current_slot = camera_slot as usize;
                     }
                     if let Some(ctype) = settings.camera_type {
-                        camera_slots.slots[camera_slot as usize].1 = TerminalPresentation { mode: ctype };
+                        camera_slots.slots[camera_slot as usize].1 =
+                            TerminalPresentation { mode: ctype };
                     }
                     if let Some(px) = settings.offset[0] {
                         camera_slots.slots[camera_slot as usize].0.camera_offset[0] = px;
@@ -295,7 +303,7 @@ impl TerminalInlineObjects {
                     }
                 }
                 None
-            },
+            }
             RgpOperation::Register {
                 object_id,
                 format,

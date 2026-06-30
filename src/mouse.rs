@@ -436,15 +436,11 @@ pub(crate) fn handle_mouse_input(
                     forwarded_mouse.last_cell = Some(cell);
                 }
             }
-            (MouseButton::Right, ButtonState::Pressed)
-                if presentation.mode.is_3d() =>
-            {
+            (MouseButton::Right, ButtonState::Pressed) if presentation.mode.is_3d() => {
                 plane_view.panning = true;
                 plane_view.last_pan_cursor = selection.cursor_position();
             }
-            (MouseButton::Right, ButtonState::Released)
-                if presentation.mode.is_3d() =>
-            {
+            (MouseButton::Right, ButtonState::Released) if presentation.mode.is_3d() => {
                 plane_view.panning = false;
                 plane_view.last_pan_cursor = selection.cursor_position();
             }
@@ -497,8 +493,7 @@ pub(crate) fn handle_mouse_input(
                 selection.clear();
                 redraw.request();
             }
-        } else if presentation.mode.is_3d() && delta != 0.0
-        {
+        } else if presentation.mode.is_3d() && delta != 0.0 {
             plane_view.zoom = (plane_view.zoom - delta).clamp(0.1, 4.0);
             redraw.request();
         }
