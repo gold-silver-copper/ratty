@@ -15,8 +15,10 @@ use crate::paths::expand_path;
 pub const APP_NAME: &str = "ratty";
 /// Local fallback config path.
 pub const CONFIG_PATH: &str = "config/ratty.toml";
-/// Label used for the terminal render target.
+/// Label used for the terminal present texture (sampled by the materials).
 pub const TERMINAL_TEXTURE_LABEL: &str = "ratty.parley_ratatui";
+/// Label used for the terminal render target (Vello's storage texture).
+pub const TERMINAL_RENDER_TEXTURE_LABEL: &str = "ratty.parley_ratatui.render";
 /// Z depth used for the cursor model root.
 pub const CURSOR_DEPTH: f32 = 10.0;
 
@@ -127,8 +129,8 @@ pub struct WindowConfig {
     pub width: u32,
     /// Window height in logical pixels.
     pub height: u32,
-    /// Window scale-factor override.
-    pub scale_factor: f32,
+    /// Window scale-factor override. Defaults to the display's scale factor.
+    pub scale_factor: Option<f32>,
     /// Window opacity from `0.0` to `1.0`.
     pub opacity: f32,
 }
@@ -138,7 +140,7 @@ impl Default for WindowConfig {
         Self {
             width: 960,
             height: 620,
-            scale_factor: 1.0,
+            scale_factor: None,
             opacity: 1.0,
         }
     }
@@ -251,7 +253,7 @@ pub struct FontConfig {
     pub family: String,
     /// Font style override.
     pub style: FontStyleConfig,
-    /// Font size in logical pixels.
+    /// Font size in points (1pt = 4/3 logical pixels).
     pub size: i32,
 }
 

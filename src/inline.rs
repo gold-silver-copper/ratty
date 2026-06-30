@@ -8,7 +8,9 @@ use bevy::prelude::*;
 use vt100::Callbacks;
 
 use crate::kitty::{KittyOperation, KittyParserState, refresh_kitty_placeholder_anchors};
-use crate::model::{ObjectSource, load_object_source, load_object_source_from_bytes};
+use crate::model::{
+    ObjectLoadOptions, load_object_source_from_bytes_with_options, load_object_source_with_options,
+};
 use crate::rgp::{
     RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, RgpRegisterSource,
     consume_sequence as consume_rgp_sequence, support_reply,
@@ -62,10 +64,18 @@ impl TerminalInlineObjects {
                 .windows(APC_START.len())
                 .position(|window| window == APC_START)
             else {
-                if cursor < self.pending_bytes.len() {
-                    parser.process(&normalize_hvp_sequences(&self.pending_bytes[cursor..]));
+                let pending_len = self.pending_bytes.len();
+                let keep_from = pending_apc_prefix_start(&self.pending_bytes, cursor);
+                if cursor < keep_from {
+                    parser.process(&normalize_hvp_sequences(
+                        &self.pending_bytes[cursor..keep_from],
+                    ));
                 }
-                self.pending_bytes.clear();
+                if keep_from < pending_len {
+                    self.pending_bytes.drain(..keep_from);
+                } else {
+                    self.pending_bytes.clear();
+                }
                 return replies;
             };
             let start = cursor + start_offset;
@@ -246,33 +256,23 @@ impl TerminalInlineObjects {
             RgpOperation::Register {
                 object_id,
                 format,
+                options,
                 source,
             } => {
-                if format != "obj" && format != "glb" {
+                let load_options = ObjectLoadOptions {
+                    normalize: options.normalize,
+                };
+                if format != "obj" && format != "glb" && format != "stl" {
                     warn!("unsupported RGP object format `{format}` for object {object_id}");
                     None
                 } else {
                     match source {
                         RgpRegisterSource::Path { path } => {
                             self.pending_rgp_payloads.remove(&object_id);
-                            match load_object_source(Path::new(&path)) {
+                            match load_object_source_with_options(Path::new(&path), load_options) {
                                 Ok((source, source_data)) => {
                                     info!("registered RGP object {} from {}", object_id, source);
-                                    self.objects.insert(
-                                        object_id,
-                                        InlineObject::RgpObject(match source_data {
-                                            ObjectSource::Obj(meshes) => RgpInlineObject::Obj {
-                                                meshes,
-                                                handles: None,
-                                            },
-                                            ObjectSource::Gltf(asset_path) => {
-                                                RgpInlineObject::Gltf {
-                                                    asset_path,
-                                                    handle: None,
-                                                }
-                                            }
-                                        }),
-                                    );
+                                    self.objects.insert(object_id, source_data.into());
                                     self.dirty = true;
                                     None
                                 }
@@ -282,9 +282,15 @@ impl TerminalInlineObjects {
                                 }
                             }
                         }
-                        RgpRegisterSource::Payload { name, more, data } => {
-                            self.handle_rgp_payload_chunk(object_id, &format, name, more, data)
-                        }
+                        RgpRegisterSource::Payload { name, more, data } => self
+                            .handle_rgp_payload_chunk(
+                                object_id,
+                                &format,
+                                name,
+                                more,
+                                data,
+                                load_options,
+                            ),
                     }
                 }
             }
@@ -311,8 +317,13 @@ impl TerminalInlineObjects {
             }
             RgpOperation::Update { object_id, update } => {
                 if let Some(anchor) = self.anchors.get_mut(&object_id) {
+                    let needs_respawn = update.depth.is_some()
+                        || update.color.is_some()
+                        || update.brightness.is_some();
                     apply_rgp_update(&mut anchor.style, update);
-                    self.dirty = true;
+                    if needs_respawn {
+                        self.dirty = true;
+                    }
                 }
                 None
             }
@@ -365,6 +376,7 @@ impl TerminalInlineObjects {
         name: Option<String>,
         more: bool,
         data: Vec<u8>,
+        options: ObjectLoadOptions,
     ) -> Option<Vec<u8>> {
         let pending = self
             .pending_rgp_payloads
@@ -373,6 +385,7 @@ impl TerminalInlineObjects {
                 format: format.to_string(),
                 name: name.clone(),
                 data: Vec::new(),
+                options,
             });
         if pending.format != format {
             warn!(
@@ -403,23 +416,15 @@ impl TerminalInlineObjects {
             pending.format,
             pending.data.len()
         );
-        match load_object_source_from_bytes(&pending.format, pending.name.as_deref(), &pending.data)
-        {
+        match load_object_source_from_bytes_with_options(
+            &pending.format,
+            pending.name.as_deref(),
+            &pending.data,
+            pending.options,
+        ) {
             Ok((source, source_data)) => {
                 info!("registered RGP object {} from {}", object_id, source);
-                self.objects.insert(
-                    object_id,
-                    InlineObject::RgpObject(match source_data {
-                        ObjectSource::Obj(meshes) => RgpInlineObject::Obj {
-                            meshes,
-                            handles: None,
-                        },
-                        ObjectSource::Gltf(asset_path) => RgpInlineObject::Gltf {
-                            asset_path,
-                            handle: None,
-                        },
-                    }),
-                );
+                self.objects.insert(object_id, source_data.into());
                 self.dirty = true;
                 None
             }
@@ -435,6 +440,7 @@ struct PendingRgpPayload {
     format: String,
     name: Option<String>,
     data: Vec<u8>,
+    options: ObjectLoadOptions,
 }
 
 fn normalize_hvp_sequences(bytes: &[u8]) -> Cow<'_, [u8]> {
@@ -471,6 +477,15 @@ fn normalize_hvp_sequences(bytes: &[u8]) -> Cow<'_, [u8]> {
     match normalized {
         Some(bytes) => Cow::Owned(bytes),
         None => Cow::Borrowed(bytes),
+    }
+}
+
+fn pending_apc_prefix_start(bytes: &[u8], cursor: usize) -> usize {
+    let start = cursor.min(bytes.len());
+    if bytes[start..].ends_with(&APC_START[..1]) {
+        bytes.len() - 1
+    } else {
+        bytes.len()
     }
 }
 
@@ -520,6 +535,14 @@ pub struct KittyInlineObject {
 
 /// RGP-backed inline object.
 pub enum RgpInlineObject {
+    /// STL mesh payload.
+    Stl {
+        /// The loaded mesh
+        mesh: Mesh,
+        /// This gets created on the fly when it's actually needed.
+        /// If you are creating a [`RgpInlineObject`], chances are that you can set this to `None`.
+        handle: Option<Handle<Mesh>>,
+    },
     /// OBJ mesh payload.
     Obj {
         /// Loaded mesh parts.
@@ -532,7 +555,7 @@ pub enum RgpInlineObject {
         /// Scene asset path.
         asset_path: String,
         /// Cached scene handle.
-        handle: Option<Handle<Scene>>,
+        handle: Option<Handle<WorldAsset>>,
     },
 }
 

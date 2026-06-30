@@ -89,6 +89,26 @@ This will:
 - Write configuration to `/etc/ratty/ratty.toml` (only when `settings` is non-empty)
 - Wrap the binary to use `--config-file /etc/ratty/ratty.toml` (only when `settings` is non-empty)
 
+### GPU Backend Selection
+
+On systems with multiple GPUs or where the default Vulkan device creation fails
+(e.g. NVIDIA 580.x drivers reporting unsupported features), set `gpuBackend` and
+`gpuAdapter` to control wgpu device selection:
+
+```nix
+{
+  programs.ratty = {
+    enable = true;
+    gpuBackend = "vulkan";    # or "gl" / "gles"
+    gpuAdapter = "RTX 3060";  # substring match against adapter name
+  };
+}
+```
+
+When set, the NixOS module wraps the binary with `WGPU_BACKEND` and
+`WGPU_ADAPTER_NAME` environment variables. When both `settings` and GPU options
+are set, a single wrapper applies all flags.
+
 ## Home Manager Configuration
 
 For user-level configuration without root:
@@ -139,17 +159,35 @@ This will:
 
 - Install the Ratty package to your user profile
 - Write configuration to `$XDG_CONFIG_HOME/ratty/ratty.toml` (typically `~/.config/ratty/ratty.toml`) (only when `settings` is non-empty)
+- Set `WGPU_BACKEND` and `WGPU_ADAPTER_NAME` in the user session when GPU options are configured
 - Ratty discovers this path automatically
+
+### GPU Backend Selection (Home Manager)
+
+Same options as NixOS, but applied via `home.sessionVariables` instead of a
+binary wrapper:
+
+```nix
+{
+  programs.ratty = {
+    enable = true;
+    gpuBackend = "vulkan";
+    gpuAdapter = "RTX 3060";
+  };
+}
+```
 
 ## Module Options
 
 Both `nixosModules.default` and `homeManagerModules.default` expose:
 
-| Option                    | Type    | Default                        | Description                           |
-| ------------------------- | ------- | ------------------------------ | ------------------------------------- |
-| `programs.ratty.enable`   | bool    | `false`                        | Enable Ratty installation             |
-| `programs.ratty.package`  | package | `self.packages.<system>.ratty` | The Ratty package to use              |
-| `programs.ratty.settings` | attrset | `{}`                           | Configuration written to `ratty.toml` |
+| Option                      | Type         | Default                        | Description                                                                              |
+| --------------------------- | ------------ | ------------------------------ | ---------------------------------------------------------------------------------------- |
+| `programs.ratty.enable`     | bool         | `false`                        | Enable Ratty installation                                                                |
+| `programs.ratty.package`    | package      | `self.packages.<system>.ratty` | The Ratty package to use                                                                 |
+| `programs.ratty.settings`   | attrset      | `{}`                           | Configuration written to `ratty.toml`                                                    |
+| `programs.ratty.gpuBackend` | null or enum | `null`                         | Force wgpu backend: `"vulkan"`, `"gl"`, or `"gles"`. null = auto-detect                  |
+| `programs.ratty.gpuAdapter` | null or str  | `null`                         | Substring match to select a specific GPU adapter (e.g. `"RTX 3060"`). null = auto-detect |
 
 ## Package Architecture
 

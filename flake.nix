@@ -55,6 +55,30 @@
                 }
               '';
             };
+
+            gpuBackend = lib.mkOption {
+              type = lib.types.nullOr (lib.types.enum [ "vulkan" "gl" "gles" ]);
+              default = null;
+              description = ''
+                Force the wgpu backend.
+                Set to null (default) for auto-detection.
+                Useful when the Vulkan ICD loader selects an incompatible driver
+                or when running in headless/VNC environments where OpenGL is preferred.
+              '';
+              example = "vulkan";
+            };
+
+            gpuAdapter = lib.mkOption {
+              type = lib.types.nullOr lib.types.str;
+              default = null;
+              description = ''
+                Substring match to select a specific GPU adapter name.
+                Set to null (default) to use the system default.
+                Useful on multi-GPU systems (e.g. integrated + discrete)
+                or when wgpu picks the wrong adapter.
+              '';
+              example = "RTX 3060";
+            };
           };
         };
     in
@@ -126,10 +150,14 @@
       #       window = { opacity = 0.9; };
       #       shell = { program = "zsh"; };
       #     };
+      #     # Optional: force wgpu backend / adapter selection
+      #     gpuBackend = "vulkan";   # "vulkan" | "gl" | "gles"
+      #     gpuAdapter = "RTX 3060"; # substring match
       #   };
       #
       # Config is written to $XDG_CONFIG_HOME/ratty/ratty.toml
-      # ratty discovers this path automatically.
+      # GPU env vars are set via home.sessionVariables.
+      # ratty discovers the config path automatically.
       homeManagerModules.default =
         args@{
           config,
@@ -149,6 +177,10 @@
             xdg.configFile."ratty/ratty.toml" = lib.mkIf (cfg.settings != { }) {
               source = tomlFormat.generate "ratty.toml" cfg.settings;
             };
+            home.sessionVariables = lib.mkMerge [
+              (lib.mkIf (cfg.gpuBackend != null) { WGPU_BACKEND = cfg.gpuBackend; })
+              (lib.mkIf (cfg.gpuAdapter != null) { WGPU_ADAPTER_NAME = cfg.gpuAdapter; })
+            ];
           };
         };
 
@@ -161,10 +193,13 @@
       #       window = { opacity = 0.9; };
       #       shell = { program = "zsh"; };
       #     };
+      #     # Optional: force wgpu backend / adapter selection
+      #     gpuBackend = "vulkan";   # "vulkan" | "gl" | "gles"
+      #     gpuAdapter = "RTX 3060"; # substring match
       #   };
       #
       # Config is written to /etc/ratty/ratty.toml
-      # Binary is wrapped with --config-file flag to use system config.
+      # Binary is wrapped with --config-file and GPU env vars when set.
       nixosModules.default =
         args@{
           config,
@@ -181,21 +216,25 @@
           inherit (opts) options;
           config = lib.mkIf cfg.enable {
             environment.systemPackages = [
-              (
-                if cfg.settings == { } then
-                  cfg.package
-                else
-                  pkgs.symlinkJoin {
-                    name = "ratty-system-wrapped";
-                    paths = [ cfg.package ];
-                    nativeBuildInputs = [ pkgs.makeWrapper ];
-                    postBuild = ''
-                      rm -f $out/bin/ratty
-                      makeWrapper ${cfg.package}/bin/ratty $out/bin/ratty \
-                        --add-flags "--config-file /etc/ratty/ratty.toml"
-                    '';
-                  }
-              )
+              (let
+                hasSettings = cfg.settings != { };
+                hasGpuOpts = cfg.gpuBackend != null || cfg.gpuAdapter != null;
+              in
+              if !(hasSettings || hasGpuOpts) then
+                cfg.package
+              else
+                pkgs.symlinkJoin {
+                  name = "ratty-system-wrapped";
+                  paths = [ cfg.package ];
+                  nativeBuildInputs = [ pkgs.makeWrapper ];
+                  postBuild = ''
+                    rm -f $out/bin/ratty
+                    makeWrapper ${lib.getExe cfg.package} $out/bin/ratty \
+                      ${lib.optionalString hasSettings "--add-flags \"--config-file /etc/ratty/ratty.toml\""} \
+                      ${lib.optionalString (cfg.gpuBackend != null) "--set WGPU_BACKEND '${cfg.gpuBackend}'"} \
+                      ${lib.optionalString (cfg.gpuAdapter != null) "--set WGPU_ADAPTER_NAME '${cfg.gpuAdapter}'"}
+                  '';
+                })
             ];
 
             environment.etc."ratty/ratty.toml" = lib.mkIf (cfg.settings != { }) {
