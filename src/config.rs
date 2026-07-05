@@ -206,6 +206,7 @@ pub enum BindingAction {
     None,
     /// Toggles between the flat and orthographic terminal views.
     #[serde(rename = "ToggleOrtho3DMode")]
+    #[serde(alias = "Toggle3DMode")]
     ToggleOrtho3DMode,
     /// Toggles the perspective terminal view.
     #[serde(rename = "TogglePersp3DMode")]
@@ -492,4 +493,23 @@ fn parse_hex_color(value: &str) -> anyhow::Result<[u8; 3]> {
     let b = u8::from_str_radix(&hex[4..6], 16)
         .with_context(|| format!("invalid blue component in {value}"))?;
     Ok([r, g, b])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_legacy_toggle_3d_mode_binding_action() {
+        let binding: KeyBindingConfig = toml::from_str(
+            r#"
+key = "Enter"
+with = "Control | alt"
+action = "Toggle3DMode"
+"#,
+        )
+        .expect("legacy Toggle3DMode action should deserialize");
+
+        assert_eq!(binding.action, BindingAction::ToggleOrtho3DMode);
+    }
 }

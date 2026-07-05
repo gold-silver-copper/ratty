@@ -236,7 +236,6 @@ pub(crate) struct PresentationParams<'w, 's> {
         ),
     >,
     camera_2d: Query<'w, 's, &'static mut Camera, (With<Camera2d>, Without<TerminalPlaneCamera>)>,
-    camera_3d: Query<'w, 's, &'static mut Camera, (With<TerminalPlaneCamera>, Without<Camera2d>)>,
 }
 
 #[derive(SystemParam)]
@@ -498,7 +497,6 @@ pub(crate) fn apply_terminal_presentation(
         materials,
         plane_transforms,
         camera_2d,
-        camera_3d,
     } = &mut params;
     let is_3d = presentation.mode.is_3d();
     let is_mobius = presentation.mode.is_mobius();
@@ -567,16 +565,6 @@ pub(crate) fn apply_terminal_presentation(
             camera.is_active = active;
         }
     }
-    // This system only runs when presentation state changes, so assigning
-    // unconditionally does not churn change detection every frame.
-    for mut camera in camera_3d.iter_mut() {
-        camera.clear_color = if is_3d {
-            ClearColorConfig::Default
-        } else {
-            ClearColorConfig::None
-        };
-    }
-
     for mut transform in &mut plane_transforms.p0() {
         transform.rotation = if is_3d {
             Quat::from_euler(EulerRot::XYZ, pitch, yaw, 0.0)
@@ -601,6 +589,14 @@ pub(crate) fn apply_terminal_presentation(
     }
 
     for (mut projection, mut transform, mut camera) in &mut plane_transforms.p2() {
+        // This system only runs when presentation state changes, so assigning
+        // unconditionally does not churn change detection every frame.
+        camera.clear_color = if is_3d {
+            ClearColorConfig::Default
+        } else {
+            ClearColorConfig::None
+        };
+
         let active = &mut camera.is_active;
         if let Projection::Perspective(persp) = projection.as_mut() {
             if presentation.mode == TerminalPresentationMode::Perspective3d {

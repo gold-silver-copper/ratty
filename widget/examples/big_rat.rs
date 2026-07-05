@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
@@ -26,6 +26,8 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
             .scale(1.0),
     );
     graphic.register()?;
+    let mut camera = CameraPreset::Ortho;
+    camera.apply()?;
     let mut area = Rect::new(0, 0, 24, 10);
     let mut centered = false;
 
@@ -54,6 +56,8 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
                     ": animate ({})  ",
                     u8::from(graphic.settings().animate)
                 )),
+                Span::styled("v", Style::default().fg(Color::Cyan)),
+                Span::raw(format!(": camera ({})  ", camera.label())),
                 Span::styled("c", Style::default().fg(Color::Cyan)),
                 Span::raw(": clear  "),
                 Span::styled("r", Style::default().fg(Color::Cyan)),
@@ -104,6 +108,10 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
                     graphic.settings_mut().animate = !animate;
                     send_update = true;
                 }
+                (KeyCode::Char('v'), _) => {
+                    camera = camera.next();
+                    camera.apply()?;
+                }
                 (KeyCode::Char('r'), _) => {
                     area = Rect::new(0, 0, 24, 10);
                     graphic.settings_mut().animate = true;
@@ -113,6 +121,8 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
                             .animate(true)
                             .scale(1.0)
                             .brightness(0.9);
+                    camera = CameraPreset::Ortho;
+                    camera.apply()?;
                     centered = false;
                     send_update = true;
                 }
@@ -176,6 +186,54 @@ fn run(terminal: &mut DefaultTerminal) -> io::Result<()> {
                 graphic.update()?;
             }
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CameraPreset {
+    Flat,
+    Ortho,
+    Perspective,
+    Mobius,
+}
+
+impl CameraPreset {
+    fn next(self) -> Self {
+        match self {
+            Self::Flat => Self::Ortho,
+            Self::Ortho => Self::Perspective,
+            Self::Perspective => Self::Mobius,
+            Self::Mobius => Self::Flat,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Ortho => "ortho",
+            Self::Perspective => "persp",
+            Self::Mobius => "mobius",
+        }
+    }
+
+    fn apply(self) -> io::Result<()> {
+        let sequence = match self {
+            Self::Flat => "\x1b_ratty;g;c;id=0;set=1;type=Flat\x1b\\".to_string(),
+            Self::Ortho => {
+                "\x1b_ratty;g;c;id=0;set=1;type=Ortho;scale=0.95;rx=0.25;rz=0.08\x1b\\"
+                    .to_string()
+            }
+            Self::Perspective => {
+                "\x1b_ratty;g;c;id=0;set=1;type=Persp;scale=0.85;rx=0.35;rz=0.12\x1b\\"
+                    .to_string()
+            }
+            Self::Mobius => {
+                "\x1b_ratty;g;c;id=0;set=1;type=Mobius;scale=0.9;rx=0.45;rz=0.18\x1b\\"
+                    .to_string()
+            }
+        };
+        io::stdout().write_all(sequence.as_bytes())?;
+        io::stdout().flush()
     }
 }
 
