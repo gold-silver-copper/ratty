@@ -6,11 +6,12 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, bail, ensure};
 use bevy::asset::RenderAssetUsages;
 use bevy::gltf::GltfAssetLabel;
-use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use rust_embed::RustEmbed;
 
 use crate::config::{AppConfig, CURSOR_DEPTH};
+use crate::inline::{InlineObject, RgpInlineObject};
 use crate::paths::{expand_path, runtime_asset_root};
 
 #[derive(RustEmbed)]
@@ -27,6 +28,24 @@ pub enum ObjectSource {
     Obj(Vec<Mesh>),
     /// glTF scene asset path.
     Gltf(String),
+    /// STL, should be similar to OBJ
+    Stl(Mesh),
+}
+
+impl From<ObjectSource> for InlineObject {
+    fn from(val: ObjectSource) -> Self {
+        InlineObject::RgpObject(match val {
+            ObjectSource::Stl(mesh) => RgpInlineObject::Stl { mesh, handle: None },
+            ObjectSource::Obj(meshes) => RgpInlineObject::Obj {
+                meshes,
+                handles: None,
+            },
+            ObjectSource::Gltf(asset_path) => RgpInlineObject::Gltf {
+                asset_path,
+                handle: None,
+            },
+        })
+    }
 }
 
 /// Options that control object source loading.
@@ -93,9 +112,15 @@ pub fn spawn_cursor_model(
         Ok((source, ObjectSource::Gltf(asset_path))) => {
             info!("loading cursor model from {}", source);
             commands.entity(root).with_children(|parent| {
-                parent.spawn(SceneRoot(
+                parent.spawn(WorldAssetRoot(
                     asset_server.load(GltfAssetLabel::Scene(0).from_asset(asset_path)),
                 ));
+            });
+        }
+        Ok((source, ObjectSource::Stl(mesh))) => {
+            info!("loaded cursor model from {source}");
+            commands.entity(root).with_children(|parent| {
+                parent.spawn((Mesh3d(meshes.add(mesh)), MeshMaterial3d(material.clone())));
             });
         }
         Err(error) => {
@@ -147,6 +172,8 @@ pub fn load_object_source_with_options(
             .unwrap_or_default();
 
         return match extension.as_str() {
+            "stl" => load_stl_meshes_from_path(path)
+                .map(|mesh| (path.display().to_string(), ObjectSource::Stl(mesh))),
             "obj" => load_obj_meshes_from_path(path, options.normalize)
                 .map(|meshes| (path.display().to_string(), ObjectSource::Obj(meshes))),
             "glb" | "gltf" => {
@@ -192,6 +219,8 @@ pub fn load_object_source_with_options(
         && let Some(file) = EmbeddedObjects::get(file_name)
     {
         return match extension.as_str() {
+            "stl" => load_stl_meshes_from_bytes(&file.data)
+                .map(|mesh| (format!("embedded:{file_name}"), ObjectSource::Stl(mesh))),
             "obj" => load_obj_meshes_from_bytes(file_name, &file.data, options.normalize)
                 .map(|meshes| (format!("embedded:{file_name}"), ObjectSource::Obj(meshes))),
             "glb" | "gltf" => {
@@ -207,6 +236,9 @@ pub fn load_object_source_with_options(
     }
 
     match extension.as_str() {
+        "stl" => load_stl_meshes_from_path(runtime_asset_root().join(&candidate).as_path())
+            .or_else(|_| load_stl_meshes_from_path(path))
+            .map(|mesh| (candidate.clone(), ObjectSource::Stl(mesh))),
         "obj" => load_obj_meshes_from_path(
             runtime_asset_root().join(&candidate).as_path(),
             options.normalize,
@@ -247,13 +279,19 @@ pub fn load_object_source_from_bytes_with_options(
 ) -> anyhow::Result<(String, ObjectSource)> {
     let display_name = name.unwrap_or(match format {
         "obj" => "payload.obj",
+        "stl" => "payload.stl",
         "glb" | "gltf" => "payload.glb",
         _ => "payload",
     });
 
+    let payload_name = format!("payload:{display_name}");
+
     match format {
+        "stl" => {
+            load_stl_meshes_from_bytes(bytes).map(|mesh| (payload_name, ObjectSource::Stl(mesh)))
+        }
         "obj" => load_obj_meshes_from_bytes(display_name, bytes, options.normalize)
-            .map(|meshes| (format!("payload:{display_name}"), ObjectSource::Obj(meshes))),
+            .map(|meshes| (payload_name, ObjectSource::Obj(meshes))),
         "glb" | "gltf" => {
             // Bevy scene loading still goes through the asset server, so payload-backed GLB/GLTF
             // assets need to be materialized under the asset root before they can be instantiated.
@@ -272,10 +310,7 @@ pub fn load_object_source_from_bytes_with_options(
                 .collect::<String>();
             let candidate = format!("objects/rgp/{sanitized}.{extension}");
             let asset_path = ensure_scene_asset_path(&candidate, Some((display_name, bytes)))?;
-            Ok((
-                format!("payload:{display_name}"),
-                ObjectSource::Gltf(asset_path),
-            ))
+            Ok((payload_name, ObjectSource::Gltf(asset_path)))
         }
         _ => bail!("unsupported object format for {}", display_name),
     }
@@ -341,6 +376,53 @@ fn object_asset_path(path: &Path) -> anyhow::Result<String> {
         .strip_prefix("assets/")
         .unwrap_or(&candidate)
         .to_string())
+}
+
+fn load_stl_meshes_from_path(path: &Path) -> anyhow::Result<Mesh> {
+    let data = std::fs::read(path)?;
+    load_stl_meshes_from_bytes(&data)
+}
+
+fn load_stl_meshes_from_bytes(bytes: &[u8]) -> anyhow::Result<Mesh> {
+    let mut c = Cursor::new(bytes);
+    let stl = stl_io::read_stl(&mut c)?;
+
+    // credit: bevy_stl (MIT)
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+
+    let vertex_count = stl.faces.len() * 3;
+
+    let mut positions = Vec::with_capacity(vertex_count);
+    let mut normals = Vec::with_capacity(vertex_count);
+    let mut indices = Vec::with_capacity(vertex_count);
+
+    for (i, face) in stl.faces.iter().enumerate() {
+        for j in 0..3 {
+            let vertex = stl.vertices[face.vertices[j]];
+            positions.push([vertex[0], vertex[1], vertex[2]]);
+            normals.push([face.normal[0], face.normal[1], face.normal[2]]);
+            indices.push((i * 3 + j) as u32);
+        }
+    }
+
+    let uvs = vec![[0.0, 0.0]; vertex_count];
+
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        VertexAttributeValues::Float32x3(positions),
+    );
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_NORMAL,
+        VertexAttributeValues::Float32x3(normals),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, VertexAttributeValues::Float32x2(uvs));
+    mesh.insert_indices(Indices::U32(indices));
+    // appropriated code over
+
+    Ok(mesh)
 }
 
 fn load_obj_meshes_from_path(path: &Path, normalize: bool) -> anyhow::Result<Vec<Mesh>> {
