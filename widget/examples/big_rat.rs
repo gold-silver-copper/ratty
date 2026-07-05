@@ -220,16 +220,13 @@ impl CameraPreset {
         let sequence = match self {
             Self::Flat => "\x1b_ratty;g;c;id=0;set=1;type=Flat\x1b\\".to_string(),
             Self::Ortho => {
-                "\x1b_ratty;g;c;id=0;set=1;type=Ortho;scale=0.95;rx=0.25;rz=0.08\x1b\\"
-                    .to_string()
+                "\x1b_ratty;g;c;id=0;set=1;type=Ortho;scale=0.95;rx=0.25;rz=0.08\x1b\\".to_string()
             }
             Self::Perspective => {
-                "\x1b_ratty;g;c;id=0;set=1;type=Persp;scale=0.85;rx=0.35;rz=0.12\x1b\\"
-                    .to_string()
+                "\x1b_ratty;g;c;id=0;set=1;type=Persp;scale=0.85;rx=0.35;rz=0.12\x1b\\".to_string()
             }
             Self::Mobius => {
-                "\x1b_ratty;g;c;id=0;set=1;type=Mobius;scale=0.9;rx=0.45;rz=0.18\x1b\\"
-                    .to_string()
+                "\x1b_ratty;g;c;id=0;set=1;type=Mobius;scale=0.9;rx=0.45;rz=0.18\x1b\\".to_string()
             }
         };
         io::stdout().write_all(sequence.as_bytes())?;
