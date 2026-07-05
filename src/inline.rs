@@ -278,7 +278,6 @@ impl TerminalInlineObjects {
                 switch_immediately,
                 settings,
             } => {
-                //info!("camera settings for slot {}: set {}; rotation: ({},{},{})", camera_slot, switch_immediately, settings.rotation[0].unwrap_or(0.0), settings.rotation[1].unwrap_or(0.0), settings.rotation[2].unwrap_or(0.0));
                 if (camera_slot as usize) < camera_slots.slots.len() {
                     if switch_immediately {
                         camera_slots.current_slot = camera_slot as usize;
@@ -293,15 +292,13 @@ impl TerminalInlineObjects {
                     if let Some(py) = settings.offset[1] {
                         camera_slots.slots[camera_slot as usize].0.camera_offset[1] = py;
                     }
-                    if let Some(pz) = settings.offset[2] {
-                        camera_slots.slots[camera_slot as usize].0.camera_offset[2] = pz;
-                    }
+                    // The interactive camera currently exposes 2D pan plus yaw/pitch; ignore
+                    // unsupported Z pan and roll values until those controls exist.
+                    let _ = settings.offset[2];
                     if let Some(rx) = settings.rotation[0] {
                         camera_slots.slots[camera_slot as usize].0.yaw = rx;
                     }
-                    if let Some(_ry) = settings.rotation[1] {
-                        /*camera_slots.slots[camera_slot as usize].0.roll = ry;*/
-                    }
+                    let _ = settings.rotation[1];
                     if let Some(rz) = settings.rotation[2] {
                         camera_slots.slots[camera_slot as usize].0.pitch = rz;
                     }
