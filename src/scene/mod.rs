@@ -17,8 +17,8 @@ use bevy::window::PrimaryWindow;
 use bevy::camera::visibility::NoFrustumCulling;
 
 use crate::config::AppConfig;
-use crate::inline::TerminalCameraViewSlots;
 use crate::direct_render::{new_terminal_image, new_terminal_render_image};
+use crate::inline::TerminalCameraViewSlots;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
 use crate::terminal::{TerminalLayout, TerminalSurface, render_scale_for_window};
