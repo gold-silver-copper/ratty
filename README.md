@@ -25,6 +25,7 @@ Inspired by TempleOS | Built with Rust & Ratatui
 - Spinning rat cursor ([customizable](#changing-the-cursor))
 - Traditional 2D and [new 3D mode](#3d-mode)!
 - [Inline 3D objects](#inline-3d-objects)
+- [Inline 2D bitmap surfaces](#inline-2d-bitmap-surfaces)
 - [GPU-backed text rendering](#rendering-pipeline)
 - Image support (via Kitty Graphics Protocol >:\()
 
@@ -232,6 +233,58 @@ A blazingly fast serial monitor with plotter TUI and 3D telemetry
 <div>
   <video width="80%" src="https://github.com/user-attachments/assets/29ba6751-65d7-4103-86b3-705ef47dbbfd"/>
 </div>
+
+## Inline 2D bitmap surfaces
+
+Ratty's [Bitmap Surface Protocol](protocols/bitmap.md) lets terminal applications
+register a PNG once, place it in terminal-cell space, and update its crop,
+destination, fit, filtering, or opacity without uploading the image again.
+Applications can also replace the pixels with fixed-size RGBA8 frames for video
+or screen-share rendering.
+
+Query support before using the protocol:
+
+```text
+ESC _ ratty;i;s ESC \
+```
+
+Ratty replies with:
+
+```text
+ESC _ ratty;i;s;v=1;fmt=png;frame=rgba8;payload=1;chunk=1;placement=1;crop=1;fit=contain|cover|fill;filter=nearest|linear;opacity=1 ESC \
+```
+
+If no reply arrives, treat bitmap surfaces as unsupported and use another render
+path or a text fallback. See the protocol specification for the complete wire
+format, validation rules, and lifecycle.
+
+Try interactive pan, zoom, fit, filtering, and opacity with a PNG:
+
+```bash
+cargo run --example bitmap_pan_zoom -- <image.png>
+```
+
+Try generated RGBA8 frames at 15 FPS for 10 seconds:
+
+```bash
+cargo run --example bitmap_frames -- --fps 15 --duration 10 --width 320 --height 180
+```
+
+`bitmap_frames` accepts `--fps`, `--duration`, `--width`, and `--height`; their
+defaults are `15`, `10`, `320`, and `180`. Both examples register one bitmap,
+create one placement, update that stable bitmap or placement, and delete both on
+exit. Multiple placements can share the same bitmap and Bevy image handle.
+
+Ratty owns APC parsing, PNG registration, raw RGBA8 frame validation and upload,
+stable image and placement state, and rendering. The application owns capture,
+network transport, codec choices such as VP8, and decoding compressed video to
+RGBA8 before sending frames to Ratty.
+
+Current v1 boundaries:
+
+- live frames are full, fixed-dimension RGBA8; frame resizing is rejected
+- no live-frame compression, delta updates, or dirty rectangles
+- no codec decoding, VP8 handling, capture, or networking in Ratty
 
 ## Architecture
 
