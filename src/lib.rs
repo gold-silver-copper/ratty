@@ -7,6 +7,7 @@
 #![warn(clippy::unwrap_used)]
 
 pub mod camera;
+pub mod bitmap;
 pub mod cli;
 pub mod config;
 mod direct_render;
