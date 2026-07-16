@@ -19,16 +19,19 @@
 //! The redraw path updates the terminal texture and presentation state first, then the inline
 //! object systems rebuild or reposition scene entities that depend on the terminal grid.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::TryRecvError;
 
+use crate::bitmap::{BitmapFilter, BitmapPlacementState};
+use crate::bitmap_material::{BitmapSurfaceMaterial, BitmapSurfaceUniform, resolve_bitmap_layout};
 use crate::camera::{
     MIN_ORTHOGRAPHIC_SCALE, TerminalCameraSlots, TerminalCameraUpdate, TerminalMobiusSource,
 };
 use crate::config::{AppConfig, CURSOR_DEPTH};
 use crate::direct_render::DirectTerminalSceneExchange;
 use crate::inline::{
-    InlineKittyPlaneLayout, InlineObject, TerminalInlineObjectPlane, TerminalInlineObjectSprite,
+    BitmapPlacementRenderCache, BitmapPlacementRenderState, InlineKittyPlaneLayout, InlineObject,
+    TerminalBitmapPlacement, TerminalInlineObjectPlane, TerminalInlineObjectSprite,
     TerminalInlineObjects, TerminalRgpObject,
 };
 use crate::model::CursorModel;
@@ -547,7 +550,15 @@ pub(crate) struct SyncInlineParams<'w, 's> {
     plane_warp: Res<'w, TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: Query<'w, 's, (Entity, &'static Transform), With<TerminalPlane>>,
-    sprite_query: Query<'w, 's, Entity, With<TerminalInlineObjectSprite>>,
+    sprite_query: Query<
+        'w,
+        's,
+        Entity,
+        (
+            With<TerminalInlineObjectSprite>,
+            Without<TerminalBitmapPlacement>,
+        ),
+    >,
     plane_image_query: Query<'w, 's, Entity, With<TerminalInlineObjectPlane>>,
     rgp_query: Query<'w, 's, Entity, With<TerminalRgpObject>>,
     asset_server: Res<'w, AssetServer>,
@@ -662,6 +673,324 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
     }
 
     inline_objects.finish_sync(viewport.size, terminal.cols, terminal.rows);
+}
+
+/// Bitmap-surface synchronization parameters.
+#[derive(SystemParam)]
+pub(crate) struct SyncBitmapParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    inline_objects: ResMut<'w, TerminalInlineObjects>,
+    terminal: Res<'w, TerminalSurface>,
+    viewport: Res<'w, TerminalViewport>,
+    camera_slots: Res<'w, TerminalCameraSlots>,
+    images: ResMut<'w, Assets<Image>>,
+    meshes: ResMut<'w, Assets<Mesh>>,
+    materials: ResMut<'w, Assets<BitmapSurfaceMaterial>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct BitmapSyncChanges {
+    transform: bool,
+    mesh: bool,
+    material: bool,
+}
+
+fn bitmap_sync_changes(
+    previous: &BitmapPlacementRenderState,
+    next: &BitmapPlacementRenderState,
+) -> BitmapSyncChanges {
+    BitmapSyncChanges {
+        transform: previous.transform != next.transform,
+        mesh: previous.destination != next.destination,
+        material: previous.image != next.image || previous.uniform != next.uniform,
+    }
+}
+
+/// Uploads registered bitmaps once and synchronizes placement entities in place.
+pub(crate) fn sync_bitmap_placements(mut params: SyncBitmapParams) {
+    let SyncBitmapParams {
+        commands,
+        inline_objects,
+        terminal,
+        viewport,
+        camera_slots,
+        images,
+        meshes,
+        materials,
+    } = &mut params;
+    if !inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows) {
+        return;
+    }
+
+    let bitmap_ids = inline_objects
+        .bitmap
+        .bitmaps()
+        .map(|(bitmap_id, _)| *bitmap_id)
+        .collect::<HashSet<_>>();
+    let restarted_bitmap_ids = bitmap_ids
+        .iter()
+        .filter(|bitmap_id| {
+            inline_objects.bitmap_render.images.contains_key(bitmap_id)
+                && inline_objects
+                    .bitmap
+                    .bitmap(**bitmap_id)
+                    .is_some_and(|bitmap| bitmap.handle().is_none())
+        })
+        .copied()
+        .collect::<HashSet<_>>();
+    for bitmap_id in &restarted_bitmap_ids {
+        if let Some(handle) = inline_objects.bitmap_render.images.remove(bitmap_id) {
+            images.remove(&handle);
+        }
+    }
+    let restarted_placement_ids = inline_objects
+        .bitmap_render
+        .placements
+        .iter()
+        .filter_map(|(placement_id, cache)| {
+            restarted_bitmap_ids
+                .contains(&cache.bitmap_id)
+                .then_some(*placement_id)
+        })
+        .collect::<Vec<_>>();
+    for placement_id in restarted_placement_ids {
+        if let Some(cache) = inline_objects
+            .bitmap_render
+            .placements
+            .remove(&placement_id)
+        {
+            commands.entity(cache.entity).despawn();
+            meshes.remove(&cache.mesh);
+            materials.remove(&cache.material);
+        }
+    }
+    let removed_bitmap_ids = inline_objects
+        .bitmap_render
+        .images
+        .keys()
+        .filter(|bitmap_id| !bitmap_ids.contains(bitmap_id))
+        .copied()
+        .collect::<Vec<_>>();
+    for bitmap_id in removed_bitmap_ids {
+        if let Some(handle) = inline_objects.bitmap_render.images.remove(&bitmap_id) {
+            images.remove(&handle);
+        }
+    }
+
+    for bitmap_id in bitmap_ids {
+        sync_bitmap_image(bitmap_id, inline_objects, images);
+    }
+
+    let placements = inline_objects
+        .bitmap
+        .placements()
+        .map(|(placement_id, placement)| (*placement_id, placement.clone()))
+        .collect::<Vec<_>>();
+    let active_placement_generations = placements
+        .iter()
+        .map(|(placement_id, placement)| (*placement_id, placement.generation()))
+        .collect::<HashMap<_, _>>();
+    let removed_placement_ids = inline_objects
+        .bitmap_render
+        .placements
+        .iter()
+        .filter_map(|(placement_id, cache)| {
+            active_placement_generations
+                .get(placement_id)
+                .is_none_or(|generation| *generation != cache.generation)
+                .then_some(*placement_id)
+        })
+        .collect::<Vec<_>>();
+    for placement_id in removed_placement_ids {
+        if let Some(cache) = inline_objects
+            .bitmap_render
+            .placements
+            .remove(&placement_id)
+        {
+            commands.entity(cache.entity).despawn();
+            meshes.remove(&cache.mesh);
+            materials.remove(&cache.material);
+        }
+    }
+
+    let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
+    let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
+    for (placement_id, placement) in placements {
+        let Some(image) = inline_objects
+            .bitmap_render
+            .images
+            .get(&placement.bitmap_id())
+            .cloned()
+        else {
+            continue;
+        };
+        let destination = Vec2::new(
+            placement.columns() as f32 * cell_width,
+            placement.rows() as f32 * cell_height,
+        );
+        let center = Vec2::new(
+            viewport.center.x - viewport.size.x * 0.5
+                + (placement.col() as f32 + placement.columns() as f32 * 0.5) * cell_width,
+            viewport.center.y + viewport.size.y * 0.5
+                - (placement.row() as f32 + placement.rows() as f32 * 0.5) * cell_height,
+        );
+        let Some(bitmap) = inline_objects.bitmap.bitmap(placement.bitmap_id()) else {
+            continue;
+        };
+        let layout = resolve_bitmap_layout(
+            UVec2::new(bitmap.width(), bitmap.height()),
+            placement.source(),
+            destination,
+            placement.fit(),
+        );
+        let uniform = bitmap_uniform(&placement, layout);
+        let transform = Transform::from_xyz(center.x, center.y, 5.0);
+        let render_state = BitmapPlacementRenderState {
+            image: image.clone(),
+            destination,
+            transform,
+            uniform,
+        };
+
+        if let Some(cache) = inline_objects
+            .bitmap_render
+            .placements
+            .get_mut(&placement_id)
+        {
+            debug_assert_eq!(cache.bitmap_id, placement.bitmap_id());
+            let changes = bitmap_sync_changes(&cache.state, &render_state);
+            if changes.mesh
+                && let Some(mut mesh) = meshes.get_mut(&cache.mesh)
+            {
+                *mesh =
+                    Rectangle::new(render_state.destination.x, render_state.destination.y).into();
+                cache.state.destination = render_state.destination;
+            }
+            if changes.material
+                && let Some(mut material) = materials.get_mut(&cache.material)
+            {
+                material.image = render_state.image.clone();
+                material.params = render_state.uniform;
+                cache.state.image = render_state.image.clone();
+                cache.state.uniform = render_state.uniform;
+            }
+            if changes.transform {
+                commands.entity(cache.entity).insert(render_state.transform);
+                cache.state.transform = render_state.transform;
+            }
+            debug!(
+                placement_id,
+                transform = changes.transform,
+                mesh = changes.mesh,
+                material = changes.material,
+                "synchronized bitmap placement update"
+            );
+            continue;
+        }
+
+        let mesh = meshes.add(Rectangle::new(destination.x, destination.y));
+        let material = materials.add(BitmapSurfaceMaterial {
+            image,
+            params: uniform,
+        });
+        let visibility = match camera_slots.active().mode {
+            TerminalPresentationMode::Flat2d => Visibility::Visible,
+            TerminalPresentationMode::Plane3d
+            | TerminalPresentationMode::Perspective3d
+            | TerminalPresentationMode::Mobius3d => Visibility::Hidden,
+        };
+        let entity = commands
+            .spawn((
+                TerminalBitmapPlacement {
+                    placement_id,
+                    bitmap_id: placement.bitmap_id(),
+                },
+                TerminalInlineObjectSprite,
+                Mesh2d(mesh.clone()),
+                MeshMaterial2d(material.clone()),
+                transform,
+                visibility,
+            ))
+            .id();
+        inline_objects.bitmap_render.placements.insert(
+            placement_id,
+            BitmapPlacementRenderCache {
+                generation: placement.generation(),
+                bitmap_id: placement.bitmap_id(),
+                entity,
+                mesh,
+                material,
+                state: render_state,
+            },
+        );
+    }
+    inline_objects.finish_bitmap_sync();
+}
+
+fn sync_bitmap_image(
+    bitmap_id: u32,
+    inline_objects: &mut TerminalInlineObjects,
+    images: &mut Assets<Image>,
+) {
+    let cached_handle = inline_objects.bitmap_render.images.get(&bitmap_id).cloned();
+    let Some(bitmap) = inline_objects.bitmap.bitmap_mut(bitmap_id) else {
+        return;
+    };
+    let pending_pixels = bitmap.take_pending_rgba();
+
+    if let Some(handle) = cached_handle.or_else(|| bitmap.handle().cloned()) {
+        if let Some(pixels) = pending_pixels
+            && let Some(mut image) = images.get_mut(&handle)
+        {
+            image.data = Some(pixels);
+        }
+        bitmap.set_handle(handle.clone());
+        inline_objects
+            .bitmap_render
+            .images
+            .insert(bitmap_id, handle);
+        return;
+    }
+
+    let Some(pixels) = pending_pixels else {
+        return;
+    };
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: bitmap.width(),
+            height: bitmap.height(),
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::nearest();
+    image.data = Some(pixels);
+    let handle = images.add(image);
+    bitmap.set_handle(handle.clone());
+    inline_objects
+        .bitmap_render
+        .images
+        .insert(bitmap_id, handle);
+}
+
+fn bitmap_uniform(
+    placement: &BitmapPlacementState,
+    layout: crate::bitmap_material::ResolvedBitmapLayout,
+) -> BitmapSurfaceUniform {
+    BitmapSurfaceUniform {
+        uv_min: layout.uv_min,
+        uv_max: layout.uv_max,
+        opacity: placement.opacity(),
+        filter_mode: match placement.filter() {
+            BitmapFilter::Nearest => 0,
+            BitmapFilter::Linear => 1,
+        },
+        content_min: layout.content_min,
+        content_max: layout.content_max,
+    }
 }
 
 fn inline_layout(
@@ -2248,5 +2577,589 @@ mod tests {
         assert_eq!(preset.mode, source.mode);
         assert_eq!(preset.pose, source.pose);
         assert_eq!(preset.mobius_source, None);
+    }
+}
+
+#[cfg(test)]
+mod bitmap_sync_tests {
+    use super::*;
+    use crate::bitmap::{
+        BitmapFilter, BitmapFit, BitmapFrameChunk, BitmapOperation, BitmapPlacement,
+        BitmapPlacementUpdate, BitmapRegisterChunk, SourceRect,
+    };
+    use crate::bitmap_material::BitmapSurfaceMaterial;
+
+    type RenderedPlacement = (
+        Entity,
+        Handle<Image>,
+        Handle<Mesh>,
+        Handle<BitmapSurfaceMaterial>,
+        Transform,
+    );
+    type RenderedPlacements = HashMap<u32, RenderedPlacement>;
+
+    const PNG_2X2: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72,
+        0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00, 0x12, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x0c, 0x81, 0x34, 0x18, 0x00, 0x00, 0x49, 0xc8, 0x09, 0xf7, 0xf9,
+        0xab, 0xb6, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn render_state() -> BitmapPlacementRenderState {
+        BitmapPlacementRenderState {
+            image: Handle::default(),
+            destination: Vec2::new(320.0, 180.0),
+            transform: Transform::from_xyz(10.0, 20.0, 5.0),
+            uniform: BitmapSurfaceUniform {
+                uv_min: Vec2::ZERO,
+                uv_max: Vec2::ONE,
+                opacity: 1.0,
+                filter_mode: 1,
+                content_min: Vec2::ZERO,
+                content_max: Vec2::ONE,
+            },
+        }
+    }
+
+    #[test]
+    fn source_only_bitmap_update_changes_only_material() {
+        let previous = render_state();
+        let mut next = previous.clone();
+        next.uniform.uv_min = Vec2::new(0.25, 0.0);
+
+        assert_eq!(
+            bitmap_sync_changes(&previous, &next),
+            BitmapSyncChanges {
+                transform: false,
+                mesh: false,
+                material: true,
+            }
+        );
+    }
+
+    #[test]
+    fn position_only_bitmap_update_changes_only_transform() {
+        let previous = render_state();
+        let mut next = previous.clone();
+        next.transform.translation.x += 40.0;
+
+        assert_eq!(
+            bitmap_sync_changes(&previous, &next),
+            BitmapSyncChanges {
+                transform: true,
+                mesh: false,
+                material: false,
+            }
+        );
+    }
+
+    fn test_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<TerminalInlineObjects>()
+            .init_resource::<Assets<Image>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<BitmapSurfaceMaterial>>()
+            .insert_resource(
+                TerminalSurface::new(&AppConfig::default())
+                    .expect("bitmap sync test fixture should satisfy this invariant"),
+            )
+            .insert_resource(TerminalViewport {
+                size: Vec2::new(800.0, 480.0),
+                center: Vec2::ZERO,
+            })
+            .init_resource::<TerminalCameraSlots>()
+            .add_systems(Update, sync_bitmap_placements);
+        app
+    }
+
+    fn register_and_place(app: &mut App, placement_ids: &[u32]) {
+        let mut objects = app.world_mut().resource_mut::<TerminalInlineObjects>();
+        objects
+            .bitmap
+            .apply(BitmapOperation::Register(BitmapRegisterChunk {
+                bitmap_id: 42,
+                format: Some("png".into()),
+                source: Some("payload".into()),
+                name: None,
+                more: false,
+                data: PNG_2X2.to_vec(),
+            }))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        for &placement_id in placement_ids {
+            objects
+                .bitmap
+                .apply(BitmapOperation::Place(BitmapPlacement {
+                    bitmap_id: 42,
+                    placement_id,
+                    row: placement_id as u16,
+                    col: 2,
+                    columns: 8,
+                    rows: 4,
+                    source: None,
+                    fit: BitmapFit::Contain,
+                    filter: BitmapFilter::Linear,
+                    opacity: 1.0,
+                }))
+                .expect("bitmap sync test fixture should satisfy this invariant");
+        }
+    }
+
+    fn rendered_placements(app: &mut App) -> RenderedPlacements {
+        let world = app.world_mut();
+        let mut query = world.query::<(
+            Entity,
+            &TerminalBitmapPlacement,
+            &Mesh2d,
+            &MeshMaterial2d<BitmapSurfaceMaterial>,
+            &Transform,
+        )>();
+        let placements = query
+            .iter(world)
+            .map(|(entity, placement, mesh, material, transform)| {
+                (
+                    placement.placement_id,
+                    (entity, mesh.0.clone(), material.0.clone(), *transform),
+                )
+            })
+            .collect::<Vec<_>>();
+        let materials = world.resource::<Assets<BitmapSurfaceMaterial>>();
+        placements
+            .into_iter()
+            .map(|(placement_id, (entity, mesh, material, transform))| {
+                let image = materials
+                    .get(&material)
+                    .expect("bitmap sync test fixture should satisfy this invariant")
+                    .image
+                    .clone();
+                (placement_id, (entity, image, mesh, material, transform))
+            })
+            .collect()
+    }
+
+    fn rendered_marker(app: &mut App, placement_id: u32) -> TerminalBitmapPlacement {
+        let world = app.world_mut();
+        let mut query = world.query::<&TerminalBitmapPlacement>();
+        *query
+            .iter(world)
+            .find(|placement| placement.placement_id == placement_id)
+            .expect("bitmap sync test fixture should satisfy this invariant")
+    }
+
+    #[test]
+    fn one_bitmap_with_two_placements_uploads_once_and_spawns_two_entities() {
+        let mut app = test_app();
+        register_and_place(&mut app, &[7, 8]);
+
+        app.update();
+
+        let rendered = rendered_placements(&mut app);
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+        assert_eq!(rendered[&7].1, rendered[&8].1);
+    }
+
+    #[test]
+    fn placement_updates_preserve_entity_image_mesh_and_material_handles() {
+        let mut app = test_app();
+        register_and_place(&mut app, &[7]);
+        app.update();
+        let before = rendered_placements(&mut app)
+            .remove(&7)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::Update {
+                placement_id: 7,
+                update: BitmapPlacementUpdate {
+                    row: Some(5),
+                    col: Some(6),
+                    columns: Some(10),
+                    rows: Some(6),
+                    source: Some(SourceRect {
+                        x: 1,
+                        y: 0,
+                        width: 1,
+                        height: 2,
+                    }),
+                    fit: Some(BitmapFit::Fill),
+                    filter: Some(BitmapFilter::Nearest),
+                    opacity: Some(0.5),
+                },
+            })
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+
+        let after = rendered_placements(&mut app)
+            .remove(&7)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        assert_eq!(before.2, after.2);
+        assert_eq!(before.3, after.3);
+        assert_ne!(before.4, after.4);
+        let material = app
+            .world()
+            .resource::<Assets<BitmapSurfaceMaterial>>()
+            .get(&after.3)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        assert_eq!(material.params.uv_min, Vec2::new(0.5, 0.0));
+        assert_eq!(material.params.uv_max, Vec2::ONE);
+        assert_eq!(material.params.filter_mode, 0);
+        assert_eq!(material.params.opacity, 0.5);
+    }
+
+    #[test]
+    fn valid_frame_mutates_pixels_in_place_without_replacing_render_objects() {
+        let mut app = test_app();
+        register_and_place(&mut app, &[7, 8]);
+        app.update();
+        let before = rendered_placements(&mut app);
+        let replacement = vec![17; 16];
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::Frame(BitmapFrameChunk {
+                bitmap_id: 42,
+                sequence: 1,
+                format: Some("rgba8".into()),
+                width: Some(2),
+                height: Some(2),
+                more: false,
+                data: replacement.clone(),
+            }))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+
+        let after = rendered_placements(&mut app);
+        assert_eq!(before, after);
+        let image = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&after[&7].1)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        assert_eq!(image.data.as_deref(), Some(replacement.as_slice()));
+    }
+
+    #[test]
+    fn malformed_and_stale_frames_leave_pixels_and_render_objects_unchanged() {
+        let mut app = test_app();
+        register_and_place(&mut app, &[7]);
+        app.update();
+        let before_render = rendered_placements(&mut app);
+        let image_handle = before_render[&7].1.clone();
+        let before_pixels = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&image_handle)
+            .expect("bitmap sync test fixture should satisfy this invariant")
+            .data
+            .clone();
+
+        assert!(
+            app.world_mut()
+                .resource_mut::<TerminalInlineObjects>()
+                .bitmap
+                .apply(BitmapOperation::Frame(BitmapFrameChunk {
+                    bitmap_id: 42,
+                    sequence: 1,
+                    format: Some("rgba8".into()),
+                    width: Some(2),
+                    height: Some(2),
+                    more: false,
+                    data: vec![1; 15],
+                }))
+                .is_err()
+        );
+        app.update();
+        assert_eq!(before_render, rendered_placements(&mut app));
+        assert_eq!(
+            app.world()
+                .resource::<Assets<Image>>()
+                .get(&image_handle)
+                .expect("bitmap sync test fixture should satisfy this invariant")
+                .data,
+            before_pixels
+        );
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::Frame(BitmapFrameChunk {
+                bitmap_id: 42,
+                sequence: 2,
+                format: Some("rgba8".into()),
+                width: Some(2),
+                height: Some(2),
+                more: false,
+                data: vec![2; 16],
+            }))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+        let valid_render = rendered_placements(&mut app);
+        let valid_pixels = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&image_handle)
+            .expect("bitmap sync test fixture should satisfy this invariant")
+            .data
+            .clone();
+        assert_eq!(valid_render, before_render);
+        assert_eq!(valid_pixels.as_deref(), Some(&[2_u8; 16][..]));
+
+        assert!(
+            app.world_mut()
+                .resource_mut::<TerminalInlineObjects>()
+                .bitmap
+                .apply(BitmapOperation::Frame(BitmapFrameChunk {
+                    bitmap_id: 42,
+                    sequence: 1,
+                    format: Some("rgba8".into()),
+                    width: Some(2),
+                    height: Some(2),
+                    more: false,
+                    data: vec![3; 16],
+                }))
+                .is_err()
+        );
+        app.update();
+
+        let after_render = rendered_placements(&mut app);
+        assert_eq!(valid_render, after_render);
+        let pixels = &app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&image_handle)
+            .expect("bitmap sync test fixture should satisfy this invariant")
+            .data;
+        assert_eq!(pixels, &valid_pixels);
+    }
+
+    #[test]
+    fn placement_and_bitmap_deletion_clean_exact_render_assets() {
+        let mut app = test_app();
+        register_and_place(&mut app, &[7, 8]);
+        app.update();
+        let before = rendered_placements(&mut app);
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::DeletePlacement(7))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+        let after_placement_delete = rendered_placements(&mut app);
+        assert!(!after_placement_delete.contains_key(&7));
+        assert_eq!(after_placement_delete[&8].0, before[&8].0);
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::DeletePlacement(8))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+        assert!(rendered_placements(&mut app).is_empty());
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+        assert!(
+            app.world()
+                .resource::<Assets<BitmapSurfaceMaterial>>()
+                .is_empty()
+        );
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::DeleteBitmap(42))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+        assert!(rendered_placements(&mut app).is_empty());
+        assert!(app.world().resource::<Assets<Image>>().is_empty());
+        assert!(
+            app.world()
+                .resource::<Assets<BitmapSurfaceMaterial>>()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_and_reregister_before_sync_starts_a_new_render_lifetime() {
+        let mut app = test_app();
+        register_and_place(&mut app, &[7]);
+        app.update();
+        let before = rendered_placements(&mut app)
+            .remove(&7)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::DeleteBitmap(42))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        register_and_place(&mut app, &[7]);
+        app.update();
+
+        let after = rendered_placements(&mut app)
+            .remove(&7)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        assert_ne!(before.0, after.0);
+        assert_ne!(before.1, after.1);
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+    }
+
+    #[test]
+    fn deleting_and_recreating_same_placement_id_on_same_bitmap_uses_fresh_render_assets() {
+        let mut app = test_app();
+        register_and_place(&mut app, &[7]);
+        app.update();
+        let before = rendered_placements(&mut app)
+            .remove(&7)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+
+        {
+            let mut objects = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            objects
+                .bitmap
+                .apply(BitmapOperation::DeletePlacement(7))
+                .expect("bitmap sync test fixture should satisfy this invariant");
+            objects
+                .bitmap
+                .apply(BitmapOperation::Place(BitmapPlacement {
+                    bitmap_id: 42,
+                    placement_id: 7,
+                    row: 9,
+                    col: 4,
+                    columns: 5,
+                    rows: 3,
+                    source: None,
+                    fit: BitmapFit::Fill,
+                    filter: BitmapFilter::Nearest,
+                    opacity: 0.75,
+                }))
+                .expect("bitmap sync test fixture should satisfy this invariant");
+        }
+        app.update();
+
+        let after = rendered_placements(&mut app)
+            .remove(&7)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        assert_ne!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        assert_ne!(before.2, after.2);
+        assert_ne!(before.3, after.3);
+        let marker = rendered_marker(&mut app, 7);
+        assert_eq!(marker.bitmap_id, 42);
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::DeletePlacement(7))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+        assert!(rendered_placements(&mut app).is_empty());
+        assert!(app.world().resource::<Assets<Mesh>>().is_empty());
+        assert!(
+            app.world()
+                .resource::<Assets<BitmapSurfaceMaterial>>()
+                .is_empty()
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::DeleteBitmap(42))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+        assert!(app.world().resource::<Assets<Image>>().is_empty());
+    }
+
+    #[test]
+    fn deleting_and_recreating_same_placement_id_on_different_bitmap_rebinds_everything() {
+        let mut app = test_app();
+        register_and_place(&mut app, &[7]);
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::Register(BitmapRegisterChunk {
+                bitmap_id: 43,
+                format: Some("png".into()),
+                source: Some("payload".into()),
+                name: None,
+                more: false,
+                data: PNG_2X2.to_vec(),
+            }))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+        let before = rendered_placements(&mut app)
+            .remove(&7)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+
+        {
+            let mut objects = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            objects
+                .bitmap
+                .apply(BitmapOperation::DeletePlacement(7))
+                .expect("bitmap sync test fixture should satisfy this invariant");
+            objects
+                .bitmap
+                .apply(BitmapOperation::Place(BitmapPlacement {
+                    bitmap_id: 43,
+                    placement_id: 7,
+                    row: 2,
+                    col: 6,
+                    columns: 4,
+                    rows: 2,
+                    source: None,
+                    fit: BitmapFit::Contain,
+                    filter: BitmapFilter::Linear,
+                    opacity: 1.0,
+                }))
+                .expect("bitmap sync test fixture should satisfy this invariant");
+        }
+        app.update();
+
+        let after = rendered_placements(&mut app)
+            .remove(&7)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        assert_ne!(before.0, after.0);
+        assert_ne!(before.1, after.1);
+        assert_ne!(before.2, after.2);
+        assert_ne!(before.3, after.3);
+        let marker = rendered_marker(&mut app, 7);
+        assert_eq!(marker.bitmap_id, 43);
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 2);
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply(BitmapOperation::DeletePlacement(7))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        app.update();
+        assert!(rendered_placements(&mut app).is_empty());
+        assert!(app.world().resource::<Assets<Mesh>>().is_empty());
+        assert!(
+            app.world()
+                .resource::<Assets<BitmapSurfaceMaterial>>()
+                .is_empty()
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 2);
+
+        {
+            let mut objects = app.world_mut().resource_mut::<TerminalInlineObjects>();
+            objects
+                .bitmap
+                .apply(BitmapOperation::DeleteBitmap(42))
+                .expect("bitmap sync test fixture should satisfy this invariant");
+            objects
+                .bitmap
+                .apply(BitmapOperation::DeleteBitmap(43))
+                .expect("bitmap sync test fixture should satisfy this invariant");
+        }
+        app.update();
+        assert!(app.world().resource::<Assets<Image>>().is_empty());
     }
 }

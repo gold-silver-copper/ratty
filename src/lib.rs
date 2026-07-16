@@ -6,8 +6,9 @@
 #![warn(missing_docs)]
 #![warn(clippy::unwrap_used)]
 
-pub mod camera;
 pub mod bitmap;
+pub mod bitmap_material;
+pub mod camera;
 pub mod cli;
 pub mod config;
 mod direct_render;

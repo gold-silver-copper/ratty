@@ -1,7 +1,11 @@
 //! Bevy plugin wiring for the terminal application.
 
+use bevy::asset::load_internal_asset;
 use bevy::prelude::*;
+use bevy::shader::Shader;
+use bevy::sprite_render::Material2dPlugin;
 
+use crate::bitmap_material::{BITMAP_SURFACE_SHADER, BitmapSurfaceMaterial};
 use crate::camera::{
     ActivateTerminalCameraPreset, TerminalCameraSlots, TerminalCameraSystemSet,
     TerminalCameraUpdate, activate_terminal_camera_presets, apply_terminal_camera_updates,
@@ -22,7 +26,8 @@ use crate::systems::{
     animate_terminal_plane_warp, apply_inline_objects, apply_instance_brightness,
     finish_terminal_model_load, handle_window_resize, pump_pty_output, render_terminal_widget,
     request_exit_on_primary_window_close, shutdown_terminal_runtime_on_exit,
-    sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects, sync_terminal_materials,
+    sync_asset_to_terminal_cursor, sync_bitmap_placements, sync_inline_objects, sync_rgp_objects,
+    sync_terminal_materials,
 };
 use crate::terminal::TerminalRedrawState;
 
@@ -42,6 +47,12 @@ pub struct TerminalPlugin;
 
 impl Plugin for TerminalPlugin {
     fn build(&self, app: &mut App) {
+        load_internal_asset!(
+            app,
+            BITMAP_SURFACE_SHADER,
+            "shaders/bitmap_surface.wgsl",
+            Shader::from_wgsl
+        );
         app.init_resource::<TerminalSelection>()
             .init_resource::<TerminalInlineObjects>()
             .init_resource::<TerminalRedrawState>()
@@ -136,8 +147,14 @@ impl Plugin for TerminalPlugin {
             )
             .add_systems(
                 Update,
-                sync_inline_objects
+                sync_bitmap_placements
                     .after(TerminalRedrawSet)
+                    .after(TerminalCameraSystemSet::Transition),
+            )
+            .add_systems(
+                Update,
+                sync_inline_objects
+                    .after(sync_bitmap_placements)
                     // Deterministic vs the Transition set: on the frame a
                     // Mobius exit finishes, spawned inline entities must see
                     // the restored mode, not race it.
@@ -173,6 +190,7 @@ impl Plugin for TerminalPlugin {
                     .run_if(|config: Res<AppConfig>| config.cursor.model.visible),
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
+            .add_plugins(Material2dPlugin::<BitmapSurfaceMaterial>::default())
             .add_plugins(DirectTerminalRenderPlugin)
             .add_plugins(TerminalPresentPlugin);
     }
