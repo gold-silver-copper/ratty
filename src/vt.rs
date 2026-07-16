@@ -689,6 +689,18 @@ mod tests {
         assert!(harness.sink.take_replies().is_empty(), "replies must drain");
     }
 
+    #[test]
+    fn cell_size_query_reports_current_pixel_dimensions() {
+        let mut harness = Harness::new(24, 80);
+        harness.term.resize(CrosswordsSize::new_with_dimensions(
+            80, 24, 800, 480, 10, 20,
+        ));
+
+        harness.feed(b"\x1b[16t");
+
+        assert_eq!(harness.sink.take_replies(), [b"\x1b[6;20;10t".to_vec()]);
+    }
+
     /// rio-vt reports the engine's capabilities, not ratty's. Sixel and OSC 52
     /// must not survive to the PTY, or applications will emit payloads that
     /// silently go nowhere.

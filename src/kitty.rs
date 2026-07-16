@@ -53,6 +53,40 @@ impl KittyParserState {
 
         let action = params.get("a").copied().unwrap_or("T");
         match action {
+            "q" => {
+                let image_id = params
+                    .get("i")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                let quiet = params
+                    .get("q")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                let format = params
+                    .get("f")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(100);
+                let width = params
+                    .get("s")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                let height = params
+                    .get("v")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                let medium = params.get("t").copied().unwrap_or("d");
+                let result = base64::engine::general_purpose::STANDARD
+                    .decode(payload)
+                    .map_err(|_| "invalid pixel data")
+                    .and_then(|payload| {
+                        validate_direct_query(format, width, height, medium, &payload)
+                    });
+                Some(KittyOperation::Query {
+                    image_id,
+                    result,
+                    quiet,
+                })
+            }
             "T" | "t" => {
                 let starts_new_transfer = self.transfer.is_none()
                     || params.contains_key("a")
@@ -187,6 +221,15 @@ pub enum KittyOperation {
     Pending,
     /// Indicates the sequence was ignored.
     Ignored,
+    /// Capability query result, returned without storing image state.
+    Query {
+        /// Image identifier echoed in the protocol reply.
+        image_id: u32,
+        /// Validation result for the probed payload.
+        result: Result<(), &'static str>,
+        /// Kitty `q` response-suppression level.
+        quiet: u8,
+    },
     /// Image registration without placement.
     TransmitOnly {
         /// Object identifier.
@@ -215,6 +258,33 @@ pub enum KittyOperation {
         /// Optional object identifier.
         object_id: Option<u32>,
     },
+}
+
+fn validate_direct_query(
+    format: u32,
+    width: u32,
+    height: u32,
+    medium: &str,
+    payload: &[u8],
+) -> Result<(), &'static str> {
+    if medium != "d" {
+        return Err("unsupported transmission medium");
+    }
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    let expected = match format {
+        24 => pixels.saturating_mul(3),
+        32 => pixels.saturating_mul(4),
+        100 => {
+            return image::load_from_memory_with_format(payload, image::ImageFormat::Png)
+                .map(|_| ())
+                .map_err(|_| "invalid PNG data");
+        }
+        _ => return Err("unsupported pixel format"),
+    };
+    if payload.len() as u64 != expected {
+        return Err("invalid pixel data");
+    }
+    Ok(())
 }
 
 struct KittyTransfer {
@@ -360,4 +430,43 @@ pub fn refresh_kitty_placeholder_anchors(
     }
 
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kitty_query_parses_valid_direct_transfer_probe() {
+        let mut state = KittyParserState::default();
+
+        let operation =
+            state.consume_sequence(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", (0, 0));
+
+        assert!(matches!(
+            operation,
+            Some(KittyOperation::Query {
+                image_id: 31,
+                result: Ok(()),
+                quiet: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn kitty_query_preserves_quiet_level() {
+        let mut state = KittyParserState::default();
+
+        let operation =
+            state.consume_sequence(b"\x1b_Gi=9,s=2,v=2,a=q,t=d,f=24,q=2;AAAA\x1b\\", (0, 0));
+
+        assert!(matches!(
+            operation,
+            Some(KittyOperation::Query {
+                image_id: 9,
+                result: Err("invalid pixel data"),
+                quiet: 2,
+            })
+        ));
+    }
 }

@@ -28,6 +28,12 @@ pub struct RuntimeOptions {
     pub working_dir: Option<PathBuf>,
 }
 
+fn apply_terminal_identity(command: &mut CommandBuilder) {
+    command.env("RATTY_SESSION", "1");
+    command.env("TERM_PROGRAM", "ratty");
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+}
+
 /// Running PTY and parser state.
 ///
 /// The `!Sync` PTY handles (the output channel receiver and the master) live
@@ -125,6 +131,33 @@ fn find_git_bash() -> Option<String> {
 }
 
 impl TerminalRuntime {
+    #[cfg(test)]
+    pub(crate) fn for_test(rows: u16, cols: u16) -> Self {
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+        let sink = TerminalEventSink::default();
+        let term = Crosswords::new(
+            CrosswordsSize::new(usize::from(cols.max(1)), usize::from(rows.max(1))),
+            CursorShape::Block,
+            sink.clone(),
+            WindowId::from(0),
+            0,
+            1000,
+        );
+
+        Self {
+            rx: SyncCell::new(rx),
+            writer: Arc::new(Mutex::new(None)),
+            master: SyncCell::new(None),
+            child: None,
+            reader_thread: None,
+            term,
+            processor: Processor::default(),
+            sink,
+            pty_disconnected: false,
+            shutdown_started: false,
+        }
+    }
+
     /// Spawns the shell PTY runtime.
     ///
     /// # Errors
@@ -173,6 +206,7 @@ impl TerminalRuntime {
         for (key, value) in &config.env {
             cmd.env(key, value);
         }
+        apply_terminal_identity(&mut cmd);
 
         let child = pair
             .slave
@@ -278,8 +312,18 @@ impl TerminalRuntime {
 
         // rio-vt reflows content and resets the scrolling region natively, so
         // the grid resize is the whole operation — no snapshot and replay.
-        self.term
-            .resize(CrosswordsSize::new(usize::from(cols), usize::from(rows)));
+        let pixel_width = u32::from(pw);
+        let pixel_height = u32::from(ph);
+        let cell_width = pixel_width.div_ceil(u32::from(cols));
+        let cell_height = pixel_height.div_ceil(u32::from(rows));
+        self.term.resize(CrosswordsSize::new_with_dimensions(
+            usize::from(cols),
+            usize::from(rows),
+            pixel_width,
+            pixel_height,
+            cell_width,
+            cell_height,
+        ));
     }
 
     /// Returns the active kitty keyboard enhancement flags.
@@ -324,5 +368,26 @@ impl TerminalRuntime {
 impl Drop for TerminalRuntime {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    #[test]
+    fn ratty_child_environment_identifies_the_terminal() {
+        let mut command = CommandBuilder::new("rchat-tui");
+
+        apply_terminal_identity(&mut command);
+
+        assert_eq!(command.get_env("RATTY_SESSION"), Some(OsStr::new("1")));
+        assert_eq!(command.get_env("TERM_PROGRAM"), Some(OsStr::new("ratty")));
+        assert_eq!(
+            command.get_env("TERM_PROGRAM_VERSION"),
+            Some(OsStr::new(env!("CARGO_PKG_VERSION")))
+        );
     }
 }

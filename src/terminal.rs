@@ -226,6 +226,17 @@ impl TerminalSurface {
         UVec2::new(width, height)
     }
 
+    /// Returns the physical pixel dimensions of one terminal cell.
+    pub fn cell_pixel_dimensions(&self) -> (u16, u16) {
+        let pixels = self.pixmap_dimensions();
+        let width = pixels.x.div_ceil(u32::from(self.cols.max(1)));
+        let height = pixels.y.div_ceil(u32::from(self.rows.max(1)));
+        (
+            width.clamp(1, u32::from(u16::MAX)) as u16,
+            height.clamp(1, u32::from(u16::MAX)) as u16,
+        )
+    }
+
     /// Returns the current terminal layout.
     fn layout(&self) -> TerminalLayout {
         TerminalLayout::new(
@@ -761,6 +772,22 @@ mod tests {
 
         // The spacer cell after a wide glyph stays blank rather than repeating it.
         assert_eq!(rendered[0], "你 好 e\u{0301}z");
+    }
+
+    #[test]
+    fn cell_pixel_dimensions_divide_the_physical_texture_by_the_grid() {
+        let mut terminal = TerminalSurface::new(&AppConfig::default())
+            .expect("default terminal surface should initialize");
+        terminal.resize(37, 11);
+        let pixels = terminal.pixmap_dimensions();
+
+        assert_eq!(
+            terminal.cell_pixel_dimensions(),
+            (
+                pixels.x.div_ceil(37).clamp(1, u32::from(u16::MAX)) as u16,
+                pixels.y.div_ceil(11).clamp(1, u32::from(u16::MAX)) as u16,
+            )
+        );
     }
 
     /// Regression test for vertical-only zoom steps (#97): with fractional
