@@ -161,11 +161,18 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 /// scene.
 pub fn pump_pty_output(
     mut runtime: ResMut<TerminalRuntime>,
+    terminal: Res<TerminalSurface>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
     mut camera_update_writer: MessageWriter<TerminalCameraUpdate>,
     mut app_exit: MessageWriter<AppExit>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
+    let (cell_width, cell_height) = terminal.cell_pixel_dimensions();
+    runtime
+        .parser
+        .callbacks_mut()
+        .set_cell_pixel_size(cell_width, cell_height);
+
     let screen_rows = |screen: &vt100::Screen| {
         let (_, cols) = screen.size();
         screen.rows(0, cols).collect::<Vec<_>>()

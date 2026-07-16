@@ -33,6 +33,7 @@ pub struct TerminalParserCallbacks {
     pending_replies: Vec<Vec<u8>>,
     kitty_keyboard_flags: u8,
     modify_other_keys: Option<u8>,
+    cell_pixel_size: Option<(u16, u16)>,
 }
 
 impl TerminalParserCallbacks {
@@ -49,6 +50,11 @@ impl TerminalParserCallbacks {
     /// Returns the active xterm `modifyOtherKeys` level.
     pub fn modify_other_keys(&self) -> Option<u8> {
         self.modify_other_keys
+    }
+
+    /// Updates the physical pixel dimensions reported for one terminal cell.
+    pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
+        self.cell_pixel_size = Some((width.max(1), height.max(1)));
     }
 }
 
@@ -78,6 +84,15 @@ impl Callbacks for TerminalParserCallbacks {
             let (row, col) = screen.cursor_position();
             self.pending_replies
                 .push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
+            return;
+        }
+
+        // CSI 16 t = report terminal cell size in pixels.
+        if i1.is_none() && i2.is_none() && c == 't' && params.len() == 1 && params[0] == [16] {
+            if let Some((width, height)) = self.cell_pixel_size {
+                self.pending_replies
+                    .push(format!("\x1b[6;{height};{width}t").into_bytes());
+            }
             return;
         }
 
@@ -168,6 +183,12 @@ impl Callbacks for TerminalParserCallbacks {
             bevy::log::warn!("unhandled terminal escape sequence: {sequence}");
         }
     }
+}
+
+fn apply_terminal_identity(command: &mut CommandBuilder) {
+    command.env("RATTY_SESSION", "1");
+    command.env("TERM_PROGRAM", "ratty");
+    command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 }
 
 /// Running PTY and parser state.
@@ -312,6 +333,7 @@ impl TerminalRuntime {
         for (key, value) in &config.env {
             cmd.env(key, value);
         }
+        apply_terminal_identity(&mut cmd);
 
         let child = pair
             .slave
@@ -451,5 +473,39 @@ impl TerminalRuntime {
 impl Drop for TerminalRuntime {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    #[test]
+    fn cell_size_query_reports_current_pixel_dimensions() {
+        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
+        parser.callbacks_mut().set_cell_pixel_size(10, 20);
+
+        parser.process(b"\x1b[16t");
+
+        assert_eq!(
+            parser.callbacks_mut().take_replies(),
+            [b"\x1b[6;20;10t".to_vec()]
+        );
+    }
+
+    #[test]
+    fn ratty_child_environment_identifies_the_terminal() {
+        let mut command = CommandBuilder::new("rchat-tui");
+
+        apply_terminal_identity(&mut command);
+
+        assert_eq!(command.get_env("RATTY_SESSION"), Some(OsStr::new("1")));
+        assert_eq!(command.get_env("TERM_PROGRAM"), Some(OsStr::new("ratty")));
+        assert_eq!(
+            command.get_env("TERM_PROGRAM_VERSION"),
+            Some(OsStr::new(env!("CARGO_PKG_VERSION")))
+        );
     }
 }

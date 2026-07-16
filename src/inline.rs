@@ -408,6 +408,21 @@ impl TerminalInlineObjects {
 
         match operation {
             KittyOperation::Pending | KittyOperation::Ignored => (true, None),
+            KittyOperation::Query {
+                image_id,
+                result,
+                quiet,
+            } => {
+                let reply = match result {
+                    Ok(()) if quiet == 1 => None,
+                    Err(_) if quiet == 2 => None,
+                    Ok(()) => Some(format!("\x1b_Gi={image_id};OK\x1b\\").into_bytes()),
+                    Err(error) => {
+                        Some(format!("\x1b_Gi={image_id};EINVAL:{error}\x1b\\").into_bytes())
+                    }
+                };
+                (true, reply)
+            }
             KittyOperation::TransmitOnly { object_id, image } => {
                 self.objects
                     .insert(object_id, InlineObject::KittyImage(image.rasterize()));
@@ -896,6 +911,7 @@ mod tests {
     use super::*;
 
     const BITMAP_SUPPORT_REPLY: &[u8] = b"\x1b_ratty;i;s;v=1;fmt=png;frame=rgba8;payload=1;chunk=1;placement=1;crop=1;fit=contain|cover|fill;filter=nearest|linear;opacity=1\x1b\\";
+    const RATATUI_IMAGE_KITTY_QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
     const PNG_2X2: &[u8] = &[
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
         0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72,
@@ -933,6 +949,59 @@ mod tests {
 
         assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
         assert_eq!(parser.screen().contents(), "leftright");
+    }
+
+    #[test]
+    fn kitty_query_reports_support_without_storing_an_image() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = vt100::Parser::new(24, 80, 0);
+
+        let replies = consume(&mut objects, RATATUI_IMAGE_KITTY_QUERY, &mut parser);
+
+        assert_eq!(replies, [b"\x1b_Gi=31;OK\x1b\\".to_vec()]);
+        assert!(objects.objects.is_empty());
+        assert!(objects.anchors.is_empty());
+    }
+
+    #[test]
+    fn invalid_kitty_query_reports_error_without_mutating_state() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = vt100::Parser::new(24, 80, 0);
+
+        let replies = consume(
+            &mut objects,
+            b"\x1b_Gi=9,s=2,v=2,a=q,t=d,f=24;AAAA\x1b\\",
+            &mut parser,
+        );
+
+        assert_eq!(
+            replies,
+            [b"\x1b_Gi=9;EINVAL:invalid pixel data\x1b\\".to_vec()]
+        );
+        assert!(objects.objects.is_empty());
+        assert!(objects.anchors.is_empty());
+    }
+
+    #[test]
+    fn kitty_query_quiet_levels_suppress_the_requested_reply_class() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = vt100::Parser::new(24, 80, 0);
+
+        let ok_replies = consume(
+            &mut objects,
+            b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24,q=1;AAAA\x1b\\",
+            &mut parser,
+        );
+        let error_replies = consume(
+            &mut objects,
+            b"\x1b_Gi=9,s=2,v=2,a=q,t=d,f=24,q=2;AAAA\x1b\\",
+            &mut parser,
+        );
+
+        assert!(ok_replies.is_empty());
+        assert!(error_replies.is_empty());
+        assert!(objects.objects.is_empty());
+        assert!(objects.anchors.is_empty());
     }
 
     #[test]
