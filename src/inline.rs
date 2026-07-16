@@ -5,6 +5,8 @@ use std::path::Path;
 
 use bevy::prelude::*;
 
+use crate::bitmap::{BitmapSurfaceState, MAX_BITMAP_APC_BYTES};
+use crate::bitmap_material::{BitmapSurfaceMaterial, BitmapSurfaceUniform};
 use crate::camera::{OptionalVec3, TerminalCameraUpdate};
 use crate::kitty::{KittyOperation, KittyParserState, refresh_kitty_placeholder_anchors};
 use crate::model::{
@@ -65,12 +67,59 @@ pub struct TerminalRgpObject {
     pub object_id: u32,
 }
 
+/// Marker identifying one rendered bitmap-surface placement.
+#[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalBitmapPlacement {
+    /// Globally unique placement identifier.
+    pub placement_id: u32,
+    /// Registered bitmap identifier shared by this placement.
+    pub bitmap_id: u32,
+}
+
+/// Stable Bevy assets owned by one bitmap placement.
+pub(crate) struct BitmapPlacementRenderCache {
+    /// Placement lifetime rendered by this cache entry.
+    pub(crate) generation: u64,
+    /// Registered bitmap used by the placement.
+    pub(crate) bitmap_id: u32,
+    /// Stable render entity.
+    pub(crate) entity: Entity,
+    /// Stable destination quad mesh.
+    pub(crate) mesh: Handle<Mesh>,
+    /// Stable per-placement material.
+    pub(crate) material: Handle<BitmapSurfaceMaterial>,
+    /// Last values synchronized into the stable render objects.
+    pub(crate) state: BitmapPlacementRenderState,
+}
+
+/// Render-facing placement values used to avoid dirtying unchanged Bevy assets.
+#[derive(Clone)]
+pub(crate) struct BitmapPlacementRenderState {
+    pub(crate) image: Handle<Image>,
+    pub(crate) destination: Vec2,
+    pub(crate) transform: Transform,
+    pub(crate) uniform: BitmapSurfaceUniform,
+}
+
+/// Renderer-side identities retained across protocol updates.
+#[derive(Default)]
+pub(crate) struct BitmapRenderCache {
+    /// Stable image handles keyed by bitmap ID.
+    pub(crate) images: HashMap<u32, Handle<Image>>,
+    /// Stable entity and material handles keyed by placement ID.
+    pub(crate) placements: HashMap<u32, BitmapPlacementRenderCache>,
+}
+
 /// Inline object registry and anchor state.
 #[derive(Resource, Default)]
 pub struct TerminalInlineObjects {
     pending_bytes: Vec<u8>,
+    discarding_oversized_bitmap_apc: bool,
+    bitmap_discard_saw_escape: bool,
     pending_rgp_payloads: HashMap<u32, PendingRgpPayload>,
     kitty: KittyParserState,
+    pub(crate) bitmap: BitmapSurfaceState,
+    pub(crate) bitmap_render: BitmapRenderCache,
     dirty: bool,
     last_viewport_size: Vec2,
     last_cols: u16,
@@ -88,7 +137,89 @@ impl TerminalInlineObjects {
         camera_updates: &mut Vec<TerminalCameraUpdate>,
         terminal_output: &mut bool,
     ) -> Vec<Vec<u8>> {
-        self.pending_bytes.extend_from_slice(chunk);
+        self.consume_pty_output_with_limit(
+            chunk,
+            parser,
+            camera_updates,
+            terminal_output,
+            MAX_BITMAP_APC_BYTES,
+        )
+    }
+
+    #[cfg(test)]
+    fn consume_pty_output_with_bitmap_limit<CB: Callbacks>(
+        &mut self,
+        chunk: &[u8],
+        parser: &mut vt100::Parser<CB>,
+        bitmap_apc_limit: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut camera_updates = Vec::new();
+        let mut terminal_output = false;
+        self.consume_pty_output_with_limit(
+            chunk,
+            parser,
+            &mut camera_updates,
+            &mut terminal_output,
+            bitmap_apc_limit,
+        )
+    }
+
+    fn consume_pty_output_with_limit<CB: Callbacks>(
+        &mut self,
+        mut chunk: &[u8],
+        parser: &mut vt100::Parser<CB>,
+        camera_updates: &mut Vec<TerminalCameraUpdate>,
+        terminal_output: &mut bool,
+        bitmap_apc_limit: usize,
+    ) -> Vec<Vec<u8>> {
+        const INGEST_BLOCK_BYTES: usize = 64 * 1024;
+
+        let mut replies = Vec::new();
+        while !chunk.is_empty() {
+            if self.discarding_oversized_bitmap_apc {
+                let Some(consumed) = self.discard_oversized_bitmap_bytes(chunk) else {
+                    return replies;
+                };
+                self.discarding_oversized_bitmap_apc = false;
+                self.bitmap_discard_saw_escape = false;
+                chunk = &chunk[consumed..];
+                continue;
+            }
+
+            let block_limit = if self
+                .pending_bytes
+                .starts_with(crate::bitmap::BITMAP_APC_START)
+            {
+                bitmap_apc_limit.saturating_sub(self.pending_bytes.len())
+            } else {
+                INGEST_BLOCK_BYTES.min(bitmap_apc_limit.max(1))
+            };
+            if block_limit == 0 {
+                self.begin_oversized_bitmap_discard();
+                continue;
+            }
+            let take = chunk.len().min(INGEST_BLOCK_BYTES).min(block_limit);
+            self.pending_bytes.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+            replies.extend(self.process_pending_bytes(parser, camera_updates, terminal_output));
+
+            if self
+                .pending_bytes
+                .starts_with(crate::bitmap::BITMAP_APC_START)
+                && self.pending_bytes.len() >= bitmap_apc_limit
+            {
+                self.begin_oversized_bitmap_discard();
+            }
+        }
+        replies
+    }
+
+    fn process_pending_bytes<CB: Callbacks>(
+        &mut self,
+        parser: &mut vt100::Parser<CB>,
+        camera_updates: &mut Vec<TerminalCameraUpdate>,
+        terminal_output: &mut bool,
+    ) -> Vec<Vec<u8>> {
         let mut replies = Vec::new();
 
         let mut cursor = 0;
@@ -138,9 +269,30 @@ impl TerminalInlineObjects {
         }
     }
 
+    fn begin_oversized_bitmap_discard(&mut self) {
+        warn!("discarding oversized Ratty Bitmap Surface APC sequence");
+        self.bitmap_discard_saw_escape = self.pending_bytes.last() == Some(&ST[0]);
+        self.pending_bytes.clear();
+        self.discarding_oversized_bitmap_apc = true;
+    }
+
+    fn discard_oversized_bitmap_bytes(&mut self, bytes: &[u8]) -> Option<usize> {
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            if self.bitmap_discard_saw_escape && byte == ST[1] {
+                return Some(index + 1);
+            }
+            if byte == C1_ST {
+                return Some(index + 1);
+            }
+            self.bitmap_discard_saw_escape = byte == ST[0];
+        }
+        None
+    }
+
     /// Returns whether inline objects need synchronization.
     pub fn needs_sync(&self, viewport_size: Vec2, cols: u16, rows: u16) -> bool {
         self.dirty
+            || self.bitmap.is_dirty()
             || self.last_viewport_size != viewport_size
             || self.last_cols != cols
             || self.last_rows != rows
@@ -149,14 +301,22 @@ impl TerminalInlineObjects {
     /// Marks synchronization as complete.
     pub fn finish_sync(&mut self, viewport_size: Vec2, cols: u16, rows: u16) {
         self.dirty = false;
+        self.bitmap.take_dirty();
         self.last_viewport_size = viewport_size;
         self.last_cols = cols;
         self.last_rows = rows;
     }
 
+    /// Marks only bitmap protocol changes as synchronized.
+    pub(crate) fn finish_bitmap_sync(&mut self) {
+        self.bitmap.take_dirty();
+    }
+
     /// Applies upward scroll to anchored objects.
     pub fn apply_scroll(&mut self, rows_scrolled: u16) {
-        if rows_scrolled == 0 || self.anchors.is_empty() {
+        if rows_scrolled == 0
+            || (self.anchors.is_empty() && self.bitmap.placements().next().is_none())
+        {
             return;
         }
 
@@ -175,16 +335,18 @@ impl TerminalInlineObjects {
             anchor.row = new_row.max(0) as u16;
             true
         });
+        self.bitmap.apply_scroll(rows_scrolled);
         self.dirty = true;
     }
 
     /// Returns whether any anchors need scroll tracking.
     pub fn has_scroll_tracked_anchors(&self) -> bool {
-        self.anchors.keys().any(|object_id| {
-            self.objects
-                .get(object_id)
-                .is_some_and(InlineObject::scrolls_with_text)
-        })
+        self.bitmap.placements().next().is_some()
+            || self.anchors.keys().any(|object_id| {
+                self.objects
+                    .get(object_id)
+                    .is_some_and(InlineObject::scrolls_with_text)
+            })
     }
 
     /// Refreshes placeholder-derived Kitty anchors.
@@ -219,6 +381,21 @@ impl TerminalInlineObjects {
         cursor_position: (u16, u16),
         camera_updates: &mut Vec<TerminalCameraUpdate>,
     ) -> (bool, Option<Vec<u8>>) {
+        if let Some(result) = self.bitmap.consume_and_apply(sequence) {
+            debug!(bytes = sequence.len(), "received bitmap surface command");
+            return match result {
+                Ok(Some(reply)) => {
+                    info!("bitmap support query answered: v1");
+                    (true, Some(reply))
+                }
+                Ok(None) => (true, None),
+                Err(error) => {
+                    warn!("failed to apply bitmap surface command: {error}");
+                    (true, None)
+                }
+            };
+        }
+
         if let Some(reply) = self.handle_rgp_sequence(sequence, camera_updates) {
             return (true, reply);
         }
@@ -670,5 +847,218 @@ fn apply_vec3_update(target: &mut Vec3, update: [Option<f32>; 3]) {
     }
     if let Some(z) = update[2] {
         target.z = z;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine as _;
+
+    use super::*;
+
+    const BITMAP_SUPPORT_REPLY: &[u8] = b"\x1b_ratty;i;s;v=1;fmt=png;frame=rgba8;payload=1;chunk=1;placement=1;crop=1;fit=contain|cover|fill;filter=nearest|linear;opacity=1\x1b\\";
+    const PNG_2X2: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72,
+        0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00, 0x12, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x0c, 0x81, 0x34, 0x18, 0x00, 0x00, 0x49, 0xc8, 0x09, 0xf7, 0xf9,
+        0xab, 0xb6, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn parser() -> vt100::Parser {
+        vt100::Parser::new(24, 80, 0)
+    }
+
+    fn consume(
+        objects: &mut TerminalInlineObjects,
+        chunk: &[u8],
+        parser: &mut vt100::Parser,
+    ) -> Vec<Vec<u8>> {
+        let mut camera_updates = Vec::new();
+        let mut terminal_output = false;
+        objects.consume_pty_output(chunk, parser, &mut camera_updates, &mut terminal_output)
+    }
+
+    fn register_bitmap(objects: &mut TerminalInlineObjects, parser: &mut vt100::Parser) {
+        let payload = base64::engine::general_purpose::STANDARD.encode(PNG_2X2);
+        let command = format!("\x1b_ratty;i;r;id=7;fmt=png;source=payload;more=0;{payload}\x1b\\");
+        assert!(consume(objects, command.as_bytes(), parser).is_empty());
+    }
+
+    #[test]
+    fn consumes_bitmap_apc_without_leaking_it_into_mixed_terminal_text() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+
+        let replies = consume(&mut objects, b"left\x1b_ratty;i;s\x1b\\right", &mut parser);
+
+        assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
+        assert_eq!(parser.screen().contents(), "leftright");
+    }
+
+    #[test]
+    fn buffers_fragmented_bitmap_apc_until_its_terminator_arrives() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+
+        assert!(consume(&mut objects, b"before\x1b_ratty;i;", &mut parser).is_empty());
+        assert_eq!(parser.screen().contents(), "before");
+        let replies = consume(&mut objects, b"s\x1b\\after", &mut parser);
+
+        assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
+        assert_eq!(parser.screen().contents(), "beforeafter");
+    }
+
+    #[test]
+    fn bounds_and_discards_oversized_fragmented_bitmap_apc_then_recovers_after_split_st() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+        let limit = 32;
+
+        objects.consume_pty_output_with_bitmap_limit(
+            b"before\x1b_ratty;i;r;id=1;",
+            &mut parser,
+            limit,
+        );
+        objects.consume_pty_output_with_bitmap_limit(b"AAAAAAAAAAAAAAAA", &mut parser, limit);
+        assert!(objects.pending_bytes.len() <= limit);
+        assert!(objects.discarding_oversized_bitmap_apc);
+
+        objects.consume_pty_output_with_bitmap_limit(b"discarded\x1b", &mut parser, limit);
+        let replies = objects.consume_pty_output_with_bitmap_limit(
+            b"\\after\x1b_ratty;i;s\x1b\\",
+            &mut parser,
+            limit,
+        );
+
+        assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
+        assert_eq!(parser.screen().contents(), "beforeafter");
+        assert!(!objects.discarding_oversized_bitmap_apc);
+        assert!(objects.pending_bytes.len() <= limit);
+    }
+
+    #[test]
+    fn discards_oversized_bitmap_apc_until_c1_st_then_recovers() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+        let limit = 24;
+
+        objects.consume_pty_output_with_bitmap_limit(
+            b"\x1b_ratty;i;r;id=1;AAAAAAAA",
+            &mut parser,
+            limit,
+        );
+        let replies = objects.consume_pty_output_with_bitmap_limit(
+            b"discarded\x9ctail\x1b_ratty;i;s\x9c",
+            &mut parser,
+            limit,
+        );
+
+        assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
+        assert_eq!(parser.screen().contents(), "tail");
+        assert!(!objects.discarding_oversized_bitmap_apc);
+    }
+
+    #[test]
+    fn bitmap_apc_limit_does_not_apply_to_fragmented_rgp_sequences() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+        let limit = 8;
+
+        objects.consume_pty_output_with_bitmap_limit(b"\x1b_ratty;g;", &mut parser, limit);
+        let replies = objects.consume_pty_output_with_bitmap_limit(b"s\x1b\\", &mut parser, limit);
+
+        assert_eq!(replies, vec![crate::rgp::support_reply()]);
+        assert!(parser.screen().contents().is_empty());
+    }
+
+    #[test]
+    fn accepts_c1_st_for_bitmap_support_query() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+
+        let replies = consume(&mut objects, b"\x1b_ratty;i;s\x9c", &mut parser);
+
+        assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
+        assert!(parser.screen().contents().is_empty());
+    }
+
+    #[test]
+    fn dispatches_adjacent_bitmap_and_rgp_sequences_in_wire_order() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+
+        let replies = consume(
+            &mut objects,
+            b"\x1b_ratty;i;s\x1b\\\x1b_ratty;g;s\x1b\\",
+            &mut parser,
+        );
+
+        assert_eq!(
+            replies,
+            vec![BITMAP_SUPPORT_REPLY.to_vec(), crate::rgp::support_reply()]
+        );
+        assert!(parser.screen().contents().is_empty());
+    }
+
+    #[test]
+    fn dispatches_bitmap_before_adjacent_kitty_and_keeps_bitmap_state_isolated() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+        register_bitmap(&mut objects, &mut parser);
+
+        let replies = consume(
+            &mut objects,
+            b"\x1b_ratty;i;s\x1b\\\x1b_Ga=d;\x1b\\\x1b_ratty;g;d\x1b\\",
+            &mut parser,
+        );
+
+        assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
+        assert!(objects.bitmap.bitmap(7).is_some());
+        assert!(parser.screen().contents().is_empty());
+    }
+
+    #[test]
+    fn malformed_bitmap_sequences_are_consumed_without_terminal_output() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+
+        let replies = consume(
+            &mut objects,
+            b"before\x1b_ratty;i;p;id=broken\x1b\\after",
+            &mut parser,
+        );
+
+        assert!(replies.is_empty());
+        assert_eq!(parser.screen().contents(), "beforeafter");
+    }
+
+    #[test]
+    fn bitmap_placements_participate_in_dirty_and_scroll_tracking() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+        register_bitmap(&mut objects, &mut parser);
+        consume(
+            &mut objects,
+            b"\x1b_ratty;i;p;id=7;pid=9;row=5;col=2;w=8;h=3\x1b\\",
+            &mut parser,
+        );
+
+        assert!(objects.needs_sync(Vec2::ZERO, 0, 0));
+        assert!(objects.has_scroll_tracked_anchors());
+        objects.finish_sync(Vec2::ZERO, 0, 0);
+        assert!(!objects.needs_sync(Vec2::ZERO, 0, 0));
+
+        objects.apply_scroll(2);
+
+        assert_eq!(
+            objects
+                .bitmap
+                .placement(9)
+                .expect("bitmap placement should exist")
+                .row(),
+            3
+        );
+        assert!(objects.needs_sync(Vec2::ZERO, 0, 0));
     }
 }
