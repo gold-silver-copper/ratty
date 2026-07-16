@@ -3,6 +3,9 @@
 Ratty Graphics Protocol (RGP) is a custom terminal protocol for inserting
 3D objects into the terminal as first-class inline objects.
 
+The `ratty;g` namespace is 3D and object-oriented. The separate `ratty;i`
+namespace is 2D and bitmap/texture-oriented.
+
 The goal is to attach a semantic graphics object to terminal cells,
 so it becomes part of the terminal surface rather than an external overlay.
 
