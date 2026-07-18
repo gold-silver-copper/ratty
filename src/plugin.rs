@@ -143,6 +143,7 @@ impl Plugin for TerminalPlugin {
                 Update,
                 sync_rgp_objects
                     .after(sync_inline_objects)
+                    .after(TerminalCameraSystemSet::Synchronize)
                     .run_if(|objects: Query<(), With<TerminalRgpObject>>| !objects.is_empty()),
             )
             .add_systems(Update, apply_instance_brightness.after(sync_rgp_objects))
@@ -158,6 +159,7 @@ impl Plugin for TerminalPlugin {
                 Update,
                 sync_asset_to_terminal_cursor
                     .after(TerminalRedrawSet)
+                    .after(TerminalCameraSystemSet::Synchronize)
                     .run_if(|config: Res<AppConfig>| config.cursor.model.visible),
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
