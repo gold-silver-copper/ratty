@@ -192,6 +192,14 @@ Interactive 3D Rubik's cube demo:
   <video width="80%" src="https://github.com/user-attachments/assets/9c5828d5-890a-45ac-80f6-cbc0b22384e6"/>
 </div>
 
+#### [Mobius Chess](widget/examples/mobius_chess.rs)
+
+A Mobius-strip chess demo:
+
+<div>
+  <video width="80%" src="https://github.com/user-attachments/assets/bae20f18-5087-4bce-aff2-c62d02c3e79f"/>
+</div>
+
 ### Apps
 
 Here are some applications explicitly built around Ratty's Graphics Protocol:

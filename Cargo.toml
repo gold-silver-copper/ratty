@@ -1,6 +1,6 @@
 [package]
 name = "ratty"
-version = "0.4.2"
+version = "0.5.0"
 description = "A GPU-rendered terminal emulator that supports inline 3D graphics"
 authors = ["Orhun Parmaksız <orhunparmaksiz@gmail.com>"]
 license = "MIT"

@@ -97,6 +97,9 @@ impl AppConfig {
     fn resolve_relative_paths(&mut self, path: &Path) {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         self.cursor.model.path = resolve_config_path(config_dir, &self.cursor.model.path);
+        if let Some(texture) = self.cursor.model.texture.as_mut() {
+            *texture = resolve_config_path(config_dir, texture);
+        }
         if let Some(program) = self.shell.program.as_mut() {
             *program = resolve_config_path(config_dir, program);
         }
@@ -133,6 +136,11 @@ pub struct WindowConfig {
     pub scale_factor: Option<f32>,
     /// Window opacity from `0.0` to `1.0`.
     pub opacity: f32,
+    /// How the window schedules redraws while focused.
+    pub update_mode: UpdateModeConfig,
+    /// Minimum time between redraws while focused, in milliseconds.
+    /// Only applies when `update_mode` is `LowPower`.
+    pub frame_interval_ms: u64,
 }
 
 impl Default for WindowConfig {
@@ -142,8 +150,22 @@ impl Default for WindowConfig {
             height: 620,
             scale_factor: None,
             opacity: 1.0,
+            update_mode: UpdateModeConfig::Continuous,
+            frame_interval_ms: 33,
         }
     }
+}
+
+/// How the window schedules redraws while focused.
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+pub enum UpdateModeConfig {
+    /// Redraw continuously, regardless of input.
+    #[serde(rename = "Continuous")]
+    #[default]
+    Continuous,
+    /// Redraw in response to events, rate-limited to `frame_interval_ms`.
+    #[serde(rename = "LowPower")]
+    LowPower,
 }
 
 /// Terminal grid configuration.
@@ -156,6 +178,8 @@ pub struct TerminalConfig {
     pub default_rows: u16,
     /// Scrollback line count.
     pub scrollback: usize,
+    /// Number of lines scrolled per mouse wheel tick in flat 2D mode.
+    pub mouse_scroll_lines: usize,
 }
 
 impl Default for TerminalConfig {
@@ -164,6 +188,7 @@ impl Default for TerminalConfig {
             default_cols: 104,
             default_rows: 32,
             scrollback: 2_000,
+            mouse_scroll_lines: 3,
         }
     }
 }
@@ -434,6 +459,8 @@ pub struct CursorModelConfig {
     pub color: [u8; 3],
     /// Cursor asset path.
     pub path: PathBuf,
+    /// Optional base-color texture image applied to the cursor model.
+    pub texture: Option<PathBuf>,
 }
 
 impl Default for CursorModelConfig {
@@ -446,6 +473,7 @@ impl Default for CursorModelConfig {
             brightness: 1.0,
             color: [255, 255, 255],
             path: PathBuf::from("CairoSpinyMouse.obj"),
+            texture: None,
         }
     }
 }
