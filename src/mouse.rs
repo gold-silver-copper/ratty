@@ -8,12 +8,12 @@ use bevy::prelude::*;
 use bevy::window::{CursorMoved, PrimaryWindow, Window};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+use crate::camera::{
+    MAX_PERSPECTIVE_FOV, MIN_PERSPECTIVE_FOV, TerminalCameraInteraction, TerminalCameraSlots,
+};
 use crate::config::AppConfig;
 use crate::runtime::TerminalRuntime;
-use crate::scene::{
-    MobiusTransition, TerminalPlaneView, TerminalPresentation, TerminalPresentationMode,
-    TerminalViewport,
-};
+use crate::scene::{MobiusTransition, TerminalPresentationMode, TerminalViewport};
 use crate::terminal::TerminalSurface;
 
 /// Distance in pixels the pointer must move with a pending selection to start dragging.
@@ -241,9 +241,9 @@ pub struct MouseSystemParams<'w, 's> {
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
-    presentation: Res<'w, TerminalPresentation>,
+    camera_slots: ResMut<'w, TerminalCameraSlots>,
+    camera_interaction: ResMut<'w, TerminalCameraInteraction>,
     mobius_transition: Res<'w, MobiusTransition>,
-    plane_view: ResMut<'w, TerminalPlaneView>,
     selection: ResMut<'w, TerminalSelection>,
     redraw: ResMut<'w, crate::terminal::TerminalRedrawState>,
     app_config: Res<'w, AppConfig>,
@@ -263,9 +263,9 @@ pub(crate) fn handle_mouse_input(
         runtime,
         terminal,
         viewport,
-        presentation,
+        camera_slots,
+        camera_interaction,
         mobius_transition,
-        plane_view,
         selection,
         redraw,
         app_config,
@@ -276,10 +276,10 @@ pub(crate) fn handle_mouse_input(
     let window_size = window.resolution.size().max(Vec2::ONE);
     let mouse_mode = runtime.parser.screen().mouse_protocol_mode();
     let mouse_encoding = runtime.parser.screen().mouse_protocol_encoding();
-    let mobius_animating =
-        presentation.mode == TerminalPresentationMode::Mobius3d && mobius_transition.active;
-    let forward_mouse = presentation.mode == TerminalPresentationMode::Flat2d
-        && mouse_mode != MouseProtocolMode::None;
+    let mode = camera_slots.active().mode;
+    let mobius_animating = mode == TerminalPresentationMode::Mobius3d && mobius_transition.active;
+    let forward_mouse =
+        mode == TerminalPresentationMode::Flat2d && mouse_mode != MouseProtocolMode::None;
 
     for event in cursor_events.read() {
         if event.window != primary_window {
@@ -291,23 +291,23 @@ pub(crate) fn handle_mouse_input(
             continue;
         }
 
-        if presentation.mode.is_3d() {
-            if plane_view.rotating {
-                if let Some(last) = plane_view.last_rotate_cursor {
+        if mode.is_3d() {
+            if camera_interaction.rotating {
+                if let Some(last) = camera_interaction.last_rotate_cursor {
                     let delta = event.position - last;
-                    plane_view.yaw += delta.x * 0.005;
-                    plane_view.pitch -= delta.y * 0.005;
-                    redraw.request();
+                    let pose = &mut camera_slots.active_mut().pose;
+                    pose.yaw += delta.x * 0.005;
+                    pose.pitch -= delta.y * 0.005;
                 }
-                plane_view.last_rotate_cursor = Some(event.position);
-            } else if plane_view.panning {
-                if let Some(last) = plane_view.last_pan_cursor {
+                camera_interaction.last_rotate_cursor = Some(event.position);
+            } else if camera_interaction.panning {
+                if let Some(last) = camera_interaction.last_pan_cursor {
                     let delta = event.position - last;
-                    plane_view.camera_offset.x -= delta.x * plane_view.zoom;
-                    plane_view.camera_offset.y += delta.y * plane_view.zoom;
-                    redraw.request();
+                    let pose = &mut camera_slots.active_mut().pose;
+                    pose.translation.x -= delta.x * pose.zoom;
+                    pose.translation.y += delta.y * pose.zoom;
                 }
-                plane_view.last_pan_cursor = Some(event.position);
+                camera_interaction.last_pan_cursor = Some(event.position);
             }
         } else if forward_mouse {
             if let Some(cell) = position_to_cell(event.position, window_size, viewport, terminal)
@@ -370,9 +370,9 @@ pub(crate) fn handle_mouse_input(
                         runtime.write_input(&encode_mouse_event(cell, 0, false, mouse_encoding));
                         forwarded_mouse.last_cell = Some(cell);
                     }
-                } else if presentation.mode.is_3d() {
-                    plane_view.rotating = true;
-                    plane_view.last_rotate_cursor = selection.cursor_position();
+                } else if mode.is_3d() {
+                    camera_interaction.rotating = true;
+                    camera_interaction.last_rotate_cursor = selection.cursor_position();
                 } else if let Some(pos) = selection.cursor_position()
                     && let Some(cell) = position_to_cell(pos, window_size, viewport, terminal)
                     && selection.begin_pending(cell, pos)
@@ -393,9 +393,9 @@ pub(crate) fn handle_mouse_input(
                         runtime.write_input(&encode_mouse_event(cell, 0, true, mouse_encoding));
                         forwarded_mouse.last_cell = Some(cell);
                     }
-                } else if presentation.mode.is_3d() {
-                    plane_view.rotating = false;
-                    plane_view.last_rotate_cursor = selection.cursor_position();
+                } else if mode.is_3d() {
+                    camera_interaction.rotating = false;
+                    camera_interaction.last_rotate_cursor = selection.cursor_position();
                 } else {
                     let _ = selection.end();
                 }
@@ -452,13 +452,13 @@ pub(crate) fn handle_mouse_input(
                     forwarded_mouse.last_cell = Some(cell);
                 }
             }
-            (MouseButton::Right, ButtonState::Pressed) if presentation.mode.is_3d() => {
-                plane_view.panning = true;
-                plane_view.last_pan_cursor = selection.cursor_position();
+            (MouseButton::Right, ButtonState::Pressed) if mode.is_3d() => {
+                camera_interaction.panning = true;
+                camera_interaction.last_pan_cursor = selection.cursor_position();
             }
-            (MouseButton::Right, ButtonState::Released) if presentation.mode.is_3d() => {
-                plane_view.panning = false;
-                plane_view.last_pan_cursor = selection.cursor_position();
+            (MouseButton::Right, ButtonState::Released) if mode.is_3d() => {
+                camera_interaction.panning = false;
+                camera_interaction.last_pan_cursor = selection.cursor_position();
             }
             _ => {}
         }
@@ -487,7 +487,7 @@ pub(crate) fn handle_mouse_input(
                     mouse_encoding,
                 ));
             }
-        } else if presentation.mode == TerminalPresentationMode::Flat2d
+        } else if mode == TerminalPresentationMode::Flat2d
             && !runtime.parser.screen().alternate_screen()
         {
             let amount = match event.unit {
@@ -512,9 +512,13 @@ pub(crate) fn handle_mouse_input(
                 selection.clear();
                 redraw.request();
             }
-        } else if presentation.mode.is_3d() && delta != 0.0 {
-            plane_view.zoom = (plane_view.zoom - delta).clamp(0.1, 4.0);
-            redraw.request();
+        } else if mode.is_3d() && delta != 0.0 {
+            let pose = &mut camera_slots.active_mut().pose;
+            pose.zoom = if mode == TerminalPresentationMode::Perspective3d {
+                (pose.zoom - delta).clamp(MIN_PERSPECTIVE_FOV, MAX_PERSPECTIVE_FOV)
+            } else {
+                (pose.zoom - delta).clamp(0.1, 4.0)
+            };
         }
     }
 }

@@ -22,11 +22,12 @@
 use std::collections::HashMap;
 use std::sync::mpsc::TryRecvError;
 
+use crate::camera::{TerminalCameraSlots, TerminalCameraUpdate};
 use crate::config::{AppConfig, CURSOR_DEPTH};
 use crate::direct_render::DirectTerminalSceneExchange;
 use crate::inline::{
-    InlineKittyPlaneLayout, InlineObject, TerminalCameraViewSlots, TerminalInlineObjectPlane,
-    TerminalInlineObjectSprite, TerminalInlineObjects, TerminalRgpObject,
+    InlineKittyPlaneLayout, InlineObject, TerminalInlineObjectPlane, TerminalInlineObjectSprite,
+    TerminalInlineObjects, TerminalRgpObject,
 };
 use crate::model::CursorModel;
 use crate::model::spawn_cursor_model;
@@ -36,9 +37,8 @@ use crate::rendering::{sync_plane_texture, sync_terminal_debug_image};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
     MobiusTransition, ModelLoadState, TerminalPlane, TerminalPlaneBack,
-    TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery, TerminalPlaneMeshes, TerminalPlaneView,
-    TerminalPlaneWarp, TerminalPresentation, TerminalPresentationMode, TerminalViewport,
-    sync_terminal_layout,
+    TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery, TerminalPlaneMeshes, TerminalPlaneWarp,
+    TerminalPresentationMode, TerminalViewport, sync_terminal_layout,
 };
 use crate::terminal::{
     TerminalRedrawState, TerminalSurface, TerminalWidget, render_scale_for_window,
@@ -155,7 +155,7 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 pub fn pump_pty_output(
     mut runtime: ResMut<TerminalRuntime>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
-    mut camera_slots: ResMut<TerminalCameraViewSlots>,
+    mut camera_update_writer: MessageWriter<TerminalCameraUpdate>,
     mut app_exit: MessageWriter<AppExit>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
@@ -165,6 +165,7 @@ pub fn pump_pty_output(
     };
 
     let mut processed_output = false;
+    let mut camera_updates = Vec::new();
     loop {
         match runtime.try_recv() {
             Ok(chunk) => {
@@ -178,8 +179,12 @@ pub fn pump_pty_output(
                 let mut replies = inline_objects.consume_pty_output(
                     &chunk,
                     &mut runtime.parser,
-                    camera_slots.as_mut(),
+                    &mut camera_updates,
+                    &mut processed_output,
                 );
+                for update in camera_updates.drain(..) {
+                    camera_update_writer.write(update);
+                }
                 replies.extend(runtime.parser.callbacks_mut().take_replies());
                 for reply in replies {
                     runtime.write_input(&reply);
@@ -190,7 +195,6 @@ pub fn pump_pty_output(
                     inline_objects.apply_scroll(scrolled);
                 }
                 inline_objects.refresh_placeholder_anchors(runtime.parser.screen());
-                processed_output = true;
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
@@ -296,7 +300,7 @@ pub(crate) fn handle_window_resize(
 /// [`TerminalInlineObjectSprite`] entities are shown in [`TerminalPresentationMode::Flat2d`], while
 /// [`TerminalInlineObjectPlane`] entities are shown in the 3D presentation modes.
 pub fn apply_inline_objects(
-    presentation: Res<TerminalPresentation>,
+    camera_slots: Res<TerminalCameraSlots>,
     mut sprite_query: Query<&mut Visibility, With<TerminalInlineObjectSprite>>,
     mut plane_query: Query<
         &mut Visibility,
@@ -306,15 +310,15 @@ pub fn apply_inline_objects(
         ),
     >,
 ) {
-    let sprite_visibility = if presentation.mode.is_3d() {
-        Visibility::Visible
-    } else {
+    let sprite_visibility = if camera_slots.active().mode.is_3d() {
         Visibility::Hidden
+    } else {
+        Visibility::Visible
     };
-    let plane_visibility = if presentation.mode.is_3d() {
-        Visibility::Hidden
-    } else {
+    let plane_visibility = if camera_slots.active().mode.is_3d() {
         Visibility::Visible
+    } else {
+        Visibility::Hidden
     };
 
     for mut visibility in &mut sprite_query {
@@ -411,7 +415,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
 pub(crate) struct SyncMaterialsParams<'w, 's> {
     runtime: Res<'w, TerminalRuntime>,
     terminal: Res<'w, TerminalSurface>,
-    presentation: Res<'w, TerminalPresentation>,
+    camera_slots: Res<'w, TerminalCameraSlots>,
     images: ResMut<'w, Assets<Image>>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     plane_materials: Query<'w, 's, &'static MeshMaterial3d<StandardMaterial>, With<TerminalPlane>>,
@@ -427,7 +431,7 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
     let SyncMaterialsParams {
         runtime,
         terminal,
-        presentation,
+        camera_slots,
         images,
         materials,
         plane_materials,
@@ -454,7 +458,7 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
         }
     }
 
-    let in_3d = presentation.mode.is_3d();
+    let in_3d = camera_slots.active().mode.is_3d();
     if in_3d {
         sync_terminal_debug_image(terminal, images, runtime.parser.screen());
     }
@@ -530,7 +534,7 @@ pub(crate) struct SyncInlineParams<'w, 's> {
     inline_objects: ResMut<'w, TerminalInlineObjects>,
     terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
-    presentation: Res<'w, TerminalPresentation>,
+    camera_slots: Res<'w, TerminalCameraSlots>,
     plane_warp: Res<'w, TerminalPlaneWarp>,
     time: Res<'w, Time>,
     plane_query: Query<'w, 's, (Entity, &'static Transform), With<TerminalPlane>>,
@@ -558,7 +562,7 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         inline_objects,
         terminal,
         viewport,
-        presentation,
+        camera_slots,
         plane_warp,
         time,
         plane_query,
@@ -615,7 +619,7 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         match object {
             InlineObject::KittyImage(object) => {
                 let mut ctx = KittyRenderContext {
-                    mode: presentation.mode,
+                    mode: camera_slots.active().mode,
                     warp_amount: plane_warp.amount,
                     elapsed_secs,
                     materials,
@@ -708,9 +712,9 @@ fn sync_kitty_inline_image(
         sprite,
         Transform::from_translation(Vec3::new(layout.center_x, layout.center_y, 5.0)),
         if ctx.mode.is_3d() {
-            Visibility::Visible
-        } else {
             Visibility::Hidden
+        } else {
+            Visibility::Visible
         },
     ));
 
@@ -877,14 +881,14 @@ fn write_kitty_plane_positions(
 /// This runs after [`sync_inline_objects`] and updates cached plane mesh positions in place when
 /// warp is active, instead of rebuilding inline entities every frame.
 pub(crate) fn animate_inline_kitty_planes(
-    presentation: Res<TerminalPresentation>,
+    camera_slots: Res<TerminalCameraSlots>,
     warp: Res<TerminalPlaneWarp>,
     time: Res<Time>,
     query: Query<(&InlineKittyPlaneLayout, &Mesh3d), With<TerminalInlineObjectPlane>>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
     if !matches!(
-        presentation.mode,
+        camera_slots.active().mode,
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d
     ) || warp.amount <= 0.0
     {
@@ -1058,7 +1062,7 @@ pub(crate) struct RgpSyncParams<'w, 's> {
     app_config: Res<'w, AppConfig>,
     terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
-    presentation: Res<'w, TerminalPresentation>,
+    camera_slots: Res<'w, TerminalCameraSlots>,
     mobius_transition: Res<'w, MobiusTransition>,
     plane_warp: Res<'w, TerminalPlaneWarp>,
     time: Res<'w, Time>,
@@ -1088,7 +1092,7 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
         app_config,
         terminal,
         viewport,
-        presentation,
+        camera_slots,
         mobius_transition,
         plane_warp,
         time,
@@ -1099,7 +1103,8 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
     let elapsed_secs = time.elapsed_secs();
-    let mobius_progress = active_mobius_progress(presentation.mode, mobius_transition);
+    let mode = camera_slots.active().mode;
+    let mobius_progress = active_mobius_progress(mode, mobius_transition);
 
     for (object, mut transform, mut visibility) in query.iter_mut() {
         let Some(anchor) = inline_objects.anchors.get(&object.object_id) else {
@@ -1140,13 +1145,13 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
         let object_rotation = base_oblique * explicit_rotation * animated_rotation;
         let object_scale = Vec3::splat(scale) * scale3;
 
-        if presentation.mode.is_3d() {
+        if mode.is_3d() {
             let Ok(plane_transform) = plane_query.single() else {
                 *visibility = Visibility::Hidden;
                 continue;
             };
             let local_position = plane_surface_point(
-                presentation.mode,
+                mode,
                 layout.local_x,
                 layout.local_y,
                 plane_warp.amount,
@@ -1181,9 +1186,6 @@ pub(crate) struct BrightnessParams<'w, 's> {
     rgp_roots: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     cursor_roots: Query<'w, 's, Entity, With<CursorModel>>,
     parent_query: Query<'w, 's, &'static ChildOf>,
-    camera_slots: ResMut<'w, TerminalCameraViewSlots>,
-    plane_view: Res<'w, TerminalPlaneView>,
-    presentation: Res<'w, TerminalPresentation>,
     material_query: Query<
         'w,
         's,
@@ -1214,18 +1216,10 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
         rgp_roots,
         cursor_roots,
         parent_query,
-        camera_slots,
-        plane_view,
-        presentation,
         material_query,
         materials,
         commands,
     } = &mut params;
-
-    let slot = camera_slots.current_slot;
-    let plane = plane_view.as_ref();
-    camera_slots.slots[slot].1.mode = presentation.mode;
-    camera_slots.slots[slot].0 = *plane;
 
     if material_query.is_empty() {
         return;
@@ -1403,20 +1397,21 @@ fn extrude_mesh(mesh: Mesh, depth: f32) -> Mesh {
 /// even when the terminal contents are otherwise static.
 pub fn animate_terminal_plane_warp(
     time: Res<Time>,
-    presentation: Res<TerminalPresentation>,
+    camera_slots: Res<TerminalCameraSlots>,
     mobius_transition: Res<MobiusTransition>,
     warp: Res<TerminalPlaneWarp>,
     plane_meshes: Res<TerminalPlaneMeshes>,
     mut meshes: ResMut<Assets<Mesh>>,
 ) {
-    if presentation.mode == TerminalPresentationMode::Flat2d {
+    let mode = camera_slots.active().mode;
+    if mode == TerminalPresentationMode::Flat2d {
         return;
     }
 
-    let needs_update = match presentation.mode {
+    let needs_update = match mode {
         TerminalPresentationMode::Flat2d => false,
         TerminalPresentationMode::Plane3d | TerminalPresentationMode::Perspective3d => {
-            presentation.is_changed() || warp.is_changed() || warp.amount > 0.0
+            camera_slots.is_changed() || warp.is_changed() || warp.amount > 0.0
         }
         // Reapply the strip every frame so mode switches and time-based motion are visible.
         TerminalPresentationMode::Mobius3d => true,
@@ -1426,10 +1421,10 @@ pub fn animate_terminal_plane_warp(
     }
 
     let pulse = warp.amount * (0.96 + 0.04 * (time.elapsed_secs() * 2.2).sin());
-    let mobius_progress = active_mobius_progress(presentation.mode, &mobius_transition);
+    let mobius_progress = active_mobius_progress(mode, &mobius_transition);
     apply_plane_warp(
         meshes.get_mut(&plane_meshes.front),
-        presentation.mode,
+        mode,
         pulse,
         time.elapsed_secs(),
         -1.0,
@@ -1437,7 +1432,7 @@ pub fn animate_terminal_plane_warp(
     );
     apply_plane_warp(
         meshes.get_mut(&plane_meshes.back),
-        presentation.mode,
+        mode,
         pulse,
         time.elapsed_secs(),
         1.0,
@@ -1448,12 +1443,10 @@ pub fn animate_terminal_plane_warp(
 /// Advances the Mobius transition and restores normal 3D interaction when it completes.
 pub fn animate_mobius_transition(
     time: Res<Time>,
-    mut presentation: ResMut<TerminalPresentation>,
+    mut camera_slots: ResMut<TerminalCameraSlots>,
     mut mobius_transition: ResMut<MobiusTransition>,
-    mut plane_view: ResMut<TerminalPlaneView>,
-    mut redraw: ResMut<TerminalRedrawState>,
 ) {
-    if presentation.mode != TerminalPresentationMode::Mobius3d {
+    if camera_slots.active().mode != TerminalPresentationMode::Mobius3d {
         mobius_transition.stop();
         return;
     }
@@ -1463,18 +1456,17 @@ pub fn animate_mobius_transition(
     }
 
     mobius_transition.elapsed_secs += time.delta_secs();
-    redraw.request();
 
     if mobius_transition.finished() {
-        plane_view.zoom = mobius_transition.end_zoom.max(0.1);
+        let pose = &mut camera_slots.active_mut().pose;
+        pose.zoom = mobius_transition.end_zoom.max(0.1);
         if mobius_transition.direction == crate::scene::MobiusTransitionDirection::Exiting {
-            plane_view.yaw = mobius_transition.source_yaw;
-            plane_view.pitch = mobius_transition.source_pitch;
-            plane_view.camera_offset = mobius_transition.source_camera_offset;
-            presentation.mode = mobius_transition.source_mode;
+            pose.yaw = mobius_transition.source_yaw;
+            pose.pitch = mobius_transition.source_pitch;
+            pose.translation = mobius_transition.source_translation;
+            camera_slots.active_mut().mode = mobius_transition.source_mode;
         }
         mobius_transition.stop();
-        redraw.request();
     }
 }
 
@@ -1536,7 +1528,7 @@ pub(crate) struct CursorSyncParams<'w, 's> {
     runtime: Res<'w, TerminalRuntime>,
     terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
-    presentation: Res<'w, TerminalPresentation>,
+    camera_slots: Res<'w, TerminalCameraSlots>,
     mobius_transition: Res<'w, MobiusTransition>,
     plane_warp: Res<'w, TerminalPlaneWarp>,
     time: Res<'w, Time>,
@@ -1558,7 +1550,7 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
         runtime,
         terminal,
         viewport,
-        presentation,
+        camera_slots,
         mobius_transition,
         plane_warp,
         time,
@@ -1573,9 +1565,9 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
         runtime,
         terminal,
         viewport,
-        mode: presentation.mode,
+        mode: camera_slots.active().mode,
         plane_warp_amount: plane_warp.amount,
-        mobius_progress: active_mobius_progress(presentation.mode, mobius_transition),
+        mobius_progress: active_mobius_progress(camera_slots.active().mode, mobius_transition),
         elapsed_secs: time.elapsed_secs(),
         plane_query,
     };
@@ -1617,7 +1609,7 @@ fn cursor_pose(
         0.0
     };
 
-    let (translation, rotation, visibility) = if ctx.mode.is_3d() {
+    let (translation, rotation, visibility) = if !ctx.mode.is_3d() {
         (
             Vec3::new(local_x, local_y + bob, CURSOR_DEPTH),
             Quat::from_rotation_y(spin) * Quat::from_rotation_x(-0.25),
@@ -1714,4 +1706,42 @@ fn mobius_surface_point(
         ring * angle.sin(),
         width * sin_half * 320.0 + depth_offset,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Resource, Default)]
+    struct CameraChangedProbe(bool);
+
+    fn record_camera_change(
+        camera_slots: Res<TerminalCameraSlots>,
+        mut probe: ResMut<CameraChangedProbe>,
+    ) {
+        probe.0 = camera_slots.is_changed();
+    }
+
+    #[test]
+    fn brightness_system_does_not_mutate_camera_state() {
+        let mut app = App::new();
+        app.init_resource::<AppConfig>()
+            .init_resource::<TerminalInlineObjects>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<TerminalCameraSlots>()
+            .init_resource::<CameraChangedProbe>()
+            .add_systems(
+                Update,
+                (
+                    apply_instance_brightness,
+                    record_camera_change.after(apply_instance_brightness),
+                ),
+            );
+
+        app.update();
+        app.world_mut().resource_mut::<CameraChangedProbe>().0 = false;
+        app.update();
+
+        assert!(!app.world().resource::<CameraChangedProbe>().0);
+    }
 }

@@ -2,7 +2,9 @@
 
 use bevy::prelude::*;
 
-use super::{TerminalPlaneView, TerminalPresentationMode};
+use crate::camera::TerminalCameraPose;
+
+use super::TerminalPresentationMode;
 
 /// Animated transition into the Mobius-strip terminal view.
 #[derive(Resource)]
@@ -21,8 +23,8 @@ pub struct MobiusTransition {
     pub source_yaw: f32,
     /// Source camera pitch before entering the Mobius view.
     pub source_pitch: f32,
-    /// Source camera pan offset before entering the Mobius view.
-    pub source_camera_offset: Vec2,
+    /// Source camera translation before entering the Mobius view.
+    pub source_translation: Vec3,
     /// Camera zoom at the start of the active transition.
     pub start_zoom: f32,
     /// Camera zoom at the end of the active transition.
@@ -31,14 +33,14 @@ pub struct MobiusTransition {
     pub start_yaw: f32,
     /// Camera pitch at the start of the active transition.
     pub start_pitch: f32,
-    /// Camera pan offset at the start of the active transition.
-    pub start_camera_offset: Vec2,
+    /// Camera translation at the start of the active transition.
+    pub start_translation: Vec3,
     /// Camera yaw at the end of the active transition.
     pub end_yaw: f32,
     /// Camera pitch at the end of the active transition.
     pub end_pitch: f32,
-    /// Camera pan offset at the end of the active transition.
-    pub end_camera_offset: Vec2,
+    /// Camera translation at the end of the active transition.
+    pub end_translation: Vec3,
 }
 
 /// Direction of the Mobius transition.
@@ -64,39 +66,39 @@ impl MobiusTransition {
     pub fn begin_enter(
         &mut self,
         source_mode: TerminalPresentationMode,
-        plane_view: &TerminalPlaneView,
+        pose: &TerminalCameraPose,
     ) {
         self.active = true;
         self.elapsed_secs = 0.0;
         self.direction = MobiusTransitionDirection::Entering;
         self.source_mode = source_mode;
-        self.source_zoom = plane_view.zoom;
-        self.source_yaw = plane_view.yaw;
-        self.source_pitch = plane_view.pitch;
-        self.source_camera_offset = plane_view.camera_offset;
-        self.start_zoom = plane_view.zoom;
-        self.end_zoom = plane_view.zoom.max(Self::TARGET_ZOOM_MULTIPLIER);
-        self.start_yaw = plane_view.yaw;
-        self.start_pitch = plane_view.pitch;
-        self.start_camera_offset = plane_view.camera_offset;
-        self.end_yaw = plane_view.yaw;
-        self.end_pitch = plane_view.pitch;
-        self.end_camera_offset = plane_view.camera_offset;
+        self.source_zoom = pose.zoom;
+        self.source_yaw = pose.yaw;
+        self.source_pitch = pose.pitch;
+        self.source_translation = pose.translation;
+        self.start_zoom = pose.zoom;
+        self.end_zoom = pose.zoom.max(Self::TARGET_ZOOM_MULTIPLIER);
+        self.start_yaw = pose.yaw;
+        self.start_pitch = pose.pitch;
+        self.start_translation = pose.translation;
+        self.end_yaw = pose.yaw;
+        self.end_pitch = pose.pitch;
+        self.end_translation = pose.translation;
     }
 
     /// Starts the exit transition back to the source mode.
-    pub fn begin_exit(&mut self, plane_view: &TerminalPlaneView, current_zoom: f32) {
+    pub fn begin_exit(&mut self, pose: &TerminalCameraPose, current_zoom: f32) {
         self.active = true;
         self.elapsed_secs = 0.0;
         self.direction = MobiusTransitionDirection::Exiting;
         self.start_zoom = current_zoom;
         self.end_zoom = self.source_zoom.max(0.1);
-        self.start_yaw = plane_view.yaw;
-        self.start_pitch = plane_view.pitch;
-        self.start_camera_offset = plane_view.camera_offset;
+        self.start_yaw = pose.yaw;
+        self.start_pitch = pose.pitch;
+        self.start_translation = pose.translation;
         self.end_yaw = self.source_yaw;
         self.end_pitch = self.source_pitch;
-        self.end_camera_offset = self.source_camera_offset;
+        self.end_translation = self.source_translation;
     }
 
     /// Stops the transition and resets its timer.
@@ -163,15 +165,15 @@ impl MobiusTransition {
         self.start_pitch + (self.end_pitch - self.start_pitch) * t
     }
 
-    /// Returns the current animated camera pan offset.
-    pub fn current_camera_offset(&self) -> Vec2 {
+    /// Returns the current animated camera translation.
+    pub fn current_translation(&self) -> Vec3 {
         let t = match self.direction {
             MobiusTransitionDirection::Entering => 0.0,
             MobiusTransitionDirection::Exiting => {
                 ease_in_out((self.elapsed_secs / Self::VIEW_RESET_SECS).clamp(0.0, 1.0))
             }
         };
-        self.start_camera_offset.lerp(self.end_camera_offset, t)
+        self.start_translation.lerp(self.end_translation, t)
     }
 
     /// Returns whether the full transition has finished.
@@ -194,15 +196,15 @@ impl Default for MobiusTransition {
             source_zoom: 1.0,
             source_yaw: 0.0,
             source_pitch: 0.0,
-            source_camera_offset: Vec2::ZERO,
+            source_translation: Vec3::ZERO,
             start_zoom: 0.0,
             end_zoom: 0.0,
             start_yaw: 0.0,
             start_pitch: 0.0,
-            start_camera_offset: Vec2::ZERO,
+            start_translation: Vec3::ZERO,
             end_yaw: 0.0,
             end_pitch: 0.0,
-            end_camera_offset: Vec2::ZERO,
+            end_translation: Vec3::ZERO,
         }
     }
 }

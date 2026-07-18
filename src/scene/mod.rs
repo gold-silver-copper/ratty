@@ -16,12 +16,17 @@ use bevy::window::PrimaryWindow;
 
 use bevy::camera::visibility::NoFrustumCulling;
 
+use crate::camera::{
+    MIN_ORTHOGRAPHIC_SCALE, TerminalCameraInteraction, TerminalCameraPreset, TerminalCameraSlots,
+};
 use crate::config::AppConfig;
 use crate::direct_render::{new_terminal_image, new_terminal_render_image};
-use crate::inline::TerminalCameraViewSlots;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
 use crate::terminal::{TerminalLayout, TerminalSurface, render_scale_for_window};
+
+const TERMINAL_PERSPECTIVE_NEAR: f32 = 0.1;
+const TERMINAL_PERSPECTIVE_FAR: f32 = 10_000.0;
 
 /// Marker for the 2D terminal sprite.
 #[derive(Component)]
@@ -35,9 +40,13 @@ pub struct TerminalPlane;
 #[derive(Component)]
 pub struct TerminalPlaneBack;
 
-/// Marker for the 3D presentation camera.
+/// Marker for the orthographic 3D presentation camera.
 #[derive(Component)]
-pub struct TerminalPlaneCamera;
+pub struct TerminalOrthographicCamera;
+
+/// Marker for the perspective 3D presentation camera.
+#[derive(Component)]
+pub struct TerminalPerspectiveCamera;
 
 /// Handles for terminal plane meshes.
 #[derive(Resource)]
@@ -72,7 +81,7 @@ pub struct TerminalViewport {
 }
 
 /// Terminal presentation mode.
-#[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TerminalPresentationMode {
     /// Flat 2D presentation.
     #[default]
@@ -97,81 +106,6 @@ impl TerminalPresentationMode {
     }
 }
 
-/// Active terminal presentation.
-#[derive(Resource, Default)]
-pub struct TerminalPresentation {
-    /// Current presentation mode.
-    pub mode: TerminalPresentationMode,
-}
-
-impl TerminalPresentation {
-    /// Toggles between the flat and warped 3D terminal views.
-    pub fn toggle_plane_mode(&mut self) {
-        self.mode = match self.mode {
-            TerminalPresentationMode::Flat2d => TerminalPresentationMode::Plane3d,
-            TerminalPresentationMode::Plane3d
-            | TerminalPresentationMode::Mobius3d
-            | TerminalPresentationMode::Perspective3d => TerminalPresentationMode::Flat2d,
-        };
-    }
-
-    /// Toggles the Perspective projection terminal view.
-    pub fn toggle_perspective_mode(&mut self) {
-        self.mode = match self.mode {
-            TerminalPresentationMode::Perspective3d => TerminalPresentationMode::Flat2d,
-            TerminalPresentationMode::Flat2d
-            | TerminalPresentationMode::Plane3d
-            | TerminalPresentationMode::Mobius3d => TerminalPresentationMode::Perspective3d,
-        };
-    }
-
-    /// Toggles the Mobius-strip terminal view.
-    pub fn toggle_mobius_mode(&mut self) {
-        self.mode = match self.mode {
-            TerminalPresentationMode::Mobius3d => TerminalPresentationMode::Flat2d,
-            TerminalPresentationMode::Flat2d
-            | TerminalPresentationMode::Plane3d
-            | TerminalPresentationMode::Perspective3d => TerminalPresentationMode::Mobius3d,
-        };
-    }
-}
-
-/// Camera state for 3D presentation.
-#[derive(Resource, Copy, Clone)]
-pub struct TerminalPlaneView {
-    /// Camera yaw.
-    pub yaw: f32,
-    /// Camera pitch.
-    pub pitch: f32,
-    /// Camera zoom factor.
-    pub zoom: f32,
-    /// Camera pan offset.
-    pub camera_offset: Vec2,
-    /// Indicates drag rotation.
-    pub rotating: bool,
-    /// Indicates drag panning.
-    pub panning: bool,
-    /// Last rotation cursor position.
-    pub last_rotate_cursor: Option<Vec2>,
-    /// Last pan cursor position.
-    pub last_pan_cursor: Option<Vec2>,
-}
-
-impl Default for TerminalPlaneView {
-    fn default() -> Self {
-        Self {
-            yaw: 0.18,
-            pitch: 0.08,
-            zoom: 1.0,
-            camera_offset: Vec2::ZERO,
-            rotating: false,
-            panning: false,
-            last_rotate_cursor: None,
-            last_pan_cursor: None,
-        }
-    }
-}
-
 /// Model loading state.
 #[derive(Resource)]
 pub struct ModelLoadState {
@@ -190,7 +124,7 @@ type PlaneMaterialQuery<'w, 's> =
 type PlaneTransformQuery<'w, 's> = Query<'w, 's, &'static mut Transform, With<TerminalPlane>>;
 type PlaneBackTransformQuery<'w, 's> =
     Query<'w, 's, &'static mut Transform, With<TerminalPlaneBack>>;
-type PlaneCameraQuery<'w, 's> = Query<
+type OrthographicCameraQuery<'w, 's> = Query<
     'w,
     's,
     (
@@ -198,7 +132,33 @@ type PlaneCameraQuery<'w, 's> = Query<
         &'static mut Transform,
         &'static mut Camera,
     ),
-    With<TerminalPlaneCamera>,
+    (
+        With<TerminalOrthographicCamera>,
+        Without<TerminalPerspectiveCamera>,
+    ),
+>;
+type PerspectiveCameraQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Projection,
+        &'static mut Transform,
+        &'static mut Camera,
+    ),
+    (
+        With<TerminalPerspectiveCamera>,
+        Without<TerminalOrthographicCamera>,
+    ),
+>;
+type FlatCameraQuery<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Camera,
+    (
+        With<Camera2d>,
+        Without<TerminalOrthographicCamera>,
+        Without<TerminalPerspectiveCamera>,
+    ),
 >;
 pub(crate) type TerminalPlaneLayoutQuery<'w, 's> =
     Query<'w, 's, &'static mut Transform, (With<TerminalPlane>, Without<TerminalSprite>)>;
@@ -226,16 +186,11 @@ pub(crate) struct PresentationParams<'w, 's> {
     >,
     plane_materials: PlaneMaterialQuery<'w, 's>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
-    plane_transforms: ParamSet<
-        'w,
-        's,
-        (
-            PlaneTransformQuery<'w, 's>,
-            PlaneBackTransformQuery<'w, 's>,
-            PlaneCameraQuery<'w, 's>,
-        ),
-    >,
-    camera_2d: Query<'w, 's, &'static mut Camera, (With<Camera2d>, Without<TerminalPlaneCamera>)>,
+    plane_transforms:
+        ParamSet<'w, 's, (PlaneTransformQuery<'w, 's>, PlaneBackTransformQuery<'w, 's>)>,
+    camera_2d: FlatCameraQuery<'w, 's>,
+    orthographic_camera: OrthographicCameraQuery<'w, 's>,
+    perspective_camera: PerspectiveCameraQuery<'w, 's>,
 }
 
 #[derive(SystemParam)]
@@ -289,7 +244,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         Msaa::Off,
     ));
     commands.spawn((
-        TerminalPlaneCamera,
+        TerminalPerspectiveCamera,
         Camera3d::default(),
         Camera {
             order: 1,
@@ -297,18 +252,18 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
             ..default()
         },
         Projection::Perspective(PerspectiveProjection {
-            near: -2000.0,
-            far: 2000.0,
+            near: TERMINAL_PERSPECTIVE_NEAR,
+            far: TERMINAL_PERSPECTIVE_FAR,
             ..PerspectiveProjection::default()
         }),
         Transform::from_xyz(0.0, 0.0, 800.0).looking_at(Vec3::ZERO, Vec3::Y),
         Msaa::Off,
     ));
     commands.spawn((
-        TerminalPlaneCamera,
+        TerminalOrthographicCamera,
         Camera3d::default(),
         Camera {
-            order: 2,
+            order: 1,
             clear_color: ClearColorConfig::None,
             ..default()
         },
@@ -391,6 +346,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         })),
         Transform::from_scale(layout.logical_size.extend(1.0)),
         Visibility::Hidden,
+        NoFrustumCulling,
     ));
 
     commands.spawn((
@@ -409,6 +365,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
             scale: layout.logical_size.extend(1.0),
         },
         Visibility::Hidden,
+        NoFrustumCulling,
     ));
 
     commands.spawn((
@@ -437,11 +394,8 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         },
         Transform::from_xyz(-280.0, -120.0, 700.0),
     ));
-    commands.insert_resource(TerminalPresentation {
-        mode: TerminalPresentationMode::Flat2d,
-    });
-    commands.insert_resource(TerminalPlaneView::default());
-    commands.insert_resource(TerminalCameraViewSlots::default());
+    commands.insert_resource(TerminalCameraSlots::default());
+    commands.insert_resource(TerminalCameraInteraction::default());
     commands.insert_resource(MobiusTransition::default());
     commands.insert_resource(ModelLoadState {
         loaded: false,
@@ -484,36 +438,107 @@ fn create_terminal_image(width: u32, height: u32, fill: [u8; 4]) -> Image {
     image
 }
 
-/// Applies the active terminal presentation mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalClearOwner {
+    Flat,
+    Orthographic,
+    Perspective,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalCameraActivation {
+    flat: bool,
+    orthographic: bool,
+    perspective: bool,
+    clear_owner: TerminalClearOwner,
+}
+
+fn camera_activation(mode: TerminalPresentationMode) -> TerminalCameraActivation {
+    match mode {
+        TerminalPresentationMode::Flat2d => TerminalCameraActivation {
+            flat: true,
+            orthographic: true,
+            perspective: false,
+            clear_owner: TerminalClearOwner::Flat,
+        },
+        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
+            TerminalCameraActivation {
+                flat: false,
+                orthographic: true,
+                perspective: false,
+                clear_owner: TerminalClearOwner::Orthographic,
+            }
+        }
+        TerminalPresentationMode::Perspective3d => TerminalCameraActivation {
+            flat: false,
+            orthographic: false,
+            perspective: true,
+            clear_owner: TerminalClearOwner::Perspective,
+        },
+    }
+}
+
+fn set_camera_state(camera: &mut Camera, active: bool, owns_clear: bool) {
+    if camera.is_active != active {
+        camera.is_active = active;
+    }
+    let clear_matches = if owns_clear {
+        matches!(camera.clear_color, ClearColorConfig::Default)
+    } else {
+        matches!(camera.clear_color, ClearColorConfig::None)
+    };
+    if !clear_matches {
+        camera.clear_color = if owns_clear {
+            ClearColorConfig::Default
+        } else {
+            ClearColorConfig::None
+        };
+    }
+}
+
+/// Synchronizes the active camera preset to the presentation entities.
 pub(crate) fn apply_terminal_presentation(
-    presentation: Res<TerminalPresentation>,
-    plane_view: Res<TerminalPlaneView>,
+    camera_slots: Res<TerminalCameraSlots>,
     mobius_transition: Res<MobiusTransition>,
+    mut last_active_preset: Local<Option<(usize, TerminalCameraPreset)>>,
     mut params: PresentationParams,
 ) {
+    let current = (camera_slots.active_slot(), *camera_slots.active());
+    if last_active_preset.as_ref() == Some(&current) && !mobius_transition.is_changed() {
+        return;
+    }
+    *last_active_preset = Some(current);
+
     let PresentationParams {
         visibility_queries,
         plane_materials,
         materials,
         plane_transforms,
         camera_2d,
+        orthographic_camera,
+        perspective_camera,
     } = &mut params;
-    let is_3d = presentation.mode.is_3d();
-    let is_mobius = presentation.mode.is_mobius();
+    let preset = camera_slots.active();
+    let mode = preset.mode;
+    let pose = preset.pose;
+    let activation = camera_activation(mode);
+    let is_3d = mode.is_3d();
+    let is_mobius = mode.is_mobius();
     let yaw = if is_mobius && mobius_transition.active {
         mobius_transition.current_yaw()
     } else {
-        plane_view.yaw
+        pose.yaw
     };
     let pitch = if is_mobius && mobius_transition.active {
         mobius_transition.current_pitch()
     } else {
-        plane_view.pitch
+        pose.pitch
     };
-    let camera_offset = if is_mobius && mobius_transition.active {
-        mobius_transition.current_camera_offset()
+    let roll = pose.roll;
+    let translation = if is_mobius && mobius_transition.active {
+        mobius_transition.current_translation()
     } else {
-        plane_view.camera_offset
+        pose.translation
     };
     let sprite_visibility = if is_3d {
         Visibility::Hidden
@@ -527,21 +552,28 @@ pub(crate) fn apply_terminal_presentation(
     };
 
     for mut visibility in &mut visibility_queries.p0() {
-        *visibility = sprite_visibility;
+        if *visibility != sprite_visibility {
+            *visibility = sprite_visibility;
+        }
     }
 
     for mut visibility in &mut visibility_queries.p1() {
-        *visibility = plane_visibility;
+        if *visibility != plane_visibility {
+            *visibility = plane_visibility;
+        }
     }
 
     for mut visibility in &mut visibility_queries.p2() {
         // A Mobius strip is one continuous ribbon, so the separate back sheet model does not map
         // cleanly. Render the front material double-sided instead.
-        *visibility = if is_3d && !is_mobius {
+        let target = if is_3d && !is_mobius {
             Visibility::Visible
         } else {
             Visibility::Hidden
         };
+        if *visibility != target {
+            *visibility = target;
+        }
     }
 
     if let Ok(front_material) = plane_materials.single() {
@@ -556,81 +588,103 @@ pub(crate) fn apply_terminal_presentation(
         }
     }
 
-    // The 2D camera only contributes in flat mode; the 3D camera stays active
-    // everywhere because the cursor model and RGP objects render through it
-    // even in 2D mode. Whichever camera renders first owns the screen clear.
     for mut camera in camera_2d.iter_mut() {
-        let active = !is_3d;
-        if camera.is_active != active {
-            camera.is_active = active;
-        }
+        set_camera_state(
+            &mut camera,
+            activation.flat,
+            activation.clear_owner == TerminalClearOwner::Flat,
+        );
     }
     for mut transform in &mut plane_transforms.p0() {
-        transform.rotation = if is_3d {
-            Quat::from_euler(EulerRot::XYZ, pitch, yaw, 0.0)
-        } else {
-            Quat::IDENTITY
-        };
+        if transform.rotation != Quat::IDENTITY {
+            transform.rotation = Quat::IDENTITY;
+        }
     }
 
     for mut transform in &mut plane_transforms.p1() {
-        if is_3d {
-            transform.rotation =
-                Quat::from_euler(EulerRot::XYZ, pitch, yaw + std::f32::consts::PI, 0.0);
-            transform.translation = if is_mobius {
-                Vec3::ZERO
-            } else {
-                Vec3::new(0.0, 0.0, -2.0)
-            };
-        } else {
-            transform.rotation = Quat::IDENTITY;
-            transform.translation = Vec3::new(0.0, 0.0, -2.0);
+        let rotation = Quat::from_rotation_y(std::f32::consts::PI);
+        let translation = Vec3::new(0.0, 0.0, -2.0);
+        if transform.rotation != rotation {
+            transform.rotation = rotation;
+        }
+        if transform.translation != translation {
+            transform.translation = translation;
         }
     }
 
-    for (mut projection, mut transform, mut camera) in &mut plane_transforms.p2() {
-        // This system only runs when presentation state changes, so assigning
-        // unconditionally does not churn change detection every frame.
-        camera.clear_color = if is_3d {
-            ClearColorConfig::Default
-        } else {
-            ClearColorConfig::None
-        };
+    let camera_translation = if is_3d { translation } else { Vec3::ZERO };
+    let camera_distance = (800.0 + camera_translation.z).max(0.1);
+    let camera_target = Vec3::new(camera_translation.x, camera_translation.y, 0.0);
+    let camera_rotation = if is_3d {
+        Quat::from_euler(EulerRot::XYZ, -pitch, -yaw, roll)
+    } else {
+        Quat::IDENTITY
+    };
+    let camera_position = camera_target + camera_rotation * Vec3::Z * camera_distance;
+    let camera_transform = Transform {
+        translation: camera_position,
+        rotation: camera_rotation,
+        ..default()
+    };
 
-        let active = &mut camera.is_active;
-        if let Projection::Perspective(persp) = projection.as_mut() {
-            if presentation.mode == TerminalPresentationMode::Perspective3d {
-                *active = true;
-                let zoom = if is_mobius && mobius_transition.active {
-                    mobius_transition.current_zoom()
-                } else {
-                    plane_view.zoom
-                };
-                persp.fov = if is_3d { zoom } else { 1.0 };
-            } else {
-                *active = false;
-            }
-        } else if let Projection::Orthographic(ortho) = projection.as_mut() {
-            if presentation.mode != TerminalPresentationMode::Perspective3d {
-                *active = true;
-                let zoom = if is_mobius && mobius_transition.active {
-                    mobius_transition.current_zoom()
-                } else {
-                    plane_view.zoom
-                };
-                ortho.scale = if is_3d { zoom } else { 1.0 };
-            } else {
-                *active = false;
-            }
+    for (mut projection, mut transform, mut camera) in orthographic_camera.iter_mut() {
+        set_camera_state(
+            &mut camera,
+            activation.orthographic,
+            activation.clear_owner == TerminalClearOwner::Orthographic,
+        );
+        if !activation.orthographic {
+            continue;
         }
-
-        let offset = if is_3d {
-            camera_offset.extend(0.0)
+        let scale = if is_3d {
+            if is_mobius && mobius_transition.active {
+                mobius_transition.current_zoom().max(MIN_ORTHOGRAPHIC_SCALE)
+            } else {
+                pose.orthographic_scale()
+            }
         } else {
-            Vec3::ZERO
+            1.0
         };
-        transform.translation = Vec3::new(0.0, 0.0, 800.0) + offset;
-        transform.look_at(offset, Vec3::Y);
+        let projection_needs_update = matches!(
+            &*projection,
+            Projection::Orthographic(orthographic) if orthographic.scale != scale
+        );
+        if projection_needs_update
+            && let Projection::Orthographic(orthographic) = projection.as_mut()
+        {
+            orthographic.scale = scale;
+        }
+        if *transform != camera_transform {
+            *transform = camera_transform;
+        }
+    }
+
+    for (mut projection, mut transform, mut camera) in perspective_camera.iter_mut() {
+        set_camera_state(
+            &mut camera,
+            activation.perspective,
+            activation.clear_owner == TerminalClearOwner::Perspective,
+        );
+        if !activation.perspective {
+            continue;
+        }
+        let fov = pose.perspective_fov();
+        let projection_needs_update = matches!(
+            &*projection,
+            Projection::Perspective(perspective)
+                if perspective.fov != fov
+                    || perspective.near != TERMINAL_PERSPECTIVE_NEAR
+                    || perspective.far != TERMINAL_PERSPECTIVE_FAR
+        );
+        if projection_needs_update && let Projection::Perspective(perspective) = projection.as_mut()
+        {
+            perspective.fov = fov;
+            perspective.near = TERMINAL_PERSPECTIVE_NEAR;
+            perspective.far = TERMINAL_PERSPECTIVE_FAR;
+        }
+        if *transform != camera_transform {
+            *transform = camera_transform;
+        }
     }
 }
 
@@ -676,4 +730,74 @@ fn terminal_plane_mesh(x_segments: u32, y_segments: u32) -> Mesh {
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_indices(Indices::U32(indices))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn camera_activation_matrix_has_one_clear_owner() {
+        let cases = [
+            (
+                TerminalPresentationMode::Flat2d,
+                TerminalCameraActivation {
+                    flat: true,
+                    orthographic: true,
+                    perspective: false,
+                    clear_owner: TerminalClearOwner::Flat,
+                },
+            ),
+            (
+                TerminalPresentationMode::Plane3d,
+                TerminalCameraActivation {
+                    flat: false,
+                    orthographic: true,
+                    perspective: false,
+                    clear_owner: TerminalClearOwner::Orthographic,
+                },
+            ),
+            (
+                TerminalPresentationMode::Mobius3d,
+                TerminalCameraActivation {
+                    flat: false,
+                    orthographic: true,
+                    perspective: false,
+                    clear_owner: TerminalClearOwner::Orthographic,
+                },
+            ),
+            (
+                TerminalPresentationMode::Perspective3d,
+                TerminalCameraActivation {
+                    flat: false,
+                    orthographic: false,
+                    perspective: true,
+                    clear_owner: TerminalClearOwner::Perspective,
+                },
+            ),
+        ];
+
+        for (mode, expected) in cases {
+            assert_eq!(camera_activation(mode), expected);
+            let active_clear_owner = match expected.clear_owner {
+                TerminalClearOwner::Flat => expected.flat,
+                TerminalClearOwner::Orthographic => expected.orthographic,
+                TerminalClearOwner::Perspective => expected.perspective,
+            };
+            assert!(active_clear_owner);
+        }
+    }
+
+    #[test]
+    fn perspective_depth_range_is_valid() {
+        let projection = PerspectiveProjection {
+            near: TERMINAL_PERSPECTIVE_NEAR,
+            far: TERMINAL_PERSPECTIVE_FAR,
+            ..PerspectiveProjection::default()
+        };
+        assert!(projection.near.is_finite());
+        assert!(projection.near > 0.0);
+        assert!(projection.far.is_finite());
+        assert!(projection.far > projection.near);
+    }
 }
