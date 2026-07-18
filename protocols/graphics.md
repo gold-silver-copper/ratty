@@ -51,7 +51,7 @@ Each object has:
 - `p` [place object](#3-place-object)
 - `u` [update object](#4-update-object)
 - `d` [delete object](#5-delete-object)
-- `c` [camera control](#5-camera-control)
+- `c` [camera control](#6-camera-control)
 
 ### 1. Support Query
 
@@ -223,19 +223,30 @@ ESC _ ratty;g;d ESC \
 
 ### 6. Camera control
 
-Updates the rotation, transform or mode of a camera setting slot (there are 10 camera setting slots 0-9, they're the `id` field).
+Partially updates one of ten persistent camera presets. `id` is required and
+must be a decimal slot number from `0` through `9`.
 
 ```text
 ESC _ ratty;g;c;id=0;set=0;type=Ortho;px=0.25;scale=1.0 ESC \
 ```
 
-- `set`: if 1, changes the current camera settings to those of the slot referred to by `id`. Defaults to 0.
+- `set`: `0` or `1`; when `1`, activates the slot after applying this update.
+  Defaults to `0`.
 
-Optional fields (these camera settings will not be updated if the fields are not specified):
+Optional fields retain their previous values when omitted:
+
 - `type`: one of `Flat`, `Ortho`, `Persp`, `Mobius`.
-- `scale`: zoom/fov depending on the camera type, does nothing for `Flat` mode
-- `px`, `py`, `pz`: camera offset from terminal plane origin
-- `rx`, `ry`, `rz`: camera roll, pitch, yaw
+- `scale`: positive orthographic scale in `Ortho` and `Mobius`, or vertical FOV
+  in radians in `Persp`. Perspective FOV must be between `0.05` and `pi - 0.05`.
+  It is ignored in `Flat` mode and ignored when outside the valid range.
+- `px`, `py`, `pz`: horizontal pan, vertical pan, and camera dolly relative to
+  the default camera position.
+- `rx`, `ry`, `rz`: pitch (X), yaw (Y), and roll (Z), in degrees.
+
+Malformed or non-finite numeric values, invalid `id`, invalid `set`, and unknown
+`type` values cause the camera command to be ignored. A valid partial command
+still applies its other fields when `scale` is numeric but outside the valid
+range.
 
 ## Example Session
 

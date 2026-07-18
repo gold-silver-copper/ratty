@@ -127,6 +127,7 @@ Other useful cursor fields are:
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Enter</kbd> | Toggle 2D / ortho 3D |
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>P</kbd>     | Toggle perspective   |
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>M</kbd>     | Toggle Mobius mode   |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>0-9</kbd> | Activate camera slot |
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Up</kbd>    | Increase warp        |
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Down</kbd>  | Decrease warp        |
 | <kbd>Alt</kbd>+<kbd>PageUp</kbd>                | Scroll one page up   |
@@ -140,6 +141,10 @@ Other useful cursor fields are:
 In custom configs, `ToggleOrtho3DMode` is the current action name for the
 orthographic 3D toggle. The old `Toggle3DMode` action remains supported as a
 backward-compatible alias.
+
+Camera slot actions are named `ActivateCameraSlot0` through
+`ActivateCameraSlot9`. The extra <kbd>Shift</kbd> modifier keeps slot 0 distinct
+from the existing <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>0</kbd> font reset.
 
 ## Inline 3D objects
 
