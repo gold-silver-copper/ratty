@@ -333,7 +333,22 @@ pub fn apply_terminal_camera_updates(
                         mode: TerminalPresentationMode::Plane3d,
                         pose: next.pose,
                     });
-                    mobius_transition.prepare_source(update.slot, source.mode, &source.pose);
+                    if mode_changed && update.slot == slots.active_slot() {
+                        // A protocol switch into Mobius on the displayed slot
+                        // animates like the keyboard toggle, but honors the
+                        // requested scale exactly instead of the keyboard
+                        // zoom floor; pose-only updates while already in
+                        // Mobius stay immediate.
+                        mobius_transition.begin_enter(
+                            update.slot,
+                            source.mode,
+                            &source.pose,
+                            &next.pose,
+                            MIN_ORTHOGRAPHIC_SCALE,
+                        );
+                    } else {
+                        mobius_transition.prepare_source(update.slot, source.mode, &source.pose);
+                    }
                 }
             }
             if mode_changed && update.slot == slots.active_slot() {
@@ -354,10 +369,8 @@ pub fn activate_terminal_camera_presets(
     mut mobius_transition: ResMut<MobiusTransition>,
 ) {
     for activation in activations.read().copied() {
-        let should_activate =
-            activation.slot < TERMINAL_CAMERA_SLOT_COUNT && slots.active_slot() != activation.slot;
-        if should_activate {
-            slots.activate(activation.slot);
+        let was_mobius = slots.active().mode == TerminalPresentationMode::Mobius3d;
+        if slots.activate(activation.slot) {
             interaction.reset();
             mobius_transition.stop();
             if slots.active().mode == TerminalPresentationMode::Mobius3d {
@@ -371,7 +384,22 @@ pub fn activate_terminal_camera_presets(
                 if slots.active().mobius_source.is_none() {
                     slots.active_mut().mobius_source = Some(source);
                 }
-                mobius_transition.prepare_source(activation.slot, source.mode, &source.pose);
+                if was_mobius {
+                    // The strip was already displayed by the previous slot;
+                    // keep it settled and just re-point the exit source.
+                    mobius_transition.prepare_source(activation.slot, source.mode, &source.pose);
+                } else {
+                    // Activating a Mobius slot animates the strip in like the
+                    // keyboard toggle, but at the slot's exact stored scale so
+                    // activation never rewrites the preset at finish.
+                    mobius_transition.begin_enter(
+                        activation.slot,
+                        source.mode,
+                        &source.pose,
+                        &slots.active().pose,
+                        MIN_ORTHOGRAPHIC_SCALE,
+                    );
+                }
             }
         }
     }
@@ -565,6 +593,54 @@ mod tests {
     }
 
     #[test]
+    fn activating_a_mobius_slot_starts_the_enter_transition() {
+        use crate::scene::MobiusTransitionDirection;
+
+        let mut app = App::new();
+        app.init_resource::<TerminalCameraSlots>()
+            .init_resource::<TerminalCameraInteraction>()
+            .init_resource::<MobiusTransition>()
+            .add_message::<TerminalCameraUpdate>()
+            .add_message::<ActivateTerminalCameraPreset>()
+            .add_systems(
+                Update,
+                (
+                    apply_terminal_camera_updates,
+                    activate_terminal_camera_presets,
+                )
+                    .chain(),
+            );
+        let mut command = update(3);
+        command.activate = true;
+        command.mode = Some(TerminalPresentationMode::Mobius3d);
+        app.world_mut().write_message(command);
+
+        app.update();
+
+        let transition = app.world().resource::<MobiusTransition>();
+        assert!(transition.active);
+        assert!(matches!(
+            transition.direction,
+            MobiusTransitionDirection::Entering
+        ));
+        assert_eq!(transition.morph_progress(), 0.0);
+        assert!(transition.source_is_for(3));
+
+        // Switching between two Mobius slots keeps the settled strip instead
+        // of collapsing it flat and re-morphing.
+        app.world_mut().resource_mut::<MobiusTransition>().stop();
+        let mut other = update(5);
+        other.activate = true;
+        other.mode = Some(TerminalPresentationMode::Mobius3d);
+        app.world_mut().write_message(other);
+        app.update();
+
+        let transition = app.world().resource::<MobiusTransition>();
+        assert!(!transition.active);
+        assert!(transition.source_is_for(5));
+    }
+
+    #[test]
     fn protocol_updates_cancel_an_active_mobius_transition() {
         let mut app = App::new();
         app.init_resource::<TerminalCameraSlots>()
@@ -583,7 +659,13 @@ mod tests {
         let source = preset.mobius_source.expect("Mobius source");
         app.world_mut()
             .resource_mut::<MobiusTransition>()
-            .begin_enter(0, source.mode, &source.pose);
+            .begin_enter(
+                0,
+                source.mode,
+                &source.pose,
+                &preset.pose,
+                MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+            );
 
         let mut camera_update = update(0);
         camera_update.scale = Some(2.0);

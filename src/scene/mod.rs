@@ -502,6 +502,16 @@ fn set_camera_state(mut camera: Mut<Camera>, active: bool, owns_clear: bool) {
     }
 }
 
+/// Composes the orbit rotation applied to the 3D terminal cameras.
+///
+/// Yaw must stay outermost and pitch inside it (YXZ order) so this matches the
+/// inverse of the `Rx(pitch) * Ry(yaw)` plane rotation the fixed camera
+/// replaced; with pitch outermost, pitch input degenerates into roll as yaw
+/// approaches 90 degrees. Roll is innermost so it stays on the view axis.
+fn camera_orbit_rotation(yaw: f32, pitch: f32, roll: f32) -> Quat {
+    Quat::from_euler(EulerRot::YXZ, -yaw, -pitch, roll)
+}
+
 /// Synchronizes the active camera preset to the presentation entities.
 pub(crate) fn apply_terminal_presentation(
     camera_slots: Res<TerminalCameraSlots>,
@@ -540,7 +550,11 @@ pub(crate) fn apply_terminal_presentation(
     } else {
         pose.pitch
     };
-    let roll = pose.roll;
+    let roll = if is_mobius && mobius_transition.active {
+        mobius_transition.current_roll()
+    } else {
+        pose.roll
+    };
     let translation = if is_mobius && mobius_transition.active {
         mobius_transition.current_translation()
     } else {
@@ -622,7 +636,7 @@ pub(crate) fn apply_terminal_presentation(
     let camera_distance = (800.0 + camera_translation.z).max(0.1);
     let camera_target = Vec3::new(camera_translation.x, camera_translation.y, 0.0);
     let camera_rotation = if is_3d {
-        Quat::from_euler(EulerRot::XYZ, -pitch, -yaw, roll)
+        camera_orbit_rotation(yaw, pitch, roll)
     } else {
         Quat::IDENTITY
     };
@@ -930,6 +944,31 @@ mod tests {
         };
         assert_eq!(projection.fov, 1.0);
         assert!(projection.fov < std::f32::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    fn orbit_rotation_keeps_pitch_and_yaw_independent() {
+        let pitch = 0.5_f32;
+        for yaw in [
+            0.0_f32,
+            std::f32::consts::FRAC_PI_2,
+            2.0,
+            std::f32::consts::PI,
+        ] {
+            let rotation = camera_orbit_rotation(yaw, pitch, 0.0);
+            let offset = rotation * Vec3::Z;
+            assert!(
+                (offset.y - pitch.sin()).abs() < 1e-6,
+                "pitch must tilt the orbit at yaw {yaw}"
+            );
+            // glam's f32 Euler decomposition carries ~1e-3 rad of error, so
+            // this pins the composition order, not bit-exact equality.
+            let plane_equivalent = Quat::from_euler(EulerRot::XYZ, pitch, yaw, 0.0).inverse();
+            assert!(
+                rotation.angle_between(plane_equivalent) < 5e-3,
+                "orbit must invert the legacy plane rotation at yaw {yaw}"
+            );
+        }
     }
 
     #[test]

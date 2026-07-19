@@ -261,6 +261,9 @@ fn default_bindings() -> Vec<KeyBinding> {
         BindingAction::ActivateCameraSlot8,
         BindingAction::ActivateCameraSlot9,
     ];
+    // No numpad variants: with Num Lock on Windows/X11, Shift+numpad delivers
+    // navigation logical keys, which would misroute these chords to the
+    // warp/scroll bindings instead of slot activation.
     bindings.extend(
         slot_keys
             .into_iter()
@@ -627,15 +630,36 @@ fn toggle_mobius_presentation(
             mode: TerminalPresentationMode::Plane3d,
             pose: preset.pose,
         });
-        mobius_transition.prepare_source(slot, source.mode, &source.pose);
-        let current_zoom = if mobius_transition.active {
-            mobius_transition.current_zoom()
+        if mobius_transition.active
+            && mobius_transition.direction == crate::scene::MobiusTransitionDirection::Exiting
+        {
+            // Toggling during an exit turns the animation back around; the
+            // preset is still Mobius, so restarting the exit here would lock
+            // out re-entry until the exit finished.
+            mobius_transition.begin_enter(
+                slot,
+                source.mode,
+                &source.pose,
+                &preset.pose,
+                MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+            );
         } else {
-            preset.pose.orthographic_scale
-        };
-        mobius_transition.begin_exit(slot, &preset.pose, current_zoom);
+            mobius_transition.prepare_source(slot, source.mode, &source.pose);
+            let current_zoom = if mobius_transition.active {
+                mobius_transition.current_zoom()
+            } else {
+                preset.pose.orthographic_scale
+            };
+            mobius_transition.begin_exit(slot, &preset.pose, current_zoom);
+        }
     } else {
-        mobius_transition.begin_enter(slot, preset.mode, &preset.pose);
+        mobius_transition.begin_enter(
+            slot,
+            preset.mode,
+            &preset.pose,
+            &preset.pose,
+            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+        );
         let preset = camera_slots.active_mut();
         preset.mobius_source = Some(TerminalMobiusSource {
             mode: preset.mode,
@@ -1365,6 +1389,43 @@ mod key_code_tests {
         assert_eq!(transition.end_yaw, expected.pose.yaw);
         assert_eq!(transition.end_pitch, expected.pose.pitch);
         assert!(!interaction.rotating);
+    }
+
+    #[test]
+    fn mobius_toggle_during_exit_turns_back_into_mobius() {
+        use crate::scene::MobiusTransitionDirection;
+
+        let mut slots = TerminalCameraSlots::default();
+        let mut interaction = TerminalCameraInteraction::default();
+        let mut transition = MobiusTransition::default();
+
+        toggle_mobius_presentation(&mut slots, &mut interaction, &mut transition);
+        assert_eq!(slots.active().mode, TerminalPresentationMode::Mobius3d);
+        transition.stop();
+
+        toggle_mobius_presentation(&mut slots, &mut interaction, &mut transition);
+        assert!(matches!(
+            transition.direction,
+            MobiusTransitionDirection::Exiting
+        ));
+        transition.elapsed_secs =
+            MobiusTransition::VIEW_RESET_SECS + MobiusTransition::MORPH_SECS * 0.5;
+        let morph_before = transition.morph_progress();
+
+        toggle_mobius_presentation(&mut slots, &mut interaction, &mut transition);
+
+        assert!(transition.active);
+        assert!(matches!(
+            transition.direction,
+            MobiusTransitionDirection::Entering
+        ));
+        assert!((transition.morph_progress() - morph_before).abs() < 1e-6);
+        assert_eq!(slots.active().mode, TerminalPresentationMode::Mobius3d);
+        assert_eq!(
+            slots.active().mobius_source.expect("Mobius source").mode,
+            TerminalPresentationMode::Flat2d
+        );
+        assert_eq!(transition.source_mode, TerminalPresentationMode::Flat2d);
     }
 }
 

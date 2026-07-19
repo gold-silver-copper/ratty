@@ -5,11 +5,12 @@ use bevy::ecs::system::SystemParam;
 use bevy::input::ButtonState;
 use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
-use bevy::window::{CursorMoved, PrimaryWindow, Window};
+use bevy::window::{CursorMoved, PrimaryWindow, Window, WindowFocused};
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::camera::{
-    MAX_PERSPECTIVE_FOV, MIN_PERSPECTIVE_FOV, TerminalCameraInteraction, TerminalCameraSlots,
+    MAX_PERSPECTIVE_FOV, MIN_ORTHOGRAPHIC_SCALE, MIN_PERSPECTIVE_FOV, TerminalCameraInteraction,
+    TerminalCameraSlots,
 };
 use crate::config::AppConfig;
 use crate::runtime::TerminalRuntime;
@@ -254,6 +255,7 @@ pub(crate) fn handle_mouse_input(
     mut cursor_events: MessageReader<CursorMoved>,
     mut button_events: MessageReader<MouseButtonInput>,
     mut wheel_events: MessageReader<MouseWheel>,
+    mut focus_events: MessageReader<WindowFocused>,
     mut params: MouseSystemParams,
     mut forwarded_mouse: Local<ForwardedMouseState>,
     mut local_scroll: Local<LocalScrollState>,
@@ -273,6 +275,15 @@ pub(crate) fn handle_mouse_input(
     let Ok((primary_window, window)) = primary_window.single() else {
         return;
     };
+
+    // Button releases delivered while the window is unfocused never reach the
+    // drag branches below, so losing focus mid-drag would otherwise leave the
+    // camera panning or rotating on bare cursor movement after refocus.
+    for event in focus_events.read() {
+        if event.window == primary_window && !event.focused {
+            camera_interaction.reset();
+        }
+    }
     let window_size = window.resolution.size().max(Vec2::ONE);
     let mouse_mode = runtime.parser.screen().mouse_protocol_mode();
     let mouse_encoding = runtime.parser.screen().mouse_protocol_encoding();
@@ -523,7 +534,8 @@ pub(crate) fn handle_mouse_input(
                 pose.perspective_fov =
                     (pose.perspective_fov - delta).clamp(MIN_PERSPECTIVE_FOV, MAX_PERSPECTIVE_FOV);
             } else {
-                pose.orthographic_scale = (pose.orthographic_scale - delta).clamp(0.1, 4.0);
+                pose.orthographic_scale =
+                    wheel_zoomed_orthographic_scale(pose.orthographic_scale, delta);
             }
         }
     }
@@ -596,4 +608,37 @@ fn position_to_cell(
         col.min(terminal.cols.saturating_sub(1) as u32),
         row.min(terminal.rows.saturating_sub(1) as u32),
     ))
+}
+
+/// Largest orthographic scale reachable by wheel zoom alone.
+const MAX_WHEEL_ORTHOGRAPHIC_SCALE: f32 = 4.0;
+
+/// Applies one wheel zoom step to an orthographic scale.
+///
+/// The protocol accepts any scale of at least [`MIN_ORTHOGRAPHIC_SCALE`], so a
+/// protocol-set scale above the interactive limit must not be yanked down to
+/// it by the first wheel tick; the wheel can only zoom back toward the range.
+fn wheel_zoomed_orthographic_scale(current: f32, delta: f32) -> f32 {
+    let max_scale = current.max(MAX_WHEEL_ORTHOGRAPHIC_SCALE);
+    (current - delta).clamp(MIN_ORTHOGRAPHIC_SCALE, max_scale)
+}
+
+#[cfg(test)]
+mod wheel_zoom_tests {
+    use super::*;
+
+    #[test]
+    fn wheel_zoom_respects_the_protocol_scale_range() {
+        // A protocol-set scale above the interactive cap is not snapped down.
+        assert_eq!(wheel_zoomed_orthographic_scale(20.0, -0.1), 20.0);
+        // Zooming in from a large scale moves toward the view, not to 4.0.
+        assert_eq!(wheel_zoomed_orthographic_scale(20.0, 0.1), 19.9);
+        // Zooming in near the protocol minimum never zooms out instead.
+        let zoomed = wheel_zoomed_orthographic_scale(0.05, 0.1);
+        assert!(zoomed <= 0.05);
+        assert!(zoomed >= MIN_ORTHOGRAPHIC_SCALE);
+        // The ordinary interactive range still behaves as before.
+        assert_eq!(wheel_zoomed_orthographic_scale(1.0, 0.1), 0.9);
+        assert_eq!(wheel_zoomed_orthographic_scale(3.95, -0.1), 4.0);
+    }
 }

@@ -246,10 +246,10 @@ Optional fields retain their previous values when omitted:
   the default camera position.
 - `rx`, `ry`, `rz`: pitch (X), yaw (Y), and roll (Z), in degrees.
 
-Malformed or non-finite numeric values, invalid `id`, invalid `set`, and unknown
-`type` values cause the camera command to be ignored. A valid partial command
-still applies its other fields when `scale` is numeric but outside the valid
-range.
+Malformed or non-finite numeric values, fields without a value, invalid `id`,
+invalid `set`, and unknown `type` values cause the camera command to be
+ignored. A valid partial command still applies its other fields when `scale` is
+numeric but outside the valid range.
 
 ## Example Session
 

@@ -25,8 +25,12 @@ pub struct MobiusTransition {
     pub source_yaw: f32,
     /// Source camera pitch before entering the Mobius view.
     pub source_pitch: f32,
+    /// Source camera roll before entering the Mobius view.
+    pub source_roll: f32,
     /// Source camera translation before entering the Mobius view.
     pub source_translation: Vec3,
+    /// Strip morph progress at the start of the active transition.
+    pub start_morph: f32,
     /// Camera zoom at the start of the active transition.
     pub start_zoom: f32,
     /// Camera zoom at the end of the active transition.
@@ -35,12 +39,16 @@ pub struct MobiusTransition {
     pub start_yaw: f32,
     /// Camera pitch at the start of the active transition.
     pub start_pitch: f32,
+    /// Camera roll at the start of the active transition.
+    pub start_roll: f32,
     /// Camera translation at the start of the active transition.
     pub start_translation: Vec3,
     /// Camera yaw at the end of the active transition.
     pub end_yaw: f32,
     /// Camera pitch at the end of the active transition.
     pub end_pitch: f32,
+    /// Camera roll at the end of the active transition.
+    pub end_roll: f32,
     /// Camera translation at the end of the active transition.
     pub end_translation: Vec3,
 }
@@ -64,42 +72,101 @@ impl MobiusTransition {
     /// Final zoom multiplier applied when the transition completes.
     pub const TARGET_ZOOM_MULTIPLIER: f32 = 1.0;
 
-    /// Starts the entry transition from a source mode and zoom level.
+    /// Starts the entry transition from a source mode and pose.
+    ///
+    /// `live_pose` is the pose the Mobius view settles into. When a transition
+    /// is already active for `slot` (e.g. re-entering during an exit), the
+    /// animation resumes from the currently displayed values and keeps the
+    /// stored source instead of overwriting it.
+    ///
+    /// `min_end_zoom` floors the final zoom: the keyboard toggle passes
+    /// [`Self::TARGET_ZOOM_MULTIPLIER`] so the strip is always visible, while
+    /// protocol and activation enters pass the protocol minimum so a stored
+    /// preset scale is displayed exactly and never rewritten at finish.
     pub fn begin_enter(
         &mut self,
         slot: usize,
         source_mode: TerminalPresentationMode,
-        pose: &TerminalCameraPose,
+        source_pose: &TerminalCameraPose,
+        live_pose: &TerminalCameraPose,
+        min_end_zoom: f32,
     ) {
-        self.prepare_source(slot, source_mode, pose);
-        self.active = true;
-        self.elapsed_secs = 0.0;
-        self.direction = MobiusTransitionDirection::Entering;
-        self.start_zoom = pose.orthographic_scale;
-        self.end_zoom = pose.orthographic_scale.max(Self::TARGET_ZOOM_MULTIPLIER);
-        self.start_yaw = pose.yaw;
-        self.start_pitch = pose.pitch;
-        self.start_translation = pose.translation;
-        self.end_yaw = pose.yaw;
-        self.end_pitch = pose.pitch;
-        self.end_translation = pose.translation;
-    }
-
-    /// Starts the exit transition back to the source mode.
-    pub fn begin_exit(&mut self, slot: usize, pose: &TerminalCameraPose, current_zoom: f32) {
-        if !self.source_is_for(slot) {
-            self.prepare_source(slot, TerminalPresentationMode::Plane3d, pose);
+        let resume = self.active && self.source_is_for(slot);
+        let (start_morph, start_zoom, start_yaw, start_pitch, start_roll, start_translation) =
+            if resume {
+                (
+                    self.morph_progress(),
+                    self.current_zoom(),
+                    self.current_yaw(),
+                    self.current_pitch(),
+                    self.current_roll(),
+                    self.current_translation(),
+                )
+            } else {
+                (
+                    0.0,
+                    live_pose.orthographic_scale,
+                    live_pose.yaw,
+                    live_pose.pitch,
+                    live_pose.roll,
+                    live_pose.translation,
+                )
+            };
+        if !resume {
+            self.prepare_source(slot, source_mode, source_pose);
         }
         self.active = true;
         self.elapsed_secs = 0.0;
+        self.direction = MobiusTransitionDirection::Entering;
+        self.start_morph = start_morph;
+        self.start_zoom = start_zoom;
+        self.end_zoom = live_pose.orthographic_scale.max(min_end_zoom);
+        self.start_yaw = start_yaw;
+        self.start_pitch = start_pitch;
+        self.start_roll = start_roll;
+        self.start_translation = start_translation;
+        self.end_yaw = live_pose.yaw;
+        self.end_pitch = live_pose.pitch;
+        self.end_roll = live_pose.roll;
+        self.end_translation = live_pose.translation;
+    }
+
+    /// Starts the exit transition back to the source mode.
+    ///
+    /// When a transition is already active (e.g. exiting during an enter), the
+    /// animation resumes from the currently displayed values instead of
+    /// snapping to the fully formed strip.
+    pub fn begin_exit(&mut self, slot: usize, pose: &TerminalCameraPose, current_zoom: f32) {
+        // Resume only from a transition that belongs to this slot; another
+        // slot's in-flight values are never valid start values here.
+        let resume = self.active && self.source_is_for(slot);
+        if !self.source_is_for(slot) {
+            self.prepare_source(slot, TerminalPresentationMode::Plane3d, pose);
+        }
+        let (start_morph, start_yaw, start_pitch, start_roll, start_translation) = if resume {
+            (
+                self.morph_progress(),
+                self.current_yaw(),
+                self.current_pitch(),
+                self.current_roll(),
+                self.current_translation(),
+            )
+        } else {
+            (1.0, pose.yaw, pose.pitch, pose.roll, pose.translation)
+        };
+        self.active = true;
+        self.elapsed_secs = 0.0;
         self.direction = MobiusTransitionDirection::Exiting;
+        self.start_morph = start_morph;
         self.start_zoom = current_zoom;
         self.end_zoom = self.source_zoom.max(MIN_ORTHOGRAPHIC_SCALE);
-        self.start_yaw = pose.yaw;
-        self.start_pitch = pose.pitch;
-        self.start_translation = pose.translation;
+        self.start_yaw = start_yaw;
+        self.start_pitch = start_pitch;
+        self.start_roll = start_roll;
+        self.start_translation = start_translation;
         self.end_yaw = self.source_yaw;
         self.end_pitch = self.source_pitch;
+        self.end_roll = self.source_roll;
         self.end_translation = self.source_translation;
     }
 
@@ -125,6 +192,7 @@ impl MobiusTransition {
         self.source_zoom = pose.orthographic_scale;
         self.source_yaw = pose.yaw;
         self.source_pitch = pose.pitch;
+        self.source_roll = pose.roll;
         self.source_translation = pose.translation;
     }
 
@@ -144,12 +212,19 @@ impl MobiusTransition {
     }
 
     /// Returns the current Mobius morph progress for the active direction.
+    ///
+    /// The morph resumes from `start_morph` so interrupting a transition never
+    /// snaps the strip geometry.
     pub fn morph_progress(&self) -> f32 {
         match self.direction {
-            MobiusTransitionDirection::Entering => self.enter_morph_progress(),
+            MobiusTransitionDirection::Entering => {
+                self.start_morph + (1.0 - self.start_morph) * self.enter_morph_progress()
+            }
             MobiusTransitionDirection::Exiting => {
-                1.0 - ((self.elapsed_secs - Self::VIEW_RESET_SECS) / Self::MORPH_SECS)
-                    .clamp(0.0, 1.0)
+                self.start_morph
+                    * (1.0
+                        - ((self.elapsed_secs - Self::VIEW_RESET_SECS) / Self::MORPH_SECS)
+                            .clamp(0.0, 1.0))
             }
         }
     }
@@ -169,37 +244,37 @@ impl MobiusTransition {
         }
     }
 
+    /// Returns the eased camera interpolation factor for the active direction.
+    ///
+    /// Fresh enters keep `start == end` so the entering lerp is a no-op there;
+    /// it only moves the camera when an interrupted exit resumes entering.
+    fn camera_lerp_t(&self) -> f32 {
+        let phase_secs = match self.direction {
+            MobiusTransitionDirection::Entering => Self::ZOOM_OUT_SECS,
+            MobiusTransitionDirection::Exiting => Self::VIEW_RESET_SECS,
+        };
+        ease_in_out((self.elapsed_secs / phase_secs).clamp(0.0, 1.0))
+    }
+
     /// Returns the current animated camera yaw.
     pub fn current_yaw(&self) -> f32 {
-        let t = match self.direction {
-            MobiusTransitionDirection::Entering => 0.0,
-            MobiusTransitionDirection::Exiting => {
-                ease_in_out((self.elapsed_secs / Self::VIEW_RESET_SECS).clamp(0.0, 1.0))
-            }
-        };
-        self.start_yaw + (self.end_yaw - self.start_yaw) * t
+        self.start_yaw + (self.end_yaw - self.start_yaw) * self.camera_lerp_t()
     }
 
     /// Returns the current animated camera pitch.
     pub fn current_pitch(&self) -> f32 {
-        let t = match self.direction {
-            MobiusTransitionDirection::Entering => 0.0,
-            MobiusTransitionDirection::Exiting => {
-                ease_in_out((self.elapsed_secs / Self::VIEW_RESET_SECS).clamp(0.0, 1.0))
-            }
-        };
-        self.start_pitch + (self.end_pitch - self.start_pitch) * t
+        self.start_pitch + (self.end_pitch - self.start_pitch) * self.camera_lerp_t()
+    }
+
+    /// Returns the current animated camera roll.
+    pub fn current_roll(&self) -> f32 {
+        self.start_roll + (self.end_roll - self.start_roll) * self.camera_lerp_t()
     }
 
     /// Returns the current animated camera translation.
     pub fn current_translation(&self) -> Vec3 {
-        let t = match self.direction {
-            MobiusTransitionDirection::Entering => 0.0,
-            MobiusTransitionDirection::Exiting => {
-                ease_in_out((self.elapsed_secs / Self::VIEW_RESET_SECS).clamp(0.0, 1.0))
-            }
-        };
-        self.start_translation.lerp(self.end_translation, t)
+        self.start_translation
+            .lerp(self.end_translation, self.camera_lerp_t())
     }
 
     /// Returns whether the full transition has finished.
@@ -223,14 +298,18 @@ impl Default for MobiusTransition {
             source_zoom: 1.0,
             source_yaw: 0.0,
             source_pitch: 0.0,
+            source_roll: 0.0,
             source_translation: Vec3::ZERO,
+            start_morph: 0.0,
             start_zoom: 0.0,
             end_zoom: 0.0,
             start_yaw: 0.0,
             start_pitch: 0.0,
+            start_roll: 0.0,
             start_translation: Vec3::ZERO,
             end_yaw: 0.0,
             end_pitch: 0.0,
+            end_roll: 0.0,
             end_translation: Vec3::ZERO,
         }
     }
@@ -251,9 +330,124 @@ mod tests {
             ..TerminalCameraPose::default()
         };
         let mut transition = MobiusTransition::default();
-        transition.begin_enter(0, TerminalPresentationMode::Plane3d, &pose);
+        transition.begin_enter(
+            0,
+            TerminalPresentationMode::Plane3d,
+            &pose,
+            &pose,
+            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+        );
         transition.begin_exit(0, &pose, 1.0);
 
         assert_eq!(transition.end_zoom, MIN_ORTHOGRAPHIC_SCALE);
+    }
+
+    #[test]
+    fn protocol_enters_display_sub_unit_scales_exactly() {
+        let pose = TerminalCameraPose {
+            orthographic_scale: 0.4,
+            ..TerminalCameraPose::default()
+        };
+        let mut transition = MobiusTransition::default();
+        transition.begin_enter(
+            0,
+            TerminalPresentationMode::Plane3d,
+            &pose,
+            &pose,
+            MIN_ORTHOGRAPHIC_SCALE,
+        );
+
+        assert_eq!(transition.end_zoom, 0.4);
+        transition.begin_enter(
+            0,
+            TerminalPresentationMode::Plane3d,
+            &pose,
+            &pose,
+            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+        );
+        assert_eq!(
+            transition.end_zoom,
+            MobiusTransition::TARGET_ZOOM_MULTIPLIER
+        );
+    }
+
+    #[test]
+    fn exiting_mid_enter_keeps_the_morph_and_zoom_continuous() {
+        let pose = TerminalCameraPose::default();
+        let mut transition = MobiusTransition::default();
+        transition.begin_enter(
+            0,
+            TerminalPresentationMode::Plane3d,
+            &pose,
+            &pose,
+            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+        );
+        transition.elapsed_secs =
+            MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS * 0.3;
+        let morph_before = transition.morph_progress();
+        let zoom_before = transition.current_zoom();
+        assert!((morph_before - 0.3).abs() < 1e-6);
+
+        transition.begin_exit(0, &pose, zoom_before);
+
+        assert!((transition.morph_progress() - morph_before).abs() < 1e-6);
+        assert_eq!(transition.current_zoom(), zoom_before);
+        transition.elapsed_secs = MobiusTransition::VIEW_RESET_SECS + MobiusTransition::MORPH_SECS;
+        assert_eq!(transition.morph_progress(), 0.0);
+    }
+
+    #[test]
+    fn entering_mid_exit_resumes_from_the_current_state() {
+        let pose = TerminalCameraPose::default();
+        let mut transition = MobiusTransition::default();
+        transition.begin_enter(
+            0,
+            TerminalPresentationMode::Flat2d,
+            &pose,
+            &pose,
+            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+        );
+        transition.elapsed_secs = MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS;
+        transition.begin_exit(0, &pose, transition.current_zoom());
+        transition.elapsed_secs =
+            MobiusTransition::VIEW_RESET_SECS + MobiusTransition::MORPH_SECS * 0.5;
+        let morph_before = transition.morph_progress();
+        assert!((morph_before - 0.5).abs() < 1e-6);
+
+        transition.begin_enter(
+            0,
+            TerminalPresentationMode::Flat2d,
+            &pose,
+            &pose,
+            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+        );
+
+        assert!(matches!(
+            transition.direction,
+            MobiusTransitionDirection::Entering
+        ));
+        assert!((transition.morph_progress() - morph_before).abs() < 1e-6);
+        assert_eq!(transition.source_mode, TerminalPresentationMode::Flat2d);
+        transition.elapsed_secs = MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS;
+        assert_eq!(transition.morph_progress(), 1.0);
+    }
+
+    #[test]
+    fn exit_interpolates_roll_back_to_the_source() {
+        let source_pose = TerminalCameraPose {
+            roll: 0.1,
+            ..TerminalCameraPose::default()
+        };
+        let mobius_pose = TerminalCameraPose {
+            roll: 0.5,
+            ..TerminalCameraPose::default()
+        };
+        let mut transition = MobiusTransition::default();
+        transition.prepare_source(0, TerminalPresentationMode::Plane3d, &source_pose);
+        transition.begin_exit(0, &mobius_pose, 1.0);
+
+        assert_eq!(transition.current_roll(), 0.5);
+        transition.elapsed_secs = MobiusTransition::VIEW_RESET_SECS;
+        assert!((transition.current_roll() - 0.1).abs() < 1e-6);
     }
 }

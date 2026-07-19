@@ -147,6 +147,9 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
                 payload = Some(part.to_string());
                 break;
             }
+            // A value-less token in a camera command is a truncated or broken
+            // emitter; reject the whole command instead of partially applying.
+            invalid_camera_field |= verb == "c";
             continue;
         };
         match key {
@@ -331,11 +334,11 @@ pub enum RgpOperation {
     },
     /// Camera manipulation.
     Camera {
-        /// Camera slot, 0 to just modify current camera
+        /// Camera preset slot, `0` through `9`.
         camera_slot: u32,
-        /// Defaults to 0, switches to the camera upon setting or not
+        /// Activates the slot after applying the update (`set=1`, default `0`).
         switch_immediately: bool,
-        /// The settings: zoom/FOV, rotation, offset
+        /// The partial settings: mode, scale/FOV, rotation, and offset.
         settings: RgpCameraSettings,
     },
     /// Object placement.
@@ -443,6 +446,8 @@ mod camera_tests {
             "id=0;scale=nope",
             "id=0;px=NaN",
             "id=0;ry=inf",
+            "id=0;px",
+            "id=0;px;py=2",
         ] {
             assert!(matches!(parse(fields), RgpOperation::Ignored), "{fields}");
         }

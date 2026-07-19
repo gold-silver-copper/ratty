@@ -134,7 +134,15 @@ impl Plugin for TerminalPlugin {
                     .chain()
                     .in_set(TerminalRedrawSet),
             )
-            .add_systems(Update, sync_inline_objects.after(TerminalRedrawSet))
+            .add_systems(
+                Update,
+                sync_inline_objects
+                    .after(TerminalRedrawSet)
+                    // Deterministic vs the Transition set: on the frame a
+                    // Mobius exit finishes, spawned inline entities must see
+                    // the restored mode, not race it.
+                    .after(TerminalCameraSystemSet::Transition),
+            )
             .add_systems(
                 Update,
                 animate_inline_kitty_planes

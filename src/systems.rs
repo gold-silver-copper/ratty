@@ -47,6 +47,7 @@ use crate::terminal::{
 };
 use bevy::app::AppExit;
 use bevy::asset::AssetMut;
+use bevy::camera::visibility::NoFrustumCulling;
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::system::SystemParam;
 use bevy::gltf::GltfAssetLabel;
@@ -742,6 +743,9 @@ fn sync_kitty_inline_image(
                 Mesh3d(mesh_handle),
                 MeshMaterial3d(material_handle),
                 Transform::default(),
+                // Warp and Mobius morphing move the vertices far outside the
+                // AABB cached at spawn, like the terminal planes.
+                NoFrustumCulling,
             ))
             .id(),
     );
@@ -1482,14 +1486,13 @@ pub fn animate_terminal_plane_warp(
         return;
     }
 
-    let needs_update = match mode {
-        TerminalPresentationMode::Flat2d => false,
-        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Perspective3d => {
-            camera_slots.is_changed() || warp.is_changed() || warp.amount > 0.0
-        }
-        // Reapply the strip every frame so mode switches and time-based motion are visible.
-        TerminalPresentationMode::Mobius3d => true,
-    };
+    let needs_update = should_animate_terminal_plane_warp(
+        mode,
+        warp.amount,
+        camera_slots.is_changed() || warp.is_changed(),
+        mobius_transition.active,
+        mobius_transition.is_changed(),
+    );
     if !needs_update {
         return;
     }
@@ -1503,14 +1506,42 @@ pub fn animate_terminal_plane_warp(
         1.0,
         mobius_progress,
     );
-    apply_plane_warp(
-        meshes.get_mut(&plane_meshes.back),
-        mode,
-        warp.amount,
-        time.elapsed_secs(),
-        -1.0,
-        mobius_progress,
-    );
+    // The back sheet is hidden in Mobius mode; skipping it avoids uploading a
+    // mesh nothing renders.
+    if !mode.is_mobius() {
+        apply_plane_warp(
+            meshes.get_mut(&plane_meshes.back),
+            mode,
+            warp.amount,
+            time.elapsed_secs(),
+            -1.0,
+            mobius_progress,
+        );
+    }
+}
+
+fn should_animate_terminal_plane_warp(
+    mode: TerminalPresentationMode,
+    warp_amount: f32,
+    state_changed: bool,
+    mobius_transition_active: bool,
+    mobius_transition_changed: bool,
+) -> bool {
+    match mode {
+        TerminalPresentationMode::Flat2d => false,
+        TerminalPresentationMode::Plane3d | TerminalPresentationMode::Perspective3d => {
+            state_changed || warp_amount > 0.0
+        }
+        // A settled strip with no warp is time-invariant; transition frames
+        // (including the finish frame, via change detection) and mode or pose
+        // changes still reapply it.
+        TerminalPresentationMode::Mobius3d => {
+            state_changed
+                || warp_amount > 0.0
+                || mobius_transition_active
+                || mobius_transition_changed
+        }
+    }
 }
 
 /// Advances the Mobius transition and restores normal 3D interaction when it completes.
@@ -1537,6 +1568,7 @@ pub fn animate_mobius_transition(
             fallback_pose.orthographic_scale = mobius_transition.source_zoom;
             fallback_pose.yaw = mobius_transition.source_yaw;
             fallback_pose.pitch = mobius_transition.source_pitch;
+            fallback_pose.roll = mobius_transition.source_roll;
             fallback_pose.translation = mobius_transition.source_translation;
             let source = preset.mobius_source.unwrap_or(TerminalMobiusSource {
                 mode: mobius_transition.source_mode,
@@ -1976,6 +2008,47 @@ mod tests {
     }
 
     #[test]
+    fn settled_mobius_mode_stops_re_uploading_the_terminal_meshes() {
+        // Settled strip, no warp, nothing changed: no idle upload.
+        assert!(!should_animate_terminal_plane_warp(
+            TerminalPresentationMode::Mobius3d,
+            0.0,
+            false,
+            false,
+            false
+        ));
+        // Transition frames, the finish frame, and state changes still update.
+        assert!(should_animate_terminal_plane_warp(
+            TerminalPresentationMode::Mobius3d,
+            0.0,
+            false,
+            true,
+            false
+        ));
+        assert!(should_animate_terminal_plane_warp(
+            TerminalPresentationMode::Mobius3d,
+            0.0,
+            false,
+            false,
+            true
+        ));
+        assert!(should_animate_terminal_plane_warp(
+            TerminalPresentationMode::Mobius3d,
+            0.0,
+            true,
+            false,
+            false
+        ));
+        assert!(should_animate_terminal_plane_warp(
+            TerminalPresentationMode::Mobius3d,
+            0.5,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
     fn completed_mobius_transition_updates_the_final_kitty_frame() {
         let layout = InlineKittyPlaneLayout {
             local_x: 0.0,
@@ -1992,7 +2065,13 @@ mod tests {
         slots.active_mut().mode = TerminalPresentationMode::Mobius3d;
         let pose = slots.active().pose;
         let mut transition = MobiusTransition::default();
-        transition.begin_enter(0, TerminalPresentationMode::Plane3d, &pose);
+        transition.begin_enter(
+            0,
+            TerminalPresentationMode::Plane3d,
+            &pose,
+            &pose,
+            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+        );
         transition.elapsed_secs = MobiusTransition::ZOOM_OUT_SECS;
 
         let mut app = App::new();
