@@ -277,11 +277,11 @@ pub(crate) fn handle_mouse_input(
     };
 
     // Button releases delivered while the window is unfocused never reach the
-    // drag branches below, so losing focus mid-drag would otherwise leave the
-    // camera panning or rotating on bare cursor movement after refocus.
+    // handlers below, so losing focus mid-drag would otherwise leave held
+    // button state re-arming on bare cursor movement after refocus.
     for event in focus_events.read() {
         if event.window == primary_window && !event.focused {
-            camera_interaction.reset();
+            release_pointer_drags(camera_interaction, selection, &mut forwarded_mouse);
         }
     }
     let window_size = window.resolution.size().max(Vec2::ONE);
@@ -529,14 +529,12 @@ pub(crate) fn handle_mouse_input(
                 redraw.request();
             }
         } else if mode.is_3d() && delta != 0.0 {
-            let pose = &mut camera_slots.active_mut().pose;
-            if mode == TerminalPresentationMode::Perspective3d {
-                pose.perspective_fov =
-                    (pose.perspective_fov - delta).clamp(MIN_PERSPECTIVE_FOV, MAX_PERSPECTIVE_FOV);
-            } else {
-                pose.orthographic_scale =
-                    wheel_zoomed_orthographic_scale(pose.orthographic_scale, delta);
-            }
+            apply_wheel_zoom(
+                &mut camera_slots.active_mut().pose,
+                mode,
+                mobius_animating,
+                delta,
+            );
         }
     }
 }
@@ -610,6 +608,25 @@ fn position_to_cell(
     ))
 }
 
+/// Drops every drag-like state that waits on a button release.
+///
+/// Releases delivered while the window is unfocused go to the newly focused
+/// window instead, so held-button state must be cleared on focus loss: camera
+/// drags, an in-progress or pending text selection drag (the completed
+/// selection itself is kept), and forwarded mouse-protocol button state that
+/// would otherwise keep reporting button-held motion to the PTY application.
+fn release_pointer_drags(
+    camera_interaction: &mut TerminalCameraInteraction,
+    selection: &mut TerminalSelection,
+    forwarded_mouse: &mut ForwardedMouseState,
+) {
+    camera_interaction.reset();
+    selection.end();
+    forwarded_mouse.left_pressed = false;
+    forwarded_mouse.middle_pressed = false;
+    forwarded_mouse.right_pressed = false;
+}
+
 /// Largest orthographic scale reachable by wheel zoom alone.
 const MAX_WHEEL_ORTHOGRAPHIC_SCALE: f32 = 4.0;
 
@@ -623,9 +640,93 @@ fn wheel_zoomed_orthographic_scale(current: f32, delta: f32) -> f32 {
     (current - delta).clamp(MIN_ORTHOGRAPHIC_SCALE, max_scale)
 }
 
+/// Routes one wheel step to the projection value the mode displays.
+///
+/// Mobius shares the orthographic branch with Plane3d. Input is dropped while
+/// a Mobius transition animates: the transition owns the strip zoom until it
+/// finishes.
+fn apply_wheel_zoom(
+    pose: &mut crate::camera::TerminalCameraPose,
+    mode: TerminalPresentationMode,
+    mobius_animating: bool,
+    delta: f32,
+) {
+    if !mode.is_3d() || mobius_animating || delta == 0.0 {
+        return;
+    }
+    if mode == TerminalPresentationMode::Perspective3d {
+        pose.perspective_fov =
+            (pose.perspective_fov - delta).clamp(MIN_PERSPECTIVE_FOV, MAX_PERSPECTIVE_FOV);
+    } else {
+        pose.orthographic_scale = wheel_zoomed_orthographic_scale(pose.orthographic_scale, delta);
+    }
+}
+
 #[cfg(test)]
 mod wheel_zoom_tests {
     use super::*;
+    use crate::camera::TerminalCameraPose;
+
+    #[test]
+    fn focus_loss_releases_every_pointer_drag() {
+        let mut interaction = TerminalCameraInteraction {
+            rotating: true,
+            panning: true,
+            last_rotate_cursor: Some(Vec2::ONE),
+            last_pan_cursor: Some(Vec2::ONE),
+        };
+        let mut selection = TerminalSelection::default();
+        selection.begin(UVec2::new(2, 3));
+        let mut forwarded = ForwardedMouseState {
+            left_pressed: true,
+            middle_pressed: true,
+            right_pressed: true,
+            last_cell: Some(UVec2::ZERO),
+        };
+
+        release_pointer_drags(&mut interaction, &mut selection, &mut forwarded);
+
+        assert!(!interaction.rotating);
+        assert!(!interaction.panning);
+        assert_eq!(interaction.last_rotate_cursor, None);
+        assert!(!selection.dragging);
+        // The completed selection itself survives; only the drag is released.
+        assert!(selection.normalized_bounds().is_some());
+        assert!(!forwarded.left_pressed);
+        assert!(!forwarded.middle_pressed);
+        assert!(!forwarded.right_pressed);
+
+        let mut pending = TerminalSelection::default();
+        pending.begin_pending(UVec2::ZERO, Vec2::ZERO);
+        release_pointer_drags(&mut interaction, &mut pending, &mut forwarded);
+        assert_eq!(pending.pending_start, None);
+        assert!(!pending.update_from_cursor(UVec2::new(5, 5), Vec2::new(100.0, 100.0)));
+    }
+
+    #[test]
+    fn mobius_wheel_zoom_shares_the_orthographic_branch() {
+        let mut pose = TerminalCameraPose::default();
+        apply_wheel_zoom(&mut pose, TerminalPresentationMode::Mobius3d, false, 0.1);
+        assert_eq!(pose.orthographic_scale, 0.9);
+        assert_eq!(
+            pose.perspective_fov,
+            TerminalCameraPose::default().perspective_fov
+        );
+
+        let mut plane_pose = TerminalCameraPose::default();
+        apply_wheel_zoom(
+            &mut plane_pose,
+            TerminalPresentationMode::Plane3d,
+            false,
+            0.1,
+        );
+        assert_eq!(plane_pose.orthographic_scale, pose.orthographic_scale);
+
+        // While the Mobius transition animates, the wheel is ignored.
+        let before = pose;
+        apply_wheel_zoom(&mut pose, TerminalPresentationMode::Mobius3d, true, 0.1);
+        assert_eq!(pose, before);
+    }
 
     #[test]
     fn wheel_zoom_respects_the_protocol_scale_range() {

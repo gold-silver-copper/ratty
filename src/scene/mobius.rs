@@ -2,9 +2,31 @@
 
 use bevy::prelude::*;
 
-use crate::camera::{MIN_ORTHOGRAPHIC_SCALE, TerminalCameraPose};
+use crate::camera::{MIN_ORTHOGRAPHIC_SCALE, TerminalCameraPose, TerminalMobiusSource};
 
 use super::TerminalPresentationMode;
+
+/// Zoom floor applied when an enter transition finishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MobiusEnterZoomFloor {
+    /// Zoom out to at least [`MobiusTransition::TARGET_ZOOM_MULTIPLIER`] so
+    /// the keyboard toggle always reveals the whole strip; the finish
+    /// write-back may raise a sub-unit preset scale.
+    KeyboardTarget,
+    /// Honor the stored preset scale exactly, so the finish write-back is a
+    /// value-level no-op and protocol or activation enters never mutate the
+    /// preset.
+    ProtocolExact,
+}
+
+impl MobiusEnterZoomFloor {
+    fn min_end_zoom(self) -> f32 {
+        match self {
+            Self::KeyboardTarget => MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+            Self::ProtocolExact => MIN_ORTHOGRAPHIC_SCALE,
+        }
+    }
+}
 
 /// Animated transition into the Mobius-strip terminal view.
 #[derive(Resource)]
@@ -72,24 +94,18 @@ impl MobiusTransition {
     /// Final zoom multiplier applied when the transition completes.
     pub const TARGET_ZOOM_MULTIPLIER: f32 = 1.0;
 
-    /// Starts the entry transition from a source mode and pose.
+    /// Starts the entry transition toward `live_pose`, restoring to `source`
+    /// on a later exit.
     ///
-    /// `live_pose` is the pose the Mobius view settles into. When a transition
-    /// is already active for `slot` (e.g. re-entering during an exit), the
-    /// animation resumes from the currently displayed values and keeps the
-    /// stored source instead of overwriting it.
-    ///
-    /// `min_end_zoom` floors the final zoom: the keyboard toggle passes
-    /// [`Self::TARGET_ZOOM_MULTIPLIER`] so the strip is always visible, while
-    /// protocol and activation enters pass the protocol minimum so a stored
-    /// preset scale is displayed exactly and never rewritten at finish.
+    /// When a transition is already active for `slot` (e.g. re-entering
+    /// during an exit), the animation resumes from the currently displayed
+    /// values and keeps the stored source instead of overwriting it.
     pub fn begin_enter(
         &mut self,
         slot: usize,
-        source_mode: TerminalPresentationMode,
-        source_pose: &TerminalCameraPose,
+        source: &TerminalMobiusSource,
         live_pose: &TerminalCameraPose,
-        min_end_zoom: f32,
+        zoom_floor: MobiusEnterZoomFloor,
     ) {
         let resume = self.active && self.source_is_for(slot);
         let (start_morph, start_zoom, start_yaw, start_pitch, start_roll, start_translation) =
@@ -113,14 +129,14 @@ impl MobiusTransition {
                 )
             };
         if !resume {
-            self.prepare_source(slot, source_mode, source_pose);
+            self.prepare_source(slot, source.mode, &source.pose);
         }
         self.active = true;
         self.elapsed_secs = 0.0;
         self.direction = MobiusTransitionDirection::Entering;
         self.start_morph = start_morph;
         self.start_zoom = start_zoom;
-        self.end_zoom = live_pose.orthographic_scale.max(min_end_zoom);
+        self.end_zoom = live_pose.orthographic_scale.max(zoom_floor.min_end_zoom());
         self.start_yaw = start_yaw;
         self.start_pitch = start_pitch;
         self.start_roll = start_roll;
@@ -206,9 +222,36 @@ impl MobiusTransition {
         (self.elapsed_secs / Self::ZOOM_OUT_SECS).clamp(0.0, 1.0)
     }
 
+    /// Returns the morph phase duration for the active transition.
+    ///
+    /// A resumed transition covers only the remaining morph distance, so the
+    /// phase shrinks proportionally and morph velocity stays continuous
+    /// across interruptions instead of stretching the remainder over the full
+    /// [`Self::MORPH_SECS`].
+    fn morph_phase_secs(&self) -> f32 {
+        let remaining = match self.direction {
+            MobiusTransitionDirection::Entering => 1.0 - self.start_morph,
+            MobiusTransitionDirection::Exiting => self.start_morph,
+        };
+        Self::MORPH_SECS * remaining
+    }
+
+    /// Returns the raw progress through the (possibly shortened) morph phase.
+    fn morph_phase_progress(&self) -> f32 {
+        let hold_secs = match self.direction {
+            MobiusTransitionDirection::Entering => Self::ZOOM_OUT_SECS,
+            MobiusTransitionDirection::Exiting => Self::VIEW_RESET_SECS,
+        };
+        let phase_secs = self.morph_phase_secs();
+        if phase_secs <= f32::EPSILON {
+            return 1.0;
+        }
+        ((self.elapsed_secs - hold_secs) / phase_secs).clamp(0.0, 1.0)
+    }
+
     /// Returns the current Mobius morph progress from `0.0` to `1.0` while entering.
     pub fn enter_morph_progress(&self) -> f32 {
-        ((self.elapsed_secs - Self::ZOOM_OUT_SECS) / Self::MORPH_SECS).clamp(0.0, 1.0)
+        self.morph_phase_progress()
     }
 
     /// Returns the current Mobius morph progress for the active direction.
@@ -218,13 +261,10 @@ impl MobiusTransition {
     pub fn morph_progress(&self) -> f32 {
         match self.direction {
             MobiusTransitionDirection::Entering => {
-                self.start_morph + (1.0 - self.start_morph) * self.enter_morph_progress()
+                self.start_morph + (1.0 - self.start_morph) * self.morph_phase_progress()
             }
             MobiusTransitionDirection::Exiting => {
-                self.start_morph
-                    * (1.0
-                        - ((self.elapsed_secs - Self::VIEW_RESET_SECS) / Self::MORPH_SECS)
-                            .clamp(0.0, 1.0))
+                self.start_morph * (1.0 - self.morph_phase_progress())
             }
         }
     }
@@ -279,11 +319,11 @@ impl MobiusTransition {
 
     /// Returns whether the full transition has finished.
     pub fn finished(&self) -> bool {
-        self.elapsed_secs
-            >= match self.direction {
-                MobiusTransitionDirection::Entering => Self::ZOOM_OUT_SECS + Self::MORPH_SECS,
-                MobiusTransitionDirection::Exiting => Self::VIEW_RESET_SECS + Self::MORPH_SECS,
-            }
+        let hold_secs = match self.direction {
+            MobiusTransitionDirection::Entering => Self::ZOOM_OUT_SECS,
+            MobiusTransitionDirection::Exiting => Self::VIEW_RESET_SECS,
+        };
+        self.elapsed_secs >= hold_secs + self.morph_phase_secs()
     }
 }
 
@@ -332,10 +372,12 @@ mod tests {
         let mut transition = MobiusTransition::default();
         transition.begin_enter(
             0,
-            TerminalPresentationMode::Plane3d,
+            &TerminalMobiusSource {
+                mode: TerminalPresentationMode::Plane3d,
+                pose,
+            },
             &pose,
-            &pose,
-            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+            MobiusEnterZoomFloor::KeyboardTarget,
         );
         transition.begin_exit(0, &pose, 1.0);
 
@@ -351,19 +393,23 @@ mod tests {
         let mut transition = MobiusTransition::default();
         transition.begin_enter(
             0,
-            TerminalPresentationMode::Plane3d,
+            &TerminalMobiusSource {
+                mode: TerminalPresentationMode::Plane3d,
+                pose,
+            },
             &pose,
-            &pose,
-            MIN_ORTHOGRAPHIC_SCALE,
+            MobiusEnterZoomFloor::ProtocolExact,
         );
 
         assert_eq!(transition.end_zoom, 0.4);
         transition.begin_enter(
             0,
-            TerminalPresentationMode::Plane3d,
+            &TerminalMobiusSource {
+                mode: TerminalPresentationMode::Plane3d,
+                pose,
+            },
             &pose,
-            &pose,
-            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+            MobiusEnterZoomFloor::KeyboardTarget,
         );
         assert_eq!(
             transition.end_zoom,
@@ -377,10 +423,12 @@ mod tests {
         let mut transition = MobiusTransition::default();
         transition.begin_enter(
             0,
-            TerminalPresentationMode::Plane3d,
+            &TerminalMobiusSource {
+                mode: TerminalPresentationMode::Plane3d,
+                pose,
+            },
             &pose,
-            &pose,
-            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+            MobiusEnterZoomFloor::KeyboardTarget,
         );
         transition.elapsed_secs =
             MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS * 0.3;
@@ -402,10 +450,12 @@ mod tests {
         let mut transition = MobiusTransition::default();
         transition.begin_enter(
             0,
-            TerminalPresentationMode::Flat2d,
+            &TerminalMobiusSource {
+                mode: TerminalPresentationMode::Flat2d,
+                pose,
+            },
             &pose,
-            &pose,
-            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+            MobiusEnterZoomFloor::KeyboardTarget,
         );
         transition.elapsed_secs = MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS;
         transition.begin_exit(0, &pose, transition.current_zoom());
@@ -416,10 +466,12 @@ mod tests {
 
         transition.begin_enter(
             0,
-            TerminalPresentationMode::Flat2d,
+            &TerminalMobiusSource {
+                mode: TerminalPresentationMode::Flat2d,
+                pose,
+            },
             &pose,
-            &pose,
-            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+            MobiusEnterZoomFloor::KeyboardTarget,
         );
 
         assert!(matches!(
@@ -430,6 +482,47 @@ mod tests {
         assert_eq!(transition.source_mode, TerminalPresentationMode::Flat2d);
         transition.elapsed_secs = MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS;
         assert_eq!(transition.morph_progress(), 1.0);
+    }
+
+    #[test]
+    fn resumed_transitions_shrink_the_morph_phase_proportionally() {
+        let pose = TerminalCameraPose::default();
+        let mut transition = MobiusTransition::default();
+        transition.begin_enter(
+            0,
+            &TerminalMobiusSource {
+                mode: TerminalPresentationMode::Plane3d,
+                pose,
+            },
+            &pose,
+            MobiusEnterZoomFloor::KeyboardTarget,
+        );
+        transition.elapsed_secs =
+            MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS * 0.7;
+        transition.begin_exit(0, &pose, transition.current_zoom());
+
+        // The remaining 0.7 of morph unwinds in 0.7 * MORPH_SECS: velocity is
+        // continuous, so halfway through the shortened phase the morph has
+        // covered half the remaining distance.
+        transition.elapsed_secs =
+            MobiusTransition::VIEW_RESET_SECS + MobiusTransition::MORPH_SECS * 0.35;
+        assert!((transition.morph_progress() - 0.35).abs() < 1e-6);
+        assert!(!transition.finished());
+        transition.elapsed_secs =
+            MobiusTransition::VIEW_RESET_SECS + MobiusTransition::MORPH_SECS * 0.7;
+        assert_eq!(transition.morph_progress(), 0.0);
+        assert!(transition.finished());
+
+        // A resume with no remaining morph distance completes right after the
+        // camera hold phase instead of dividing by zero.
+        let mut degenerate = MobiusTransition::default();
+        degenerate.begin_exit(0, &pose, 1.0);
+        degenerate.elapsed_secs = MobiusTransition::VIEW_RESET_SECS + MobiusTransition::MORPH_SECS;
+        degenerate.begin_exit(0, &pose, 1.0);
+        assert_eq!(degenerate.morph_progress(), 0.0);
+        assert!(!degenerate.finished());
+        degenerate.elapsed_secs = MobiusTransition::VIEW_RESET_SECS;
+        assert!(degenerate.finished());
     }
 
     #[test]

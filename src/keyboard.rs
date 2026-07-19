@@ -17,8 +17,8 @@ use crate::config::{AppConfig, BindingAction, FontConfig, KeyBindingConfig};
 use crate::mouse::{TerminalSelection, encode_mouse_wheel};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
-    MobiusTransition, TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery, TerminalPlaneWarp,
-    TerminalPresentationMode, TerminalViewport, sync_terminal_layout,
+    MobiusEnterZoomFloor, MobiusTransition, TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery,
+    TerminalPlaneWarp, TerminalPresentationMode, TerminalViewport, sync_terminal_layout,
 };
 use crate::terminal::{TerminalRedrawState, TerminalSurface, render_scale_for_window};
 
@@ -638,10 +638,9 @@ fn toggle_mobius_presentation(
             // out re-entry until the exit finished.
             mobius_transition.begin_enter(
                 slot,
-                source.mode,
-                &source.pose,
+                &source,
                 &preset.pose,
-                MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+                MobiusEnterZoomFloor::KeyboardTarget,
             );
         } else {
             mobius_transition.prepare_source(slot, source.mode, &source.pose);
@@ -653,18 +652,18 @@ fn toggle_mobius_presentation(
             mobius_transition.begin_exit(slot, &preset.pose, current_zoom);
         }
     } else {
-        mobius_transition.begin_enter(
-            slot,
-            preset.mode,
-            &preset.pose,
-            &preset.pose,
-            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
-        );
-        let preset = camera_slots.active_mut();
-        preset.mobius_source = Some(TerminalMobiusSource {
+        let source = TerminalMobiusSource {
             mode: preset.mode,
             pose: preset.pose,
-        });
+        };
+        mobius_transition.begin_enter(
+            slot,
+            &source,
+            &preset.pose,
+            MobiusEnterZoomFloor::KeyboardTarget,
+        );
+        let preset = camera_slots.active_mut();
+        preset.mobius_source = Some(source);
         preset.mode = TerminalPresentationMode::Mobius3d;
     }
     interaction.reset();

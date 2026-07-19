@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 
-use crate::scene::{MobiusTransition, TerminalPresentationMode};
+use crate::scene::{MobiusEnterZoomFloor, MobiusTransition, TerminalPresentationMode};
 
 /// Number of addressable terminal camera presets.
 pub const TERMINAL_CAMERA_SLOT_COUNT: usize = 10;
@@ -338,13 +338,15 @@ pub fn apply_terminal_camera_updates(
                         // animates like the keyboard toggle, but honors the
                         // requested scale exactly instead of the keyboard
                         // zoom floor; pose-only updates while already in
-                        // Mobius stay immediate.
+                        // Mobius stay immediate. The stop() above makes the
+                        // resume branch of begin_enter unreachable here by
+                        // design: that is what keeps the keyboard floor from
+                        // ever leaking into a protocol enter.
                         mobius_transition.begin_enter(
                             update.slot,
-                            source.mode,
-                            &source.pose,
+                            &source,
                             &next.pose,
-                            MIN_ORTHOGRAPHIC_SCALE,
+                            MobiusEnterZoomFloor::ProtocolExact,
                         );
                     } else {
                         mobius_transition.prepare_source(update.slot, source.mode, &source.pose);
@@ -370,36 +372,54 @@ pub fn activate_terminal_camera_presets(
 ) {
     for activation in activations.read().copied() {
         let was_mobius = slots.active().mode == TerminalPresentationMode::Mobius3d;
+        let strip_in_flight = was_mobius && mobius_transition.active;
         if slots.activate(activation.slot) {
             interaction.reset();
-            mobius_transition.stop();
-            if slots.active().mode == TerminalPresentationMode::Mobius3d {
-                let source = slots
-                    .active()
-                    .mobius_source
-                    .unwrap_or(TerminalMobiusSource {
-                        mode: TerminalPresentationMode::Plane3d,
-                        pose: slots.active().pose,
-                    });
-                if slots.active().mobius_source.is_none() {
-                    slots.active_mut().mobius_source = Some(source);
-                }
-                if was_mobius {
-                    // The strip was already displayed by the previous slot;
-                    // keep it settled and just re-point the exit source.
-                    mobius_transition.prepare_source(activation.slot, source.mode, &source.pose);
-                } else {
-                    // Activating a Mobius slot animates the strip in like the
-                    // keyboard toggle, but at the slot's exact stored scale so
-                    // activation never rewrites the preset at finish.
-                    mobius_transition.begin_enter(
-                        activation.slot,
-                        source.mode,
-                        &source.pose,
-                        &slots.active().pose,
-                        MIN_ORTHOGRAPHIC_SCALE,
-                    );
-                }
+            if slots.active().mode != TerminalPresentationMode::Mobius3d {
+                mobius_transition.stop();
+                continue;
+            }
+            let source = slots
+                .active()
+                .mobius_source
+                .unwrap_or(TerminalMobiusSource {
+                    mode: TerminalPresentationMode::Plane3d,
+                    pose: slots.active().pose,
+                });
+            if slots.active().mobius_source.is_none() {
+                slots.active_mut().mobius_source = Some(source);
+            }
+            if was_mobius && !strip_in_flight {
+                // A settled strip was displayed by the previous slot; keep it
+                // settled and just re-point the exit source.
+                mobius_transition.stop();
+                mobius_transition.prepare_source(activation.slot, source.mode, &source.pose);
+            } else if strip_in_flight {
+                // The strip animation is mid-flight; re-own its source for
+                // the new slot WITHOUT stopping so begin_enter resumes from
+                // the currently displayed morph and camera values instead of
+                // snapping the strip.
+                mobius_transition.prepare_source(activation.slot, source.mode, &source.pose);
+                mobius_transition.begin_enter(
+                    activation.slot,
+                    &source,
+                    &slots.active().pose,
+                    MobiusEnterZoomFloor::ProtocolExact,
+                );
+            } else {
+                // Activating a Mobius slot from a non-Mobius view animates
+                // the strip in like the keyboard toggle, but at the slot's
+                // exact stored scale so activation never rewrites the preset
+                // at finish. The stop() makes the resume branch of
+                // begin_enter unreachable, keeping the keyboard zoom floor
+                // out of activation enters.
+                mobius_transition.stop();
+                mobius_transition.begin_enter(
+                    activation.slot,
+                    &source,
+                    &slots.active().pose,
+                    MobiusEnterZoomFloor::ProtocolExact,
+                );
             }
         }
     }
@@ -638,6 +658,31 @@ mod tests {
         let transition = app.world().resource::<MobiusTransition>();
         assert!(!transition.active);
         assert!(transition.source_is_for(5));
+
+        // A mid-flight strip animation is handed to the next Mobius slot
+        // continuously instead of snapping to the settled strip.
+        app.world_mut()
+            .write_message(ActivateTerminalCameraPreset { slot: 1 });
+        app.update();
+        app.world_mut()
+            .write_message(ActivateTerminalCameraPreset { slot: 3 });
+        app.update();
+        {
+            let mut transition = app.world_mut().resource_mut::<MobiusTransition>();
+            assert!(transition.active);
+            transition.elapsed_secs =
+                MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS * 0.4;
+        }
+        let morph_before = app.world().resource::<MobiusTransition>().morph_progress();
+        assert!((morph_before - 0.4).abs() < 1e-6);
+        app.world_mut()
+            .write_message(ActivateTerminalCameraPreset { slot: 5 });
+        app.update();
+
+        let transition = app.world().resource::<MobiusTransition>();
+        assert!(transition.active);
+        assert!(transition.source_is_for(5));
+        assert!((transition.morph_progress() - morph_before).abs() < 1e-6);
     }
 
     #[test]
@@ -661,10 +706,9 @@ mod tests {
             .resource_mut::<MobiusTransition>()
             .begin_enter(
                 0,
-                source.mode,
-                &source.pose,
+                &source,
                 &preset.pose,
-                MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+                MobiusEnterZoomFloor::KeyboardTarget,
             );
 
         let mut camera_update = update(0);

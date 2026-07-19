@@ -1831,6 +1831,7 @@ fn mobius_surface_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::MobiusEnterZoomFloor;
 
     #[derive(Resource, Default)]
     struct CameraChangedProbe(bool);
@@ -2067,10 +2068,12 @@ mod tests {
         let mut transition = MobiusTransition::default();
         transition.begin_enter(
             0,
-            TerminalPresentationMode::Plane3d,
+            &TerminalMobiusSource {
+                mode: TerminalPresentationMode::Plane3d,
+                pose,
+            },
             &pose,
-            &pose,
-            MobiusTransition::TARGET_ZOOM_MULTIPLIER,
+            MobiusEnterZoomFloor::KeyboardTarget,
         );
         transition.elapsed_secs = MobiusTransition::ZOOM_OUT_SECS;
 
@@ -2156,6 +2159,58 @@ mod tests {
         let material = kitty_plane_material(&image);
 
         assert_eq!(material.cull_mode, None);
+    }
+
+    #[test]
+    fn keyboard_mobius_enter_finish_applies_the_target_zoom_floor() {
+        let sub_unit_pose = crate::camera::TerminalCameraPose {
+            orthographic_scale: 0.4,
+            ..crate::camera::TerminalCameraPose::default()
+        };
+        let source = TerminalMobiusSource {
+            mode: TerminalPresentationMode::Plane3d,
+            pose: sub_unit_pose,
+        };
+
+        let mut slots = TerminalCameraSlots::default();
+        slots.active_mut().mode = TerminalPresentationMode::Mobius3d;
+        slots.active_mut().pose = sub_unit_pose;
+        slots.active_mut().mobius_source = Some(source);
+
+        let mut transition = MobiusTransition::default();
+        transition.begin_enter(
+            0,
+            &source,
+            &sub_unit_pose,
+            MobiusEnterZoomFloor::KeyboardTarget,
+        );
+        transition.elapsed_secs = MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS;
+
+        let mut app = App::new();
+        app.insert_resource(slots)
+            .insert_resource(transition)
+            .init_resource::<Time>()
+            .add_systems(Update, animate_mobius_transition);
+        app.update();
+
+        let preset = app.world().resource::<TerminalCameraSlots>().active();
+        // The keyboard enter is the one finish write that is not a no-op: the
+        // displayed pose is zoomed out to the target floor...
+        assert_eq!(
+            preset.pose.orthographic_scale,
+            MobiusTransition::TARGET_ZOOM_MULTIPLIER
+        );
+        // ...while the saved source keeps the exact sub-unit scale so the
+        // exit restores it.
+        assert_eq!(
+            preset
+                .mobius_source
+                .expect("Mobius source")
+                .pose
+                .orthographic_scale,
+            0.4
+        );
+        assert!(!app.world().resource::<MobiusTransition>().active);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 mod mobius;
 
-pub use mobius::{MobiusTransition, MobiusTransitionDirection};
+pub use mobius::{MobiusEnterZoomFloor, MobiusTransition, MobiusTransitionDirection};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::ClearColorConfig;
@@ -961,8 +961,10 @@ mod tests {
                 (offset.y - pitch.sin()).abs() < 1e-6,
                 "pitch must tilt the orbit at yaw {yaw}"
             );
-            // glam's f32 Euler decomposition carries ~1e-3 rad of error, so
-            // this pins the composition order, not bit-exact equality.
+            // The two compositions are analytically identical, but
+            // Quat::angle_between is ill-conditioned near zero (acos of a
+            // dot product near 1.0 amplifies f32 rounding into ~1e-3 rad),
+            // so this pins the composition order, not bit-exact equality.
             let plane_equivalent = Quat::from_euler(EulerRot::XYZ, pitch, yaw, 0.0).inverse();
             assert!(
                 rotation.angle_between(plane_equivalent) < 5e-3,
