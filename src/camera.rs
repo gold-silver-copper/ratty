@@ -336,12 +336,13 @@ pub fn apply_terminal_camera_updates(
                     if mode_changed && update.slot == slots.active_slot() {
                         // A protocol switch into Mobius on the displayed slot
                         // animates like the keyboard toggle, but honors the
-                        // requested scale exactly instead of the keyboard
-                        // zoom floor; pose-only updates while already in
-                        // Mobius stay immediate. The stop() above makes the
-                        // resume branch of begin_enter unreachable here by
-                        // design: that is what keeps the keyboard floor from
-                        // ever leaking into a protocol enter.
+                        // requested scale exactly: begin_enter recomputes the
+                        // zoom floor from its argument on every call, so no
+                        // earlier keyboard floor can persist. The stop()
+                        // above only makes this a fresh enter whose start
+                        // values snap to the live pose — the documented
+                        // protocol-cancel semantics. Pose-only updates while
+                        // already in Mobius stay immediate.
                         mobius_transition.begin_enter(
                             update.slot,
                             &source,
@@ -409,10 +410,10 @@ pub fn activate_terminal_camera_presets(
             } else {
                 // Activating a Mobius slot from a non-Mobius view animates
                 // the strip in like the keyboard toggle, but at the slot's
-                // exact stored scale so activation never rewrites the preset
-                // at finish. The stop() makes the resume branch of
-                // begin_enter unreachable, keeping the keyboard zoom floor
-                // out of activation enters.
+                // exact stored scale (recomputed from the zoom_floor argument
+                // on every begin_enter) so activation never rewrites the
+                // preset at finish. The stop() only forces a fresh enter
+                // whose start values snap to the newly displayed pose.
                 mobius_transition.stop();
                 mobius_transition.begin_enter(
                     activation.slot,

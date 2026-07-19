@@ -108,6 +108,19 @@ impl MobiusTransition {
         zoom_floor: MobiusEnterZoomFloor,
     ) {
         let resume = self.active && self.source_is_for(slot);
+        if resume
+            && self.direction == MobiusTransitionDirection::Entering
+            && self.end_zoom == live_pose.orthographic_scale.max(zoom_floor.min_end_zoom())
+            && self.end_yaw == live_pose.yaw
+            && self.end_pitch == live_pose.pitch
+            && self.end_roll == live_pose.roll
+            && self.end_translation == live_pose.translation
+        {
+            // Re-entering toward identical targets is a no-op; restarting
+            // would reset the clock, letting rapid repeated activations keep
+            // the transition open (and input gated) indefinitely.
+            return;
+        }
         let (start_morph, start_zoom, start_yaw, start_pitch, start_roll, start_translation) =
             if resume {
                 (
@@ -236,22 +249,28 @@ impl MobiusTransition {
         Self::MORPH_SECS * remaining
     }
 
+    /// Returns how long the morph waits for the camera phase.
+    ///
+    /// Only fresh transitions hold the morph while the camera settles; a
+    /// resumed transition must keep morphing immediately, otherwise every
+    /// restart (e.g. rapid slot hand-offs) would re-freeze the morph for the
+    /// hold duration and the transition could be kept from ever finishing.
+    fn morph_hold_secs(&self) -> f32 {
+        match self.direction {
+            MobiusTransitionDirection::Entering if self.start_morph > 0.0 => 0.0,
+            MobiusTransitionDirection::Entering => Self::ZOOM_OUT_SECS,
+            MobiusTransitionDirection::Exiting if self.start_morph < 1.0 => 0.0,
+            MobiusTransitionDirection::Exiting => Self::VIEW_RESET_SECS,
+        }
+    }
+
     /// Returns the raw progress through the (possibly shortened) morph phase.
     fn morph_phase_progress(&self) -> f32 {
-        let hold_secs = match self.direction {
-            MobiusTransitionDirection::Entering => Self::ZOOM_OUT_SECS,
-            MobiusTransitionDirection::Exiting => Self::VIEW_RESET_SECS,
-        };
         let phase_secs = self.morph_phase_secs();
         if phase_secs <= f32::EPSILON {
             return 1.0;
         }
-        ((self.elapsed_secs - hold_secs) / phase_secs).clamp(0.0, 1.0)
-    }
-
-    /// Returns the current Mobius morph progress from `0.0` to `1.0` while entering.
-    pub fn enter_morph_progress(&self) -> f32 {
-        self.morph_phase_progress()
+        ((self.elapsed_secs - self.morph_hold_secs()) / phase_secs).clamp(0.0, 1.0)
     }
 
     /// Returns the current Mobius morph progress for the active direction.
@@ -319,11 +338,14 @@ impl MobiusTransition {
 
     /// Returns whether the full transition has finished.
     pub fn finished(&self) -> bool {
-        let hold_secs = match self.direction {
+        // Wait for both the camera phase (always the full hold window) and
+        // the morph, which may start immediately on a resume.
+        let camera_secs = match self.direction {
             MobiusTransitionDirection::Entering => Self::ZOOM_OUT_SECS,
             MobiusTransitionDirection::Exiting => Self::VIEW_RESET_SECS,
         };
-        self.elapsed_secs >= hold_secs + self.morph_phase_secs()
+        let morph_secs = self.morph_hold_secs() + self.morph_phase_secs();
+        self.elapsed_secs >= morph_secs.max(camera_secs)
     }
 }
 
@@ -501,15 +523,13 @@ mod tests {
             MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS * 0.7;
         transition.begin_exit(0, &pose, transition.current_zoom());
 
-        // The remaining 0.7 of morph unwinds in 0.7 * MORPH_SECS: velocity is
-        // continuous, so halfway through the shortened phase the morph has
-        // covered half the remaining distance.
-        transition.elapsed_secs =
-            MobiusTransition::VIEW_RESET_SECS + MobiusTransition::MORPH_SECS * 0.35;
+        // The remaining 0.7 of morph unwinds in 0.7 * MORPH_SECS with no
+        // hold: velocity is continuous, so halfway through the shortened
+        // phase the morph has covered half the remaining distance.
+        transition.elapsed_secs = MobiusTransition::MORPH_SECS * 0.35;
         assert!((transition.morph_progress() - 0.35).abs() < 1e-6);
         assert!(!transition.finished());
-        transition.elapsed_secs =
-            MobiusTransition::VIEW_RESET_SECS + MobiusTransition::MORPH_SECS * 0.7;
+        transition.elapsed_secs = MobiusTransition::MORPH_SECS * 0.7;
         assert_eq!(transition.morph_progress(), 0.0);
         assert!(transition.finished());
 
@@ -523,6 +543,79 @@ mod tests {
         assert!(!degenerate.finished());
         degenerate.elapsed_secs = MobiusTransition::VIEW_RESET_SECS;
         assert!(degenerate.finished());
+    }
+
+    #[test]
+    fn repeated_identical_handoffs_do_not_restart_the_clock() {
+        let pose = TerminalCameraPose::default();
+        let source = TerminalMobiusSource {
+            mode: TerminalPresentationMode::Plane3d,
+            pose,
+        };
+        let mut transition = MobiusTransition::default();
+        transition.begin_enter(0, &source, &pose, MobiusEnterZoomFloor::ProtocolExact);
+        transition.elapsed_secs = 0.15;
+
+        // Rapid re-activations toward identical targets (e.g. alternating
+        // identically-posed Mobius slots) must not reset the clock, or the
+        // transition could be held open forever.
+        transition.prepare_source(1, source.mode, &source.pose);
+        transition.begin_enter(1, &source, &pose, MobiusEnterZoomFloor::ProtocolExact);
+
+        assert_eq!(transition.elapsed_secs, 0.15);
+        assert!(transition.source_is_for(1));
+    }
+
+    #[test]
+    fn resumed_morph_advances_during_the_camera_phase() {
+        let live_pose = TerminalCameraPose::default();
+        let other_pose = TerminalCameraPose {
+            yaw: 1.0,
+            ..TerminalCameraPose::default()
+        };
+        let source = TerminalMobiusSource {
+            mode: TerminalPresentationMode::Plane3d,
+            pose: live_pose,
+        };
+        let mut transition = MobiusTransition::default();
+        transition.begin_enter(0, &source, &live_pose, MobiusEnterZoomFloor::ProtocolExact);
+        transition.elapsed_secs =
+            MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS * 0.4;
+
+        // A hand-off to a differently-posed slot restarts the camera lerp,
+        // but the morph keeps advancing immediately instead of freezing for
+        // the hold window.
+        transition.prepare_source(1, source.mode, &source.pose);
+        transition.begin_enter(1, &source, &other_pose, MobiusEnterZoomFloor::ProtocolExact);
+        assert!((transition.morph_progress() - 0.4).abs() < 1e-6);
+        transition.elapsed_secs = MobiusTransition::ZOOM_OUT_SECS / 2.0;
+        assert!(transition.morph_progress() > 0.4);
+    }
+
+    #[test]
+    fn handoff_resumes_continuously_from_an_exiting_transition() {
+        let pose = TerminalCameraPose::default();
+        let source = TerminalMobiusSource {
+            mode: TerminalPresentationMode::Plane3d,
+            pose,
+        };
+        let mut transition = MobiusTransition::default();
+        transition.begin_enter(0, &source, &pose, MobiusEnterZoomFloor::KeyboardTarget);
+        transition.elapsed_secs = MobiusTransition::ZOOM_OUT_SECS + MobiusTransition::MORPH_SECS;
+        transition.begin_exit(0, &pose, transition.current_zoom());
+        transition.elapsed_secs = MobiusTransition::MORPH_SECS * 0.5;
+        let morph_before = transition.morph_progress();
+        assert!(morph_before > 0.0 && morph_before < 1.0);
+
+        transition.prepare_source(1, source.mode, &source.pose);
+        transition.begin_enter(1, &source, &pose, MobiusEnterZoomFloor::ProtocolExact);
+
+        assert!(matches!(
+            transition.direction,
+            MobiusTransitionDirection::Entering
+        ));
+        assert!((transition.morph_progress() - morph_before).abs() < 1e-6);
+        assert!(transition.source_is_for(1));
     }
 
     #[test]

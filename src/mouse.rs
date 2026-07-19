@@ -276,17 +276,34 @@ pub(crate) fn handle_mouse_input(
         return;
     };
 
+    let window_size = window.resolution.size().max(Vec2::ONE);
+    let mouse_mode = runtime.parser.screen().mouse_protocol_mode();
+    let mouse_encoding = runtime.parser.screen().mouse_protocol_encoding();
+
     // Button releases delivered while the window is unfocused never reach the
     // handlers below, so losing focus mid-drag would otherwise leave held
     // button state re-arming on bare cursor movement after refocus.
     for event in focus_events.read() {
         if event.window == primary_window && !event.focused {
+            // The PTY application saw the press and will never see the real
+            // release, so synthesize one per held button before dropping the
+            // local state.
+            if mouse_mode != MouseProtocolMode::None
+                && let Some(cell) = forwarded_mouse.last_cell
+            {
+                for (pressed, code) in [
+                    (forwarded_mouse.left_pressed, 0),
+                    (forwarded_mouse.middle_pressed, 1),
+                    (forwarded_mouse.right_pressed, 2),
+                ] {
+                    if pressed {
+                        runtime.write_input(&encode_mouse_event(cell, code, true, mouse_encoding));
+                    }
+                }
+            }
             release_pointer_drags(camera_interaction, selection, &mut forwarded_mouse);
         }
     }
-    let window_size = window.resolution.size().max(Vec2::ONE);
-    let mouse_mode = runtime.parser.screen().mouse_protocol_mode();
-    let mouse_encoding = runtime.parser.screen().mouse_protocol_encoding();
     let mode = camera_slots.active().mode;
     let mobius_animating = mode == TerminalPresentationMode::Mobius3d && mobius_transition.active;
     let forward_mouse =
@@ -481,10 +498,6 @@ pub(crate) fn handle_mouse_input(
     }
 
     for event in wheel_events.read() {
-        if mobius_animating {
-            continue;
-        }
-
         let delta = match event.unit {
             MouseScrollUnit::Line => event.y * 0.1,
             MouseScrollUnit::Pixel => event.y * 0.001,
@@ -613,8 +626,10 @@ fn position_to_cell(
 /// Releases delivered while the window is unfocused go to the newly focused
 /// window instead, so held-button state must be cleared on focus loss: camera
 /// drags, an in-progress or pending text selection drag (the completed
-/// selection itself is kept), and forwarded mouse-protocol button state that
-/// would otherwise keep reporting button-held motion to the PTY application.
+/// selection itself is kept), and forwarded mouse-protocol button state.
+/// This only clears local state; the caller synthesizes the release events
+/// the PTY application is still owed before invoking it. `last_cell` is also
+/// cleared so the first motion after refocus is never deduplicated away.
 fn release_pointer_drags(
     camera_interaction: &mut TerminalCameraInteraction,
     selection: &mut TerminalSelection,
@@ -625,6 +640,7 @@ fn release_pointer_drags(
     forwarded_mouse.left_pressed = false;
     forwarded_mouse.middle_pressed = false;
     forwarded_mouse.right_pressed = false;
+    forwarded_mouse.last_cell = None;
 }
 
 /// Largest orthographic scale reachable by wheel zoom alone.
@@ -695,6 +711,7 @@ mod wheel_zoom_tests {
         assert!(!forwarded.left_pressed);
         assert!(!forwarded.middle_pressed);
         assert!(!forwarded.right_pressed);
+        assert_eq!(forwarded.last_cell, None);
 
         let mut pending = TerminalSelection::default();
         pending.begin_pending(UVec2::ZERO, Vec2::ZERO);
