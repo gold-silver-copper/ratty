@@ -322,10 +322,14 @@ pub fn apply_inline_objects(
     };
 
     for mut visibility in &mut sprite_query {
-        *visibility = sprite_visibility;
+        if *visibility != sprite_visibility {
+            *visibility = sprite_visibility;
+        }
     }
     for mut visibility in &mut plane_query {
-        *visibility = plane_visibility;
+        if *visibility != plane_visibility {
+            *visibility = plane_visibility;
+        }
     }
 }
 
@@ -1459,7 +1463,7 @@ pub fn animate_mobius_transition(
 
     if mobius_transition.finished() {
         let pose = &mut camera_slots.active_mut().pose;
-        pose.zoom = mobius_transition.end_zoom.max(0.1);
+        pose.orthographic_scale = mobius_transition.end_zoom.max(0.1);
         if mobius_transition.direction == crate::scene::MobiusTransitionDirection::Exiting {
             pose.yaw = mobius_transition.source_yaw;
             pose.pitch = mobius_transition.source_pitch;
@@ -1715,11 +1719,21 @@ mod tests {
     #[derive(Resource, Default)]
     struct CameraChangedProbe(bool);
 
+    #[derive(Resource, Default)]
+    struct VisibilityChangedProbe(usize);
+
     fn record_camera_change(
         camera_slots: Res<TerminalCameraSlots>,
         mut probe: ResMut<CameraChangedProbe>,
     ) {
         probe.0 = camera_slots.is_changed();
+    }
+
+    fn record_visibility_changes(
+        visibility: Query<(), Changed<Visibility>>,
+        mut probe: ResMut<VisibilityChangedProbe>,
+    ) {
+        probe.0 = visibility.iter().count();
     }
 
     #[test]
@@ -1743,5 +1757,31 @@ mod tests {
         app.update();
 
         assert!(!app.world().resource::<CameraChangedProbe>().0);
+    }
+
+    #[test]
+    fn pose_updates_do_not_mark_inline_visibility_changed() {
+        let mut app = App::new();
+        app.init_resource::<TerminalCameraSlots>()
+            .init_resource::<VisibilityChangedProbe>()
+            .add_systems(
+                Update,
+                (apply_inline_objects, record_visibility_changes).chain(),
+            );
+        app.world_mut()
+            .spawn((TerminalInlineObjectSprite, Visibility::Visible));
+        app.world_mut()
+            .spawn((TerminalInlineObjectPlane, Visibility::Hidden));
+        app.update();
+        app.world_mut().clear_trackers();
+        app.world_mut()
+            .resource_mut::<TerminalCameraSlots>()
+            .active_mut()
+            .pose
+            .yaw += 0.25;
+
+        app.update();
+
+        assert_eq!(app.world().resource::<VisibilityChangedProbe>().0, 0);
     }
 }

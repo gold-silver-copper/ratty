@@ -9,7 +9,7 @@ use bevy::window::{PrimaryWindow, Window};
 
 use arboard::Clipboard;
 
-use crate::camera::{ActivateTerminalCameraPreset, TerminalCameraSlots};
+use crate::camera::{ActivateTerminalCameraPreset, TerminalCameraInteraction, TerminalCameraSlots};
 use crate::config::{AppConfig, BindingAction, FontConfig, KeyBindingConfig};
 use crate::mouse::{TerminalSelection, encode_mouse_wheel};
 use crate::runtime::TerminalRuntime;
@@ -368,6 +368,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     selection: ResMut<'w, TerminalSelection>,
     plane_warp: ResMut<'w, TerminalPlaneWarp>,
     camera_slots: ResMut<'w, TerminalCameraSlots>,
+    camera_interaction: ResMut<'w, TerminalCameraInteraction>,
     camera_activations: MessageWriter<'w, ActivateTerminalCameraPreset>,
     mobius_transition: ResMut<'w, MobiusTransition>,
     clipboard: NonSendMut<'w, TerminalClipboard>,
@@ -429,6 +430,7 @@ pub fn handle_keyboard_input(
                     } else {
                         TerminalPresentationMode::Plane3d
                     };
+                    params.camera_interaction.reset();
                     params.mobius_transition.stop();
                     params.selection.clear();
                     continue;
@@ -440,27 +442,17 @@ pub fn handle_keyboard_input(
                     } else {
                         TerminalPresentationMode::Perspective3d
                     };
+                    params.camera_interaction.reset();
                     params.mobius_transition.stop();
                     params.selection.clear();
                     continue;
                 }
                 BindingAction::ToggleMobiusMode => {
-                    if params.camera_slots.active().mode == TerminalPresentationMode::Mobius3d {
-                        let current_zoom = if params.mobius_transition.active {
-                            params.mobius_transition.current_zoom()
-                        } else {
-                            params.camera_slots.active().pose.zoom
-                        };
-                        params
-                            .mobius_transition
-                            .begin_exit(&params.camera_slots.active().pose, current_zoom);
-                    } else {
-                        let previous_mode = params.camera_slots.active().mode;
-                        params
-                            .mobius_transition
-                            .begin_enter(previous_mode, &params.camera_slots.active().pose);
-                        params.camera_slots.active_mut().mode = TerminalPresentationMode::Mobius3d;
-                    }
+                    toggle_mobius_presentation(
+                        &mut params.camera_slots,
+                        &mut params.camera_interaction,
+                        &mut params.mobius_transition,
+                    );
                     params.selection.clear();
                     continue;
                 }
@@ -616,6 +608,27 @@ pub fn handle_keyboard_input(
             params.runtime.write_input(&input);
         }
     }
+}
+
+fn toggle_mobius_presentation(
+    camera_slots: &mut TerminalCameraSlots,
+    interaction: &mut TerminalCameraInteraction,
+    mobius_transition: &mut MobiusTransition,
+) {
+    let slot = camera_slots.active_slot();
+    let preset = *camera_slots.active();
+    if preset.mode == TerminalPresentationMode::Mobius3d {
+        let current_zoom = if mobius_transition.active {
+            mobius_transition.current_zoom()
+        } else {
+            preset.pose.orthographic_scale
+        };
+        mobius_transition.begin_exit(slot, &preset.pose, current_zoom);
+    } else {
+        mobius_transition.begin_enter(slot, preset.mode, &preset.pose);
+        camera_slots.active_mut().mode = TerminalPresentationMode::Mobius3d;
+    }
+    interaction.reset();
 }
 
 fn is_scroll_action(action: BindingAction) -> bool {
@@ -1233,6 +1246,110 @@ mod key_code_tests {
             bindings.action_for(KeyCode::Digit0, control_alt_shift),
             Some(BindingAction::ActivateCameraSlot0)
         );
+    }
+
+    #[test]
+    fn distributed_camera_bindings_parse_without_trigger_collisions() {
+        let config: AppConfig =
+            toml::from_str(include_str!("../config/ratty.toml")).expect("distributed config");
+        let bindings = config
+            .bindings
+            .keys
+            .iter()
+            .map(|binding| KeyBinding::from_config(binding).expect("valid distributed binding"))
+            .collect::<Vec<_>>();
+
+        for (index, binding) in bindings.iter().enumerate() {
+            assert!(
+                bindings[index + 1..]
+                    .iter()
+                    .all(|other| !binding.same_trigger(other)),
+                "duplicate distributed trigger for {:?}",
+                binding.action
+            );
+        }
+        let mut slots = bindings
+            .iter()
+            .filter_map(|binding| binding.action.camera_slot())
+            .collect::<Vec<_>>();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn mobius_exit_uses_the_active_slots_protocol_pose() {
+        use crate::camera::{
+            OptionalVec3, TerminalCameraUpdate, activate_terminal_camera_presets,
+            apply_terminal_camera_updates,
+        };
+
+        let mut app = App::new();
+        app.init_resource::<TerminalCameraSlots>()
+            .init_resource::<TerminalCameraInteraction>()
+            .init_resource::<MobiusTransition>()
+            .add_message::<TerminalCameraUpdate>()
+            .add_message::<ActivateTerminalCameraPreset>()
+            .add_systems(
+                Update,
+                (
+                    apply_terminal_camera_updates,
+                    activate_terminal_camera_presets,
+                )
+                    .chain(),
+            );
+        app.world_mut().write_message(TerminalCameraUpdate {
+            slot: 2,
+            activate: true,
+            mode: Some(TerminalPresentationMode::Mobius3d),
+            scale: Some(2.5),
+            translation: OptionalVec3 {
+                x: Some(12.0),
+                y: Some(-8.0),
+                z: Some(30.0),
+            },
+            rotation_degrees: OptionalVec3 {
+                x: Some(15.0),
+                y: Some(35.0),
+                z: None,
+            },
+        });
+        app.update();
+        app.world_mut()
+            .write_message(ActivateTerminalCameraPreset { slot: 1 });
+        app.update();
+        app.world_mut()
+            .write_message(ActivateTerminalCameraPreset { slot: 2 });
+        app.update();
+
+        let expected = *app.world().resource::<TerminalCameraSlots>().active();
+        let mut slots = app
+            .world_mut()
+            .remove_resource::<TerminalCameraSlots>()
+            .expect("camera slots");
+        let mut interaction = app
+            .world_mut()
+            .remove_resource::<TerminalCameraInteraction>()
+            .expect("camera interaction");
+        interaction.rotating = true;
+        let mut transition = app
+            .world_mut()
+            .remove_resource::<MobiusTransition>()
+            .expect("mobius transition");
+
+        toggle_mobius_presentation(&mut slots, &mut interaction, &mut transition);
+
+        assert!(transition.active);
+        assert!(matches!(
+            transition.direction,
+            crate::scene::MobiusTransitionDirection::Exiting
+        ));
+        assert!(transition.source_is_for(2));
+        assert_eq!(transition.source_mode, TerminalPresentationMode::Flat2d);
+        assert_eq!(transition.end_zoom, expected.pose.orthographic_scale);
+        assert_eq!(transition.end_translation, expected.pose.translation);
+        assert_eq!(transition.end_yaw, expected.pose.yaw);
+        assert_eq!(transition.end_pitch, expected.pose.pitch);
+        assert!(!interaction.rotating);
     }
 }
 

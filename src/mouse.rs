@@ -304,8 +304,13 @@ pub(crate) fn handle_mouse_input(
                 if let Some(last) = camera_interaction.last_pan_cursor {
                     let delta = event.position - last;
                     let pose = &mut camera_slots.active_mut().pose;
-                    pose.translation.x -= delta.x * pose.zoom;
-                    pose.translation.y += delta.y * pose.zoom;
+                    let movement_scale = if mode == TerminalPresentationMode::Perspective3d {
+                        pose.perspective_fov
+                    } else {
+                        pose.orthographic_scale
+                    };
+                    pose.translation.x -= delta.x * movement_scale;
+                    pose.translation.y += delta.y * movement_scale;
                 }
                 camera_interaction.last_pan_cursor = Some(event.position);
             }
@@ -514,11 +519,12 @@ pub(crate) fn handle_mouse_input(
             }
         } else if mode.is_3d() && delta != 0.0 {
             let pose = &mut camera_slots.active_mut().pose;
-            pose.zoom = if mode == TerminalPresentationMode::Perspective3d {
-                (pose.zoom - delta).clamp(MIN_PERSPECTIVE_FOV, MAX_PERSPECTIVE_FOV)
+            if mode == TerminalPresentationMode::Perspective3d {
+                pose.perspective_fov =
+                    (pose.perspective_fov - delta).clamp(MIN_PERSPECTIVE_FOV, MAX_PERSPECTIVE_FOV);
             } else {
-                (pose.zoom - delta).clamp(0.1, 4.0)
-            };
+                pose.orthographic_scale = (pose.orthographic_scale - delta).clamp(0.1, 4.0);
+            }
         }
     }
 }

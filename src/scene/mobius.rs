@@ -17,6 +17,8 @@ pub struct MobiusTransition {
     pub direction: MobiusTransitionDirection,
     /// Source mode before entering the Mobius view.
     pub source_mode: TerminalPresentationMode,
+    /// Camera slot that owns the saved source state.
+    source_slot: Option<usize>,
     /// Source zoom before entering the Mobius view.
     pub source_zoom: f32,
     /// Source camera yaw before entering the Mobius view.
@@ -65,19 +67,16 @@ impl MobiusTransition {
     /// Starts the entry transition from a source mode and zoom level.
     pub fn begin_enter(
         &mut self,
+        slot: usize,
         source_mode: TerminalPresentationMode,
         pose: &TerminalCameraPose,
     ) {
+        self.prepare_source(slot, source_mode, pose);
         self.active = true;
         self.elapsed_secs = 0.0;
         self.direction = MobiusTransitionDirection::Entering;
-        self.source_mode = source_mode;
-        self.source_zoom = pose.zoom;
-        self.source_yaw = pose.yaw;
-        self.source_pitch = pose.pitch;
-        self.source_translation = pose.translation;
-        self.start_zoom = pose.zoom;
-        self.end_zoom = pose.zoom.max(Self::TARGET_ZOOM_MULTIPLIER);
+        self.start_zoom = pose.orthographic_scale;
+        self.end_zoom = pose.orthographic_scale.max(Self::TARGET_ZOOM_MULTIPLIER);
         self.start_yaw = pose.yaw;
         self.start_pitch = pose.pitch;
         self.start_translation = pose.translation;
@@ -87,7 +86,10 @@ impl MobiusTransition {
     }
 
     /// Starts the exit transition back to the source mode.
-    pub fn begin_exit(&mut self, pose: &TerminalCameraPose, current_zoom: f32) {
+    pub fn begin_exit(&mut self, slot: usize, pose: &TerminalCameraPose, current_zoom: f32) {
+        if !self.source_is_for(slot) {
+            self.prepare_source(slot, TerminalPresentationMode::Plane3d, pose);
+        }
         self.active = true;
         self.elapsed_secs = 0.0;
         self.direction = MobiusTransitionDirection::Exiting;
@@ -105,6 +107,30 @@ impl MobiusTransition {
     pub fn stop(&mut self) {
         self.active = false;
         self.elapsed_secs = 0.0;
+    }
+
+    /// Saves a stable source pose for a later Mobius exit from `slot`.
+    pub fn prepare_source(
+        &mut self,
+        slot: usize,
+        source_mode: TerminalPresentationMode,
+        pose: &TerminalCameraPose,
+    ) {
+        self.source_slot = Some(slot);
+        self.source_mode = if source_mode == TerminalPresentationMode::Mobius3d {
+            TerminalPresentationMode::Plane3d
+        } else {
+            source_mode
+        };
+        self.source_zoom = pose.orthographic_scale;
+        self.source_yaw = pose.yaw;
+        self.source_pitch = pose.pitch;
+        self.source_translation = pose.translation;
+    }
+
+    /// Returns whether the saved source state belongs to `slot`.
+    pub fn source_is_for(&self, slot: usize) -> bool {
+        self.source_slot == Some(slot)
     }
 
     /// Returns the current zoom-out progress from `0.0` to `1.0` while entering.
@@ -193,6 +219,7 @@ impl Default for MobiusTransition {
             elapsed_secs: 0.0,
             direction: MobiusTransitionDirection::Entering,
             source_mode: TerminalPresentationMode::Flat2d,
+            source_slot: None,
             source_zoom: 1.0,
             source_yaw: 0.0,
             source_pitch: 0.0,

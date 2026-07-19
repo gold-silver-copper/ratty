@@ -39,26 +39,29 @@ pub struct TerminalCameraPose {
     pub pitch: f32,
     /// Rotation around the view axis, in radians.
     pub roll: f32,
-    /// Orthographic scale or perspective vertical field of view in radians.
-    pub zoom: f32,
+    /// Orthographic projection scale.
+    pub orthographic_scale: f32,
+    /// Perspective vertical field of view in radians.
+    pub perspective_fov: f32,
     /// Camera translation relative to its default position.
     pub translation: Vec3,
 }
 
 impl TerminalCameraPose {
     /// Returns a finite, positive orthographic scale.
-    pub fn orthographic_scale(self) -> f32 {
-        if self.zoom.is_finite() {
-            self.zoom.max(MIN_ORTHOGRAPHIC_SCALE)
+    pub fn resolved_orthographic_scale(self) -> f32 {
+        if self.orthographic_scale.is_finite() {
+            self.orthographic_scale.max(MIN_ORTHOGRAPHIC_SCALE)
         } else {
             1.0
         }
     }
 
     /// Returns a finite perspective field of view away from zero and pi.
-    pub fn perspective_fov(self) -> f32 {
-        if self.zoom.is_finite() {
-            self.zoom.clamp(MIN_PERSPECTIVE_FOV, MAX_PERSPECTIVE_FOV)
+    pub fn resolved_perspective_fov(self) -> f32 {
+        if self.perspective_fov.is_finite() {
+            self.perspective_fov
+                .clamp(MIN_PERSPECTIVE_FOV, MAX_PERSPECTIVE_FOV)
         } else {
             1.0
         }
@@ -71,7 +74,8 @@ impl Default for TerminalCameraPose {
             yaw: 0.18,
             pitch: 0.08,
             roll: 0.0,
-            zoom: 1.0,
+            orthographic_scale: 1.0,
+            perspective_fov: 1.0,
             translation: Vec3::ZERO,
         }
     }
@@ -149,17 +153,18 @@ impl TerminalCameraSlots {
             next.pose.roll = value.to_radians();
         }
         if let Some(value) = update.scale {
-            let valid = match next.mode {
-                TerminalPresentationMode::Flat2d => false,
+            match next.mode {
+                TerminalPresentationMode::Flat2d => {}
                 TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-                    value >= MIN_ORTHOGRAPHIC_SCALE
+                    if value >= MIN_ORTHOGRAPHIC_SCALE {
+                        next.pose.orthographic_scale = value;
+                    }
                 }
                 TerminalPresentationMode::Perspective3d => {
-                    (MIN_PERSPECTIVE_FOV..=MAX_PERSPECTIVE_FOV).contains(&value)
+                    if (MIN_PERSPECTIVE_FOV..=MAX_PERSPECTIVE_FOV).contains(&value) {
+                        next.pose.perspective_fov = value;
+                    }
                 }
-            };
-            if valid {
-                next.pose.zoom = value;
             }
         }
 
@@ -199,6 +204,16 @@ pub struct TerminalCameraInteraction {
     pub last_rotate_cursor: Option<Vec2>,
     /// Previous cursor position during panning.
     pub last_pan_cursor: Option<Vec2>,
+}
+
+impl TerminalCameraInteraction {
+    /// Clears transient drag state after a mode or slot transition.
+    pub fn reset(&mut self) {
+        self.rotating = false;
+        self.panning = false;
+        self.last_rotate_cursor = None;
+        self.last_pan_cursor = None;
+    }
 }
 
 /// Optional vector components in a partial camera update.
@@ -251,21 +266,37 @@ pub fn apply_terminal_camera_updates(
     mut updates: MessageReader<TerminalCameraUpdate>,
     mut activations: MessageWriter<ActivateTerminalCameraPreset>,
     mut slots: ResMut<TerminalCameraSlots>,
+    mut interaction: ResMut<TerminalCameraInteraction>,
     mut mobius_transition: ResMut<MobiusTransition>,
 ) {
     for update in updates.read().copied() {
-        let active_mode_before = slots.active().mode;
+        let previous = slots.preset(update.slot).copied();
         let changed = if let Some(next) = slots.updated_preset(update) {
             slots.presets[update.slot] = next;
             true
         } else {
             false
         };
-        if changed
-            && update.slot == slots.active_slot()
-            && slots.active().mode != active_mode_before
-        {
-            mobius_transition.stop();
+        if changed && let Some(previous) = previous {
+            let next = slots.presets[update.slot];
+            let mode_changed = next.mode != previous.mode;
+            if update.slot == slots.active_slot() || update.activate {
+                if next.mode == TerminalPresentationMode::Mobius3d {
+                    let source_mode = if mode_changed {
+                        previous.mode
+                    } else if mobius_transition.source_is_for(update.slot) {
+                        mobius_transition.source_mode
+                    } else {
+                        TerminalPresentationMode::Plane3d
+                    };
+                    mobius_transition.prepare_source(update.slot, source_mode, &next.pose);
+                } else if mode_changed && update.slot == slots.active_slot() {
+                    mobius_transition.stop();
+                }
+            }
+            if mode_changed && update.slot == slots.active_slot() {
+                interaction.reset();
+            }
         }
         if update.activate {
             activations.write(ActivateTerminalCameraPreset { slot: update.slot });
@@ -285,11 +316,20 @@ pub fn activate_terminal_camera_presets(
             activation.slot < TERMINAL_CAMERA_SLOT_COUNT && slots.active_slot() != activation.slot;
         if should_activate {
             slots.activate(activation.slot);
-            interaction.rotating = false;
-            interaction.panning = false;
-            interaction.last_rotate_cursor = None;
-            interaction.last_pan_cursor = None;
+            interaction.reset();
             mobius_transition.stop();
+            if slots.active().mode == TerminalPresentationMode::Mobius3d {
+                let source_mode = if mobius_transition.source_is_for(activation.slot) {
+                    mobius_transition.source_mode
+                } else {
+                    TerminalPresentationMode::Plane3d
+                };
+                mobius_transition.prepare_source(
+                    activation.slot,
+                    source_mode,
+                    &slots.active().pose,
+                );
+            }
         }
     }
 }
@@ -325,7 +365,11 @@ mod tests {
         assert_eq!(preset.pose.yaw, std::f32::consts::FRAC_PI_2);
         assert_eq!(preset.pose.pitch, original.pose.pitch);
         assert_eq!(preset.pose.roll, original.pose.roll);
-        assert_eq!(preset.pose.zoom, original.pose.zoom);
+        assert_eq!(
+            preset.pose.orthographic_scale,
+            original.pose.orthographic_scale
+        );
+        assert_eq!(preset.pose.perspective_fov, original.pose.perspective_fov);
     }
 
     #[test]
@@ -354,7 +398,7 @@ mod tests {
 
         assert!(slots.apply_update(partial));
         assert_eq!(slots.active().mode, TerminalPresentationMode::Perspective3d);
-        assert_eq!(slots.active().pose.zoom, 1.0);
+        assert_eq!(slots.active().pose.perspective_fov, 1.0);
     }
 
     #[test]
@@ -367,14 +411,28 @@ mod tests {
     #[test]
     fn projections_are_always_finite_and_valid() {
         let mut pose = TerminalCameraPose::default();
-        for zoom in [f32::NAN, f32::INFINITY, -1.0, 0.0, std::f32::consts::PI] {
-            pose.zoom = zoom;
-            assert!(pose.orthographic_scale().is_finite());
-            assert!(pose.orthographic_scale() > 0.0);
-            assert!(pose.perspective_fov().is_finite());
-            assert!(pose.perspective_fov() > 0.0);
-            assert!(pose.perspective_fov() < std::f32::consts::PI);
+        for value in [f32::NAN, f32::INFINITY, -1.0, 0.0, std::f32::consts::PI] {
+            pose.orthographic_scale = value;
+            pose.perspective_fov = value;
+            assert!(pose.resolved_orthographic_scale().is_finite());
+            assert!(pose.resolved_orthographic_scale() > 0.0);
+            assert!(pose.resolved_perspective_fov().is_finite());
+            assert!(pose.resolved_perspective_fov() > 0.0);
+            assert!(pose.resolved_perspective_fov() < std::f32::consts::PI);
         }
+    }
+
+    #[test]
+    fn orthographic_zoom_does_not_change_perspective_fov() {
+        let mut slots = TerminalCameraSlots::default();
+        slots.active_mut().mode = TerminalPresentationMode::Plane3d;
+        slots.active_mut().pose.orthographic_scale = 4.0;
+        let expected_fov = slots.active().pose.perspective_fov;
+
+        slots.active_mut().mode = TerminalPresentationMode::Perspective3d;
+
+        assert_eq!(slots.active().pose.perspective_fov, expected_fov);
+        assert_eq!(slots.active().pose.resolved_perspective_fov(), 1.0);
     }
 
     #[test]
@@ -442,6 +500,11 @@ mod tests {
                     .chain(),
             );
         assert!(app.world_mut().resource_mut::<TerminalRedrawState>().take());
+        {
+            let mut interaction = app.world_mut().resource_mut::<TerminalCameraInteraction>();
+            interaction.rotating = true;
+            interaction.last_rotate_cursor = Some(Vec2::new(10.0, 20.0));
+        }
         let mut command = update(0);
         command.mode = Some(TerminalPresentationMode::Perspective3d);
         app.world_mut().write_message(command);
@@ -449,5 +512,8 @@ mod tests {
         app.update();
 
         assert!(!app.world_mut().resource_mut::<TerminalRedrawState>().take());
+        let interaction = app.world().resource::<TerminalCameraInteraction>();
+        assert!(!interaction.rotating);
+        assert_eq!(interaction.last_rotate_cursor, None);
     }
 }

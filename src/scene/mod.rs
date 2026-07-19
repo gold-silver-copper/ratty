@@ -135,6 +135,9 @@ type OrthographicCameraQuery<'w, 's> = Query<
     (
         With<TerminalOrthographicCamera>,
         Without<TerminalPerspectiveCamera>,
+        Without<Camera2d>,
+        Without<TerminalPlane>,
+        Without<TerminalPlaneBack>,
     ),
 >;
 type PerspectiveCameraQuery<'w, 's> = Query<
@@ -148,6 +151,9 @@ type PerspectiveCameraQuery<'w, 's> = Query<
     (
         With<TerminalPerspectiveCamera>,
         Without<TerminalOrthographicCamera>,
+        Without<Camera2d>,
+        Without<TerminalPlane>,
+        Without<TerminalPlaneBack>,
     ),
 >;
 type FlatCameraQuery<'w, 's> = Query<
@@ -478,7 +484,7 @@ fn camera_activation(mode: TerminalPresentationMode) -> TerminalCameraActivation
     }
 }
 
-fn set_camera_state(camera: &mut Camera, active: bool, owns_clear: bool) {
+fn set_camera_state(mut camera: Mut<Camera>, active: bool, owns_clear: bool) {
     if camera.is_active != active {
         camera.is_active = active;
     }
@@ -588,9 +594,9 @@ pub(crate) fn apply_terminal_presentation(
         }
     }
 
-    for mut camera in camera_2d.iter_mut() {
+    for camera in camera_2d.iter_mut() {
         set_camera_state(
-            &mut camera,
+            camera,
             activation.flat,
             activation.clear_owner == TerminalClearOwner::Flat,
         );
@@ -627,9 +633,9 @@ pub(crate) fn apply_terminal_presentation(
         ..default()
     };
 
-    for (mut projection, mut transform, mut camera) in orthographic_camera.iter_mut() {
+    for (mut projection, mut transform, camera) in orthographic_camera.iter_mut() {
         set_camera_state(
-            &mut camera,
+            camera,
             activation.orthographic,
             activation.clear_owner == TerminalClearOwner::Orthographic,
         );
@@ -640,7 +646,7 @@ pub(crate) fn apply_terminal_presentation(
             if is_mobius && mobius_transition.active {
                 mobius_transition.current_zoom().max(MIN_ORTHOGRAPHIC_SCALE)
             } else {
-                pose.orthographic_scale()
+                pose.resolved_orthographic_scale()
             }
         } else {
             1.0
@@ -659,16 +665,16 @@ pub(crate) fn apply_terminal_presentation(
         }
     }
 
-    for (mut projection, mut transform, mut camera) in perspective_camera.iter_mut() {
+    for (mut projection, mut transform, camera) in perspective_camera.iter_mut() {
         set_camera_state(
-            &mut camera,
+            camera,
             activation.perspective,
             activation.clear_owner == TerminalClearOwner::Perspective,
         );
         if !activation.perspective {
             continue;
         }
-        let fov = pose.perspective_fov();
+        let fov = pose.resolved_perspective_fov();
         let projection_needs_update = matches!(
             &*projection,
             Projection::Perspective(perspective)
@@ -736,6 +742,61 @@ fn terminal_plane_mesh(x_segments: u32, y_segments: u32) -> Mesh {
 mod tests {
     use super::*;
 
+    #[derive(Resource, Default)]
+    struct ChangedCameraCount(usize);
+
+    fn count_changed_cameras(
+        cameras: Query<(), Changed<Camera>>,
+        mut count: ResMut<ChangedCameraCount>,
+    ) {
+        count.0 = cameras.iter().count();
+    }
+
+    fn presentation_app() -> (App, Entity, Entity, Entity) {
+        let mut app = App::new();
+        app.init_resource::<TerminalCameraSlots>()
+            .init_resource::<MobiusTransition>()
+            .init_resource::<Assets<StandardMaterial>>()
+            .init_resource::<ChangedCameraCount>();
+        let material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        app.world_mut().spawn((TerminalSprite, Visibility::Visible));
+        app.world_mut().spawn((
+            TerminalPlane,
+            MeshMaterial3d(material),
+            Transform::default(),
+            Visibility::Hidden,
+        ));
+        app.world_mut()
+            .spawn((TerminalPlaneBack, Transform::default(), Visibility::Hidden));
+        let flat = app.world_mut().spawn((Camera2d, Camera::default())).id();
+        let orthographic = app
+            .world_mut()
+            .spawn((
+                TerminalOrthographicCamera,
+                Camera::default(),
+                Projection::Orthographic(OrthographicProjection::default_3d()),
+                Transform::default(),
+            ))
+            .id();
+        let perspective = app
+            .world_mut()
+            .spawn((
+                TerminalPerspectiveCamera,
+                Camera::default(),
+                Projection::Perspective(PerspectiveProjection::default()),
+                Transform::default(),
+            ))
+            .id();
+        app.add_systems(
+            Update,
+            (apply_terminal_presentation, count_changed_cameras).chain(),
+        );
+        (app, flat, orthographic, perspective)
+    }
+
     #[test]
     fn camera_activation_matrix_has_one_clear_owner() {
         let cases = [
@@ -799,5 +860,91 @@ mod tests {
         assert!(projection.near > 0.0);
         assert!(projection.far.is_finite());
         assert!(projection.far > projection.near);
+    }
+
+    #[test]
+    fn presentation_system_applies_activation_and_clear_ownership() {
+        let (mut app, flat, orthographic, perspective) = presentation_app();
+        let cases = [
+            (TerminalPresentationMode::Flat2d, [true, true, false]),
+            (TerminalPresentationMode::Plane3d, [false, true, false]),
+            (TerminalPresentationMode::Mobius3d, [false, true, false]),
+            (
+                TerminalPresentationMode::Perspective3d,
+                [false, false, true],
+            ),
+        ];
+
+        for (mode, expected_active) in cases {
+            app.world_mut()
+                .resource_mut::<TerminalCameraSlots>()
+                .active_mut()
+                .mode = mode;
+            app.update();
+
+            let cameras = [flat, orthographic, perspective].map(|entity| {
+                app.world()
+                    .entity(entity)
+                    .get::<Camera>()
+                    .expect("camera entity")
+                    .clone()
+            });
+            assert_eq!(
+                cameras.each_ref().map(|camera| camera.is_active),
+                expected_active,
+                "wrong activation matrix for {mode:?}"
+            );
+            assert_eq!(
+                cameras
+                    .iter()
+                    .filter(|camera| matches!(camera.clear_color, ClearColorConfig::Default))
+                    .count(),
+                1,
+                "wrong clear ownership for {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn orthographic_zoom_out_does_not_collapse_perspective_projection() {
+        let (mut app, _, _, perspective) = presentation_app();
+        {
+            let mut slots = app.world_mut().resource_mut::<TerminalCameraSlots>();
+            slots.active_mut().mode = TerminalPresentationMode::Plane3d;
+            slots.active_mut().pose.orthographic_scale = 4.0;
+        }
+        app.update();
+        app.world_mut()
+            .resource_mut::<TerminalCameraSlots>()
+            .active_mut()
+            .mode = TerminalPresentationMode::Perspective3d;
+        app.update();
+
+        let projection = app
+            .world()
+            .entity(perspective)
+            .get::<Projection>()
+            .expect("perspective projection");
+        let Projection::Perspective(projection) = projection else {
+            panic!("expected perspective projection");
+        };
+        assert_eq!(projection.fov, 1.0);
+        assert!(projection.fov < std::f32::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    fn pose_only_updates_do_not_mark_camera_components_changed() {
+        let (mut app, _, _, _) = presentation_app();
+        app.update();
+        app.world_mut().clear_trackers();
+        app.world_mut()
+            .resource_mut::<TerminalCameraSlots>()
+            .active_mut()
+            .pose
+            .yaw += 0.25;
+
+        app.update();
+
+        assert_eq!(app.world().resource::<ChangedCameraCount>().0, 0);
     }
 }
