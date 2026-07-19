@@ -393,6 +393,14 @@ mod tests {
     fn invalid_projection_scales_do_not_replace_the_previous_value() {
         let mut slots = TerminalCameraSlots::default();
         let mut partial = update(0);
+        partial.mode = Some(TerminalPresentationMode::Plane3d);
+        partial.scale = Some(MIN_ORTHOGRAPHIC_SCALE / 2.0);
+
+        assert!(slots.apply_update(partial));
+        assert_eq!(slots.active().mode, TerminalPresentationMode::Plane3d);
+        assert_eq!(slots.active().pose.orthographic_scale, 1.0);
+
+        let mut partial = update(0);
         partial.mode = Some(TerminalPresentationMode::Perspective3d);
         partial.scale = Some(std::f32::consts::PI);
 

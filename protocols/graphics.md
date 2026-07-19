@@ -236,8 +236,9 @@ ESC _ ratty;g;c;id=0;set=0;type=Ortho;px=0.25;scale=1.0 ESC \
 Optional fields retain their previous values when omitted:
 
 - `type`: one of `Flat`, `Ortho`, `Persp`, `Mobius`.
-- `scale`: positive orthographic scale in `Ortho` and `Mobius`, or vertical FOV
-  in radians in `Persp`. Perspective FOV must be between `0.05` and `pi - 0.05`.
+- `scale`: orthographic scale of at least `0.01` in `Ortho` and `Mobius`, or
+  vertical FOV in radians in `Persp`. Perspective FOV must be between `0.05`
+  and `pi - 0.05`.
   Orthographic scale and perspective FOV are stored independently, so changing
   `type` does not reinterpret the previous mode's projection value.
   It is ignored in `Flat` mode and ignored when outside the valid range.
