@@ -88,6 +88,17 @@ pub struct TerminalCameraPreset {
     pub mode: TerminalPresentationMode,
     /// Persistent camera pose selected by the preset.
     pub pose: TerminalCameraPose,
+    /// Presentation state restored when leaving Mobius mode.
+    pub mobius_source: Option<TerminalMobiusSource>,
+}
+
+/// Per-slot presentation state saved before entering Mobius mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalMobiusSource {
+    /// Presentation mode restored after the exit transition.
+    pub mode: TerminalPresentationMode,
+    /// Camera pose restored after the exit transition.
+    pub pose: TerminalCameraPose,
 }
 
 /// The ten persistent camera presets and the active slot.
@@ -134,38 +145,33 @@ impl TerminalCameraSlots {
         if let Some(mode) = update.mode {
             next.mode = mode;
         }
-        if let Some(value) = update.translation.x {
-            next.pose.translation.x = value;
-        }
-        if let Some(value) = update.translation.y {
-            next.pose.translation.y = value;
-        }
-        if let Some(value) = update.translation.z {
-            next.pose.translation.z = value;
-        }
-        if let Some(value) = update.rotation_degrees.x {
-            next.pose.pitch = value.to_radians();
-        }
-        if let Some(value) = update.rotation_degrees.y {
-            next.pose.yaw = value.to_radians();
-        }
-        if let Some(value) = update.rotation_degrees.z {
-            next.pose.roll = value.to_radians();
-        }
-        if let Some(value) = update.scale {
-            match next.mode {
-                TerminalPresentationMode::Flat2d => {}
-                TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-                    if value >= MIN_ORTHOGRAPHIC_SCALE {
-                        next.pose.orthographic_scale = value;
-                    }
-                }
-                TerminalPresentationMode::Perspective3d => {
-                    if (MIN_PERSPECTIVE_FOV..=MAX_PERSPECTIVE_FOV).contains(&value) {
-                        next.pose.perspective_fov = value;
-                    }
+        apply_pose_update(&mut next.pose, update, next.mode);
+
+        let mode_changed = next.mode != current.mode;
+        let pose_changed = next.pose != current.pose;
+        if next.mode == TerminalPresentationMode::Mobius3d {
+            if mode_changed {
+                next.mobius_source = Some(TerminalMobiusSource {
+                    mode: current.mode,
+                    pose: next.pose,
+                });
+            } else {
+                let source = current.mobius_source.unwrap_or(TerminalMobiusSource {
+                    mode: TerminalPresentationMode::Plane3d,
+                    pose: current.pose,
+                });
+                let mut updated_source = source;
+                apply_pose_update(
+                    &mut updated_source.pose,
+                    update,
+                    TerminalPresentationMode::Mobius3d,
+                );
+                if pose_changed || updated_source != source {
+                    next.mobius_source = Some(updated_source);
                 }
             }
+        } else {
+            next.mobius_source = None;
         }
 
         if next == current {
@@ -181,6 +187,46 @@ impl TerminalCameraSlots {
         };
         self.presets[update.slot] = next;
         true
+    }
+}
+
+fn apply_pose_update(
+    pose: &mut TerminalCameraPose,
+    update: TerminalCameraUpdate,
+    mode: TerminalPresentationMode,
+) {
+    if let Some(value) = update.translation.x {
+        pose.translation.x = value;
+    }
+    if let Some(value) = update.translation.y {
+        pose.translation.y = value;
+    }
+    if let Some(value) = update.translation.z {
+        pose.translation.z = value;
+    }
+    if let Some(value) = update.rotation_degrees.x {
+        pose.pitch = value.to_radians();
+    }
+    if let Some(value) = update.rotation_degrees.y {
+        pose.yaw = value.to_radians();
+    }
+    if let Some(value) = update.rotation_degrees.z {
+        pose.roll = value.to_radians();
+    }
+    if let Some(value) = update.scale {
+        match mode {
+            TerminalPresentationMode::Flat2d => {}
+            TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
+                if value >= MIN_ORTHOGRAPHIC_SCALE {
+                    pose.orthographic_scale = value;
+                }
+            }
+            TerminalPresentationMode::Perspective3d => {
+                if (MIN_PERSPECTIVE_FOV..=MAX_PERSPECTIVE_FOV).contains(&value) {
+                    pose.perspective_fov = value;
+                }
+            }
+        }
     }
 }
 
@@ -281,17 +327,13 @@ pub fn apply_terminal_camera_updates(
             let next = slots.presets[update.slot];
             let mode_changed = next.mode != previous.mode;
             if update.slot == slots.active_slot() || update.activate {
+                mobius_transition.stop();
                 if next.mode == TerminalPresentationMode::Mobius3d {
-                    let source_mode = if mode_changed {
-                        previous.mode
-                    } else if mobius_transition.source_is_for(update.slot) {
-                        mobius_transition.source_mode
-                    } else {
-                        TerminalPresentationMode::Plane3d
-                    };
-                    mobius_transition.prepare_source(update.slot, source_mode, &next.pose);
-                } else if mode_changed && update.slot == slots.active_slot() {
-                    mobius_transition.stop();
+                    let source = next.mobius_source.unwrap_or(TerminalMobiusSource {
+                        mode: TerminalPresentationMode::Plane3d,
+                        pose: next.pose,
+                    });
+                    mobius_transition.prepare_source(update.slot, source.mode, &source.pose);
                 }
             }
             if mode_changed && update.slot == slots.active_slot() {
@@ -319,16 +361,17 @@ pub fn activate_terminal_camera_presets(
             interaction.reset();
             mobius_transition.stop();
             if slots.active().mode == TerminalPresentationMode::Mobius3d {
-                let source_mode = if mobius_transition.source_is_for(activation.slot) {
-                    mobius_transition.source_mode
-                } else {
-                    TerminalPresentationMode::Plane3d
-                };
-                mobius_transition.prepare_source(
-                    activation.slot,
-                    source_mode,
-                    &slots.active().pose,
-                );
+                let source = slots
+                    .active()
+                    .mobius_source
+                    .unwrap_or(TerminalMobiusSource {
+                        mode: TerminalPresentationMode::Plane3d,
+                        pose: slots.active().pose,
+                    });
+                if slots.active().mobius_source.is_none() {
+                    slots.active_mut().mobius_source = Some(source);
+                }
+                mobius_transition.prepare_source(activation.slot, source.mode, &source.pose);
             }
         }
     }
@@ -471,6 +514,137 @@ mod tests {
         assert_eq!(slots.active_slot(), 4);
         assert_eq!(slots.active().mode, TerminalPresentationMode::Perspective3d);
         assert_eq!(slots.active().pose.translation.z, 50.0);
+    }
+
+    #[test]
+    fn mobius_exit_sources_are_persistent_per_slot() {
+        let mut app = App::new();
+        app.init_resource::<TerminalCameraSlots>()
+            .init_resource::<TerminalCameraInteraction>()
+            .init_resource::<MobiusTransition>()
+            .add_message::<TerminalCameraUpdate>()
+            .add_message::<ActivateTerminalCameraPreset>()
+            .add_systems(
+                Update,
+                (
+                    apply_terminal_camera_updates,
+                    activate_terminal_camera_presets,
+                )
+                    .chain(),
+            );
+
+        let mut slot_zero = update(0);
+        slot_zero.mode = Some(TerminalPresentationMode::Mobius3d);
+        app.world_mut().write_message(slot_zero);
+        app.update();
+
+        let mut slot_one = update(1);
+        slot_one.mode = Some(TerminalPresentationMode::Perspective3d);
+        app.world_mut().write_message(slot_one);
+        app.update();
+
+        let mut slot_one = update(1);
+        slot_one.activate = true;
+        slot_one.mode = Some(TerminalPresentationMode::Mobius3d);
+        app.world_mut().write_message(slot_one);
+        app.update();
+
+        app.world_mut()
+            .write_message(ActivateTerminalCameraPreset { slot: 0 });
+        app.update();
+
+        let slots = app.world().resource::<TerminalCameraSlots>();
+        assert_eq!(slots.active_slot(), 0);
+        assert_eq!(
+            slots.active().mobius_source.expect("slot source").mode,
+            TerminalPresentationMode::Flat2d
+        );
+        let transition = app.world().resource::<MobiusTransition>();
+        assert!(transition.source_is_for(0));
+        assert_eq!(transition.source_mode, TerminalPresentationMode::Flat2d);
+    }
+
+    #[test]
+    fn protocol_updates_cancel_an_active_mobius_transition() {
+        let mut app = App::new();
+        app.init_resource::<TerminalCameraSlots>()
+            .init_resource::<TerminalCameraInteraction>()
+            .init_resource::<MobiusTransition>()
+            .add_message::<TerminalCameraUpdate>()
+            .add_message::<ActivateTerminalCameraPreset>()
+            .add_systems(Update, apply_terminal_camera_updates);
+
+        let mut enter_mobius = update(0);
+        enter_mobius.mode = Some(TerminalPresentationMode::Mobius3d);
+        app.world_mut().write_message(enter_mobius);
+        app.update();
+
+        let preset = *app.world().resource::<TerminalCameraSlots>().active();
+        let source = preset.mobius_source.expect("Mobius source");
+        app.world_mut()
+            .resource_mut::<MobiusTransition>()
+            .begin_enter(0, source.mode, &source.pose);
+
+        let mut camera_update = update(0);
+        camera_update.scale = Some(2.0);
+        app.world_mut().write_message(camera_update);
+        app.update();
+
+        let slots = app.world().resource::<TerminalCameraSlots>();
+        assert_eq!(slots.active().pose.orthographic_scale, 2.0);
+        assert_eq!(
+            slots
+                .active()
+                .mobius_source
+                .expect("Mobius source")
+                .pose
+                .orthographic_scale,
+            2.0
+        );
+        assert!(!app.world().resource::<MobiusTransition>().active);
+    }
+
+    #[test]
+    fn partial_mobius_updates_preserve_omitted_source_fields() {
+        let mut slots = TerminalCameraSlots::default();
+        let mut source = update(0);
+        source.mode = Some(TerminalPresentationMode::Plane3d);
+        source.scale = Some(0.05);
+        assert!(slots.apply_update(source));
+
+        let mut enter_mobius = update(0);
+        enter_mobius.mode = Some(TerminalPresentationMode::Mobius3d);
+        assert!(slots.apply_update(enter_mobius));
+        slots.active_mut().pose.orthographic_scale = 1.0;
+
+        let mut rotate = update(0);
+        rotate.rotation_degrees.y = Some(45.0);
+        assert!(slots.apply_update(rotate));
+
+        let source = slots.active().mobius_source.expect("Mobius source");
+        assert_eq!(source.pose.orthographic_scale, 0.05);
+        assert_eq!(source.pose.yaw, 45.0_f32.to_radians());
+    }
+
+    #[test]
+    fn mobius_updates_compare_against_the_saved_source_pose() {
+        let mut slots = TerminalCameraSlots::default();
+        let mut source = update(0);
+        source.mode = Some(TerminalPresentationMode::Plane3d);
+        source.scale = Some(0.05);
+        assert!(slots.apply_update(source));
+
+        let mut enter_mobius = update(0);
+        enter_mobius.mode = Some(TerminalPresentationMode::Mobius3d);
+        assert!(slots.apply_update(enter_mobius));
+        slots.active_mut().pose.orthographic_scale = 1.0;
+
+        let mut match_live_pose = update(0);
+        match_live_pose.scale = Some(1.0);
+        assert!(slots.apply_update(match_live_pose));
+
+        let source = slots.active().mobius_source.expect("Mobius source");
+        assert_eq!(source.pose.orthographic_scale, 1.0);
     }
 
     #[test]

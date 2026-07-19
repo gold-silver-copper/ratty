@@ -9,7 +9,10 @@ use bevy::window::{PrimaryWindow, Window};
 
 use arboard::Clipboard;
 
-use crate::camera::{ActivateTerminalCameraPreset, TerminalCameraInteraction, TerminalCameraSlots};
+use crate::camera::{
+    ActivateTerminalCameraPreset, TerminalCameraInteraction, TerminalCameraSlots,
+    TerminalMobiusSource,
+};
 use crate::config::{AppConfig, BindingAction, FontConfig, KeyBindingConfig};
 use crate::mouse::{TerminalSelection, encode_mouse_wheel};
 use crate::runtime::TerminalRuntime;
@@ -430,6 +433,7 @@ pub fn handle_keyboard_input(
                     } else {
                         TerminalPresentationMode::Plane3d
                     };
+                    preset.mobius_source = None;
                     params.camera_interaction.reset();
                     params.mobius_transition.stop();
                     params.selection.clear();
@@ -442,6 +446,7 @@ pub fn handle_keyboard_input(
                     } else {
                         TerminalPresentationMode::Perspective3d
                     };
+                    preset.mobius_source = None;
                     params.camera_interaction.reset();
                     params.mobius_transition.stop();
                     params.selection.clear();
@@ -618,6 +623,11 @@ fn toggle_mobius_presentation(
     let slot = camera_slots.active_slot();
     let preset = *camera_slots.active();
     if preset.mode == TerminalPresentationMode::Mobius3d {
+        let source = preset.mobius_source.unwrap_or(TerminalMobiusSource {
+            mode: TerminalPresentationMode::Plane3d,
+            pose: preset.pose,
+        });
+        mobius_transition.prepare_source(slot, source.mode, &source.pose);
         let current_zoom = if mobius_transition.active {
             mobius_transition.current_zoom()
         } else {
@@ -626,7 +636,12 @@ fn toggle_mobius_presentation(
         mobius_transition.begin_exit(slot, &preset.pose, current_zoom);
     } else {
         mobius_transition.begin_enter(slot, preset.mode, &preset.pose);
-        camera_slots.active_mut().mode = TerminalPresentationMode::Mobius3d;
+        let preset = camera_slots.active_mut();
+        preset.mobius_source = Some(TerminalMobiusSource {
+            mode: preset.mode,
+            pose: preset.pose,
+        });
+        preset.mode = TerminalPresentationMode::Mobius3d;
     }
     interaction.reset();
 }

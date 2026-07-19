@@ -137,7 +137,9 @@ impl Plugin for TerminalPlugin {
             .add_systems(Update, sync_inline_objects.after(TerminalRedrawSet))
             .add_systems(
                 Update,
-                animate_inline_kitty_planes.after(sync_inline_objects),
+                animate_inline_kitty_planes
+                    .after(sync_inline_objects)
+                    .after(TerminalCameraSystemSet::Transition),
             )
             .add_systems(
                 Update,

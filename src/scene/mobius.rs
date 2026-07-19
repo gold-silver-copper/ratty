@@ -2,7 +2,7 @@
 
 use bevy::prelude::*;
 
-use crate::camera::TerminalCameraPose;
+use crate::camera::{MIN_ORTHOGRAPHIC_SCALE, TerminalCameraPose};
 
 use super::TerminalPresentationMode;
 
@@ -94,7 +94,7 @@ impl MobiusTransition {
         self.elapsed_secs = 0.0;
         self.direction = MobiusTransitionDirection::Exiting;
         self.start_zoom = current_zoom;
-        self.end_zoom = self.source_zoom.max(0.1);
+        self.end_zoom = self.source_zoom.max(MIN_ORTHOGRAPHIC_SCALE);
         self.start_yaw = pose.yaw;
         self.start_pitch = pose.pitch;
         self.start_translation = pose.translation;
@@ -238,4 +238,22 @@ impl Default for MobiusTransition {
 
 fn ease_in_out(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_transition_preserves_the_minimum_protocol_zoom() {
+        let pose = TerminalCameraPose {
+            orthographic_scale: MIN_ORTHOGRAPHIC_SCALE,
+            ..TerminalCameraPose::default()
+        };
+        let mut transition = MobiusTransition::default();
+        transition.begin_enter(0, TerminalPresentationMode::Plane3d, &pose);
+        transition.begin_exit(0, &pose, 1.0);
+
+        assert_eq!(transition.end_zoom, MIN_ORTHOGRAPHIC_SCALE);
+    }
 }
