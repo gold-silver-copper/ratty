@@ -1,0 +1,49 @@
+name: GPU camera smoke
+
+on:
+  push:
+    branches: [ci/gpu-smoke]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install runtime and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libudev-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            xvfb \
+            xdotool \
+            openbox \
+            imagemagick \
+            mesa-vulkan-drivers \
+            vulkan-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Ratty and big_rat
+        run: |
+          cargo build --bin ratty
+          cargo build --manifest-path widget/Cargo.toml --example big_rat
+      - name: Exercise camera modes
+        run: bash .github/scripts/gpu-camera-smoke.sh
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-camera-smoke
+          path: smoke-artifacts
+          if-no-files-found: error
