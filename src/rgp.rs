@@ -31,14 +31,19 @@ pub struct RgpPlacementStyle {
     pub scale3: [f32; 3],
 }
 
-/// Settings for an RGP Camera.
+/// Partial camera settings parsed from a `c` command.
+///
+/// `None` fields leave the slot's stored value untouched. Every angle on the
+/// wire is degrees; `fov` is converted to radians during parsing, so nothing
+/// downstream ever handles a degree value.
 #[derive(Clone, Copy, Default)]
 pub struct RgpCameraSettings {
     /// Camera type: flat, orthographic, perspective, or Mobius.
     pub camera_type: Option<TerminalPresentationMode>,
     /// Orthographic projection scale.
     pub scale: Option<f32>,
-    /// Vertical perspective FOV in radians, converted from wire degrees.
+    /// Vertical perspective FOV in radians. The wire value is degrees and is
+    /// converted in [`consume_sequence`]; never assign a degree value here.
     pub fov: Option<f32>,
     /// Translation offset relative to the terminal plane.
     pub offset: [Option<f32>; 3],
@@ -180,6 +185,7 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
                 invalid_camera_field |= verb == "c" && scale.is_none();
             }
             "fov" => {
+                // Degrees on the wire; radians everywhere past this point.
                 fov = parse_finite_f32(value).map(f32::to_radians);
                 invalid_camera_field |= verb == "c" && fov.is_none();
             }

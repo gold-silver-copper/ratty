@@ -6,11 +6,14 @@ use crate::scene::{MobiusEnterZoomFloor, MobiusTransition, TerminalPresentationM
 
 /// Number of addressable terminal camera presets.
 pub const TERMINAL_CAMERA_SLOT_COUNT: usize = 10;
-/// Smallest valid perspective field of view in radians.
+/// Smallest valid perspective field of view in radians (about 2.87 degrees).
+/// The RGP `fov` field arrives in degrees and is converted during parsing, so
+/// every value checked against this clamp is already radians.
 pub const MIN_PERSPECTIVE_FOV: f32 = 0.05;
-/// Largest valid perspective field of view in radians.
+/// Largest valid perspective field of view in radians (about 177.13 degrees).
 pub const MAX_PERSPECTIVE_FOV: f32 = std::f32::consts::PI - 0.05;
-/// Smallest valid orthographic projection scale.
+/// Smallest valid orthographic projection scale, shared by protocol updates
+/// and interactive wheel zoom.
 pub const MIN_ORTHOGRAPHIC_SCALE: f32 = 0.01;
 
 /// Ordered camera pipeline stages with actual resource dependencies.
@@ -282,9 +285,11 @@ pub struct TerminalCameraUpdate {
     pub activate: bool,
     /// Optional presentation mode.
     pub mode: Option<TerminalPresentationMode>,
-    /// Optional orthographic scale.
+    /// Optional orthographic scale; ignored below [`MIN_ORTHOGRAPHIC_SCALE`].
     pub scale: Option<f32>,
-    /// Optional perspective FOV in radians.
+    /// Optional perspective FOV in radians — the RGP parser converts the
+    /// wire's degrees before constructing this update. Ignored outside
+    /// [`MIN_PERSPECTIVE_FOV`]`..=`[`MAX_PERSPECTIVE_FOV`].
     pub fov: Option<f32>,
     /// Optional translation components.
     pub translation: OptionalVec3,

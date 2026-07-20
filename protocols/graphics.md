@@ -228,6 +228,7 @@ must be a decimal slot number from `0` through `9`.
 
 ```text
 ESC _ ratty;g;c;id=0;set=0;type=Ortho;px=0.25;scale=1.0 ESC \
+ESC _ ratty;g;c;id=1;set=1;type=Persp;fov=50;rx=10;ry=20 ESC \
 ```
 
 - `set`: `0` or `1`; when `1`, activates the slot after applying this update.
@@ -256,7 +257,9 @@ projection value.
 Malformed or non-finite numeric values, fields without a value, invalid `id`,
 invalid `set`, and unknown `type` values cause the camera command to be
 ignored. A valid partial command still applies its other fields when `scale`
-or `fov` is numeric but outside its valid range.
+or `fov` is numeric but outside its valid range; such an out-of-range value
+also does not block `set=1` activation — the slot activates with its previous
+projection value.
 
 ## Example Session
 
@@ -276,6 +279,18 @@ Rotate it later:
 
 ```text
 ESC _ ratty;g;u;id=7;ry=180 ESC \
+```
+
+View the terminal in perspective with a 50-degree field of view:
+
+```text
+ESC _ ratty;g;c;id=0;set=1;type=Persp;fov=50;rx=10;ry=20 ESC \
+```
+
+Return to the flat terminal:
+
+```text
+ESC _ ratty;g;c;id=0;set=1;type=Flat ESC \
 ```
 
 Delete it:

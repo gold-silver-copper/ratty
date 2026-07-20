@@ -2,19 +2,19 @@
 //!
 //! These systems are scheduled from [`crate::plugin::TerminalPlugin`] in a mostly linear flow:
 //!
-//! - [`pump_pty_output`]
-//! - [`crate::keyboard::handle_keyboard_input`]
-//! - [`crate::mouse::handle_mouse_input`]
-//! - [`handle_window_resize`]
-//! - [`crate::scene::apply_terminal_presentation`]
-//! - [`apply_inline_objects`]
-//! - [`render_terminal_widget`]
-//! - [`sync_inline_objects`]
-//! - [`animate_inline_kitty_planes`]
-//! - [`sync_rgp_objects`]
-//! - [`apply_instance_brightness`]
-//! - [`animate_terminal_plane_warp`]
-//! - [`sync_asset_to_terminal_cursor`]
+//! - `pump_pty_output`
+//! - `keyboard::handle_keyboard_input`
+//! - `mouse::handle_mouse_input`
+//! - `handle_window_resize`
+//! - `scene::apply_terminal_presentation`
+//! - `apply_inline_objects`
+//! - `render_terminal_widget`
+//! - `sync_inline_objects`
+//! - `animate_inline_kitty_planes`
+//! - `sync_rgp_objects`
+//! - `apply_instance_brightness`
+//! - `animate_terminal_plane_warp`
+//! - `sync_asset_to_terminal_cursor`
 //!
 //! The redraw path updates the terminal texture and presentation state first, then the inline
 //! object systems rebuild or reposition scene entities that depend on the terminal grid.
@@ -150,7 +150,7 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 
 /// Pumps PTY output into the terminal parser.
 ///
-/// This runs early in the update schedule, before [`render_terminal_widget`]. It drains PTY output
+/// This runs early in the update schedule, before `render_terminal_widget`. It drains PTY output
 /// from [`TerminalRuntime`], feeds it through [`TerminalInlineObjects::consume_pty_output`] and
 /// requests a redraw through [`TerminalRedrawState`] when terminal state changed.
 ///
@@ -300,7 +300,7 @@ pub(crate) fn handle_window_resize(
 
 /// Applies inline object visibility for the current presentation mode.
 ///
-/// This runs after [`crate::scene::apply_terminal_presentation`] and only flips scene visibility.
+/// This runs after `scene::apply_terminal_presentation` and only flips scene visibility.
 /// [`TerminalInlineObjectSprite`] entities are shown in [`TerminalPresentationMode::Flat2d`], while
 /// [`TerminalInlineObjectPlane`] entities are shown in the 3D presentation modes.
 pub fn apply_inline_objects(
