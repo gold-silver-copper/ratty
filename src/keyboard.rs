@@ -1340,6 +1340,7 @@ mod key_code_tests {
             activate: true,
             mode: Some(TerminalPresentationMode::Mobius3d),
             scale: Some(2.5),
+            fov: None,
             translation: OptionalVec3 {
                 x: Some(12.0),
                 y: Some(-8.0),

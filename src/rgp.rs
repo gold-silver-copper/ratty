@@ -36,8 +36,10 @@ pub struct RgpPlacementStyle {
 pub struct RgpCameraSettings {
     /// Camera type: flat, orthographic, perspective, or Mobius.
     pub camera_type: Option<TerminalPresentationMode>,
-    /// Scale multiplier (FOV/Zoom depending on if orthogonal/perspective)
+    /// Orthographic projection scale.
     pub scale: Option<f32>,
+    /// Vertical perspective FOV in radians, converted from wire degrees.
+    pub fov: Option<f32>,
     /// Translation offset relative to the terminal plane.
     pub offset: [Option<f32>; 3],
     /// Rotation in degrees, ordered as pitch, yaw, and roll.
@@ -127,6 +129,7 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
     let mut height = None;
     let mut animate = None;
     let mut scale = None;
+    let mut fov = None;
     let mut depth = None;
     let mut color = None;
     let mut brightness = None;
@@ -175,6 +178,10 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
             "scale" => {
                 scale = parse_finite_f32(value);
                 invalid_camera_field |= verb == "c" && scale.is_none();
+            }
+            "fov" => {
+                fov = parse_finite_f32(value).map(f32::to_radians);
+                invalid_camera_field |= verb == "c" && fov.is_none();
             }
             "depth" => depth = value.parse().ok(),
             "color" | "tint" => color = parse_color(value),
@@ -238,6 +245,7 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
                 settings: RgpCameraSettings {
                     camera_type,
                     scale,
+                    fov,
                     offset: [px, py, pz],
                     rotation: [rx, ry, rz],
                 },
@@ -338,7 +346,7 @@ pub enum RgpOperation {
         camera_slot: u32,
         /// Activates the slot after applying the update (`set=1`, default `0`).
         switch_immediately: bool,
-        /// The partial settings: mode, scale/FOV, rotation, and offset.
+        /// The partial settings: mode, scale, FOV, rotation, and offset.
         settings: RgpCameraSettings,
     },
     /// Object placement.
@@ -405,7 +413,8 @@ mod camera_tests {
 
     #[test]
     fn parses_complete_camera_update() {
-        let operation = parse("id=9;set=1;type=Persp;scale=1.2;px=1;py=2;pz=3;rx=10;ry=20;rz=30");
+        let operation =
+            parse("id=9;set=1;type=Persp;scale=1.2;fov=90;px=1;py=2;pz=3;rx=10;ry=20;rz=30");
         let RgpOperation::Camera {
             camera_slot,
             switch_immediately,
@@ -421,6 +430,7 @@ mod camera_tests {
             Some(TerminalPresentationMode::Perspective3d)
         );
         assert_eq!(settings.scale, Some(1.2));
+        assert_eq!(settings.fov, Some(90.0_f32.to_radians()));
         assert_eq!(settings.offset, [Some(1.0), Some(2.0), Some(3.0)]);
         assert_eq!(settings.rotation, [Some(10.0), Some(20.0), Some(30.0)]);
     }
@@ -432,6 +442,7 @@ mod camera_tests {
         };
         assert_eq!(settings.camera_type, None);
         assert_eq!(settings.scale, None);
+        assert_eq!(settings.fov, None);
         assert_eq!(settings.offset, [None, Some(-4.0), None]);
         assert_eq!(settings.rotation, [None, None, None]);
     }
@@ -444,6 +455,9 @@ mod camera_tests {
             "id=0;type=FishEye",
             "id=0;set=2",
             "id=0;scale=nope",
+            "id=0;fov=nope",
+            "id=0;fov=NaN",
+            "id=0;fov",
             "id=0;px=NaN",
             "id=0;ry=inf",
             "id=0;px",

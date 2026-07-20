@@ -145,7 +145,7 @@ impl TerminalCameraSlots {
         if let Some(mode) = update.mode {
             next.mode = mode;
         }
-        apply_pose_update(&mut next.pose, update, next.mode);
+        apply_pose_update(&mut next.pose, update);
 
         let mode_changed = next.mode != current.mode;
         let pose_changed = next.pose != current.pose;
@@ -161,11 +161,7 @@ impl TerminalCameraSlots {
                     pose: current.pose,
                 });
                 let mut updated_source = source;
-                apply_pose_update(
-                    &mut updated_source.pose,
-                    update,
-                    TerminalPresentationMode::Mobius3d,
-                );
+                apply_pose_update(&mut updated_source.pose, update);
                 if pose_changed || updated_source != source {
                     next.mobius_source = Some(updated_source);
                 }
@@ -190,11 +186,7 @@ impl TerminalCameraSlots {
     }
 }
 
-fn apply_pose_update(
-    pose: &mut TerminalCameraPose,
-    update: TerminalCameraUpdate,
-    mode: TerminalPresentationMode,
-) {
+fn apply_pose_update(pose: &mut TerminalCameraPose, update: TerminalCameraUpdate) {
     if let Some(value) = update.translation.x {
         pose.translation.x = value;
     }
@@ -213,20 +205,18 @@ fn apply_pose_update(
     if let Some(value) = update.rotation_degrees.z {
         pose.roll = value.to_radians();
     }
-    if let Some(value) = update.scale {
-        match mode {
-            TerminalPresentationMode::Flat2d => {}
-            TerminalPresentationMode::Plane3d | TerminalPresentationMode::Mobius3d => {
-                if value >= MIN_ORTHOGRAPHIC_SCALE {
-                    pose.orthographic_scale = value;
-                }
-            }
-            TerminalPresentationMode::Perspective3d => {
-                if (MIN_PERSPECTIVE_FOV..=MAX_PERSPECTIVE_FOV).contains(&value) {
-                    pose.perspective_fov = value;
-                }
-            }
-        }
+    // Scale and FOV target their independently stored projection values
+    // regardless of the update's or slot's mode; out-of-range values leave
+    // the previous value in place without invalidating the rest.
+    if let Some(value) = update.scale
+        && value >= MIN_ORTHOGRAPHIC_SCALE
+    {
+        pose.orthographic_scale = value;
+    }
+    if let Some(value) = update.fov
+        && (MIN_PERSPECTIVE_FOV..=MAX_PERSPECTIVE_FOV).contains(&value)
+    {
+        pose.perspective_fov = value;
     }
 }
 
@@ -292,8 +282,10 @@ pub struct TerminalCameraUpdate {
     pub activate: bool,
     /// Optional presentation mode.
     pub mode: Option<TerminalPresentationMode>,
-    /// Optional orthographic scale or perspective FOV in radians.
+    /// Optional orthographic scale.
     pub scale: Option<f32>,
+    /// Optional perspective FOV in radians.
+    pub fov: Option<f32>,
     /// Optional translation components.
     pub translation: OptionalVec3,
     /// Optional rotation components in degrees, mapped as pitch, yaw, and roll.
@@ -437,6 +429,7 @@ mod tests {
             activate: false,
             mode: None,
             scale: None,
+            fov: None,
             translation: OptionalVec3::default(),
             rotation_degrees: OptionalVec3::default(),
         }
@@ -482,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_projection_scales_do_not_replace_the_previous_value() {
+    fn invalid_projection_values_do_not_replace_the_previous_value() {
         let mut slots = TerminalCameraSlots::default();
         let mut partial = update(0);
         partial.mode = Some(TerminalPresentationMode::Plane3d);
@@ -494,11 +487,55 @@ mod tests {
 
         let mut partial = update(0);
         partial.mode = Some(TerminalPresentationMode::Perspective3d);
-        partial.scale = Some(std::f32::consts::PI);
+        partial.fov = Some(std::f32::consts::PI);
 
         assert!(slots.apply_update(partial));
         assert_eq!(slots.active().mode, TerminalPresentationMode::Perspective3d);
         assert_eq!(slots.active().pose.perspective_fov, 1.0);
+    }
+
+    #[test]
+    fn scale_and_fov_update_their_stored_values_in_any_mode() {
+        let mut slots = TerminalCameraSlots::default();
+        let mut partial = update(0);
+        partial.scale = Some(1.5);
+        partial.fov = Some(0.9);
+
+        assert!(slots.apply_update(partial));
+        assert_eq!(slots.active().mode, TerminalPresentationMode::Flat2d);
+        assert_eq!(slots.active().pose.orthographic_scale, 1.5);
+        assert_eq!(slots.active().pose.perspective_fov, 0.9);
+
+        let mut partial = update(0);
+        partial.mode = Some(TerminalPresentationMode::Perspective3d);
+        partial.scale = Some(2.0);
+
+        assert!(slots.apply_update(partial));
+        assert_eq!(slots.active().pose.orthographic_scale, 2.0);
+        assert_eq!(slots.active().pose.perspective_fov, 0.9);
+    }
+
+    #[test]
+    fn fov_applies_only_inside_the_radian_clamp() {
+        let mut slots = TerminalCameraSlots::default();
+        let mut partial = update(0);
+        partial.fov = Some(MIN_PERSPECTIVE_FOV);
+        assert!(slots.apply_update(partial));
+        assert_eq!(slots.active().pose.perspective_fov, MIN_PERSPECTIVE_FOV);
+
+        let mut partial = update(0);
+        partial.fov = Some(MAX_PERSPECTIVE_FOV);
+        assert!(slots.apply_update(partial));
+        assert_eq!(slots.active().pose.perspective_fov, MAX_PERSPECTIVE_FOV);
+
+        let mut partial = update(0);
+        partial.fov = Some(MIN_PERSPECTIVE_FOV - 0.001);
+        assert!(!slots.apply_update(partial));
+
+        let mut partial = update(0);
+        partial.fov = Some(MAX_PERSPECTIVE_FOV + 0.001);
+        assert!(!slots.apply_update(partial));
+        assert_eq!(slots.active().pose.perspective_fov, MAX_PERSPECTIVE_FOV);
     }
 
     #[test]

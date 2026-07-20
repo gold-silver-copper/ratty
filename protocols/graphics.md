@@ -236,20 +236,27 @@ ESC _ ratty;g;c;id=0;set=0;type=Ortho;px=0.25;scale=1.0 ESC \
 Optional fields retain their previous values when omitted:
 
 - `type`: one of `Flat`, `Ortho`, `Persp`, `Mobius`.
-- `scale`: orthographic scale of at least `0.01` in `Ortho` and `Mobius`, or
-  vertical FOV in radians in `Persp`. Perspective FOV must be between `0.05`
-  and `pi - 0.05`.
-  Orthographic scale and perspective FOV are stored independently, so changing
-  `type` does not reinterpret the previous mode's projection value.
-  It is ignored in `Flat` mode and ignored when outside the valid range.
+- `scale`: orthographic projection scale of at least `0.01`. The value is used
+  when the slot presents in `Ortho` or `Mobius`.
+- `fov`: vertical perspective field of view in degrees, used when the slot
+  presents in `Persp`. The value must be strictly inside the range equivalent
+  to `0.05` through `pi - 0.05` radians (about `2.87` through `177.13`
+  degrees).
 - `px`, `py`, `pz`: horizontal pan, vertical pan, and camera dolly relative to
   the default camera position.
 - `rx`, `ry`, `rz`: pitch (X), yaw (Y), and roll (Z), in degrees.
 
+Every angle on the wire (`rx`, `ry`, `rz`, and `fov`) is expressed in degrees.
+
+Orthographic scale and perspective FOV are stored independently per slot, so
+one command may set both `scale` and `fov` regardless of the current or
+requested `type`, and changing `type` never reinterprets the other mode's
+projection value.
+
 Malformed or non-finite numeric values, fields without a value, invalid `id`,
 invalid `set`, and unknown `type` values cause the camera command to be
-ignored. A valid partial command still applies its other fields when `scale` is
-numeric but outside the valid range.
+ignored. A valid partial command still applies its other fields when `scale`
+or `fov` is numeric but outside its valid range.
 
 ## Example Session
 

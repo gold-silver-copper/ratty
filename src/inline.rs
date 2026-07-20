@@ -307,6 +307,7 @@ impl TerminalInlineObjects {
                     activate: switch_immediately,
                     mode: settings.camera_type,
                     scale: settings.scale,
+                    fov: settings.fov,
                     translation: OptionalVec3::from(settings.offset),
                     rotation_degrees: OptionalVec3::from(settings.rotation),
                 });

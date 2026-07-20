@@ -223,7 +223,7 @@ impl CameraPreset {
                 "\x1b_ratty;g;c;id=0;set=1;type=Ortho;scale=0.95;rx=8;ry=18;rz=2\x1b\\".to_string()
             }
             Self::Perspective => {
-                "\x1b_ratty;g;c;id=0;set=1;type=Persp;scale=0.85;pz=40;rx=10;ry=20;rz=2\x1b\\"
+                "\x1b_ratty;g;c;id=0;set=1;type=Persp;fov=50;pz=40;rx=10;ry=20;rz=2\x1b\\"
                     .to_string()
             }
             Self::Mobius => {
