@@ -120,23 +120,23 @@ Other useful cursor fields are:
 
 ## Key Bindings
 
-| Key                                             | Action               |
-| ----------------------------------------------- | -------------------- |
-| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>C</kbd>     | Copy selection       |
-| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd>     | Paste clipboard      |
-| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Enter</kbd> | Toggle 2D / ortho 3D |
-| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>P</kbd>     | Toggle perspective   |
-| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>M</kbd>     | Toggle Mobius mode   |
+| Key                                                            | Action               |
+| -------------------------------------------------------------- | -------------------- |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>C</kbd>                    | Copy selection       |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd>                    | Paste clipboard      |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Enter</kbd>                | Toggle 2D / ortho 3D |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>P</kbd>                    | Toggle perspective   |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>M</kbd>                    | Toggle Mobius mode   |
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>0-9</kbd> | Activate camera slot |
-| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Up</kbd>    | Increase warp        |
-| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Down</kbd>  | Decrease warp        |
-| <kbd>Alt</kbd>+<kbd>PageUp</kbd>                | Scroll one page up   |
-| <kbd>Alt</kbd>+<kbd>PageDown</kbd>              | Scroll one page down |
-| <kbd>Alt</kbd>+<kbd>Up</kbd>                    | Scroll one line up   |
-| <kbd>Alt</kbd>+<kbd>Down</kbd>                  | Scroll one line down |
-| <kbd>Ctrl</kbd>+<kbd>=</kbd>                    | Increase font size   |
-| <kbd>Ctrl</kbd>+<kbd>-</kbd>                    | Decrease font size   |
-| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>0</kbd>     | Reset font size      |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Up</kbd>                   | Increase warp        |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Down</kbd>                 | Decrease warp        |
+| <kbd>Alt</kbd>+<kbd>PageUp</kbd>                               | Scroll one page up   |
+| <kbd>Alt</kbd>+<kbd>PageDown</kbd>                             | Scroll one page down |
+| <kbd>Alt</kbd>+<kbd>Up</kbd>                                   | Scroll one line up   |
+| <kbd>Alt</kbd>+<kbd>Down</kbd>                                 | Scroll one line down |
+| <kbd>Ctrl</kbd>+<kbd>=</kbd>                                   | Increase font size   |
+| <kbd>Ctrl</kbd>+<kbd>-</kbd>                                   | Decrease font size   |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>0</kbd>                    | Reset font size      |
 
 In custom configs, `ToggleOrtho3DMode` is the current action name for the
 orthographic 3D toggle. The old `Toggle3DMode` action remains supported as a
