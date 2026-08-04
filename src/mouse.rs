@@ -6,7 +6,6 @@ use bevy::input::ButtonState;
 use bevy::input::mouse::{MouseButton, MouseButtonInput, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::window::{CursorMoved, PrimaryWindow, Window, WindowFocused};
-use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
 use crate::camera::{
     MAX_PERSPECTIVE_FOV, MIN_ORTHOGRAPHIC_SCALE, MIN_PERSPECTIVE_FOV, TerminalCameraInteraction,
@@ -16,6 +15,7 @@ use crate::config::AppConfig;
 use crate::runtime::TerminalRuntime;
 use crate::scene::{MobiusTransition, TerminalPresentationMode, TerminalViewport};
 use crate::terminal::TerminalSurface;
+use crate::vt::{self, MouseProtocolEncoding, MouseProtocolMode, VtTerminal};
 
 /// Distance in pixels the pointer must move with a pending selection to start dragging.
 const SELECTION_DRAG_THRESHOLD: f32 = 4.0;
@@ -188,10 +188,15 @@ impl TerminalSelection {
     }
 
     /// Returns the selected screen text.
-    pub fn selected_text(&self, screen: &vt100::Screen) -> Option<String> {
+    ///
+    /// Kept hand-rolled rather than delegating to rio-vt's `selection_to_string`:
+    /// ratty's selection is a plain rectangular row/column range driven by the
+    /// 3D viewport, not rio-vt's `Selection` (which models linewise and
+    /// semantic modes over absolute grid positions).
+    pub fn selected_text(&self, term: &VtTerminal) -> Option<String> {
         let bounds = self.normalized_bounds()?;
 
-        let (_, cols) = screen.size();
+        let cols = u16::try_from(term.columns()).unwrap_or(u16::MAX);
         let mut out = String::new();
 
         let start_row = bounds.start_row as u16;
@@ -207,20 +212,23 @@ impl TerminalSelection {
                 cols.saturating_sub(1)
             };
 
-            for col in row_start..=row_end {
-                let Some(cell) = screen.cell(row, col) else {
-                    continue;
-                };
-                if cell.is_wide_continuation() {
-                    continue;
-                }
+            if vt::visible_row(term, row).is_some() {
+                for col in row_start..=row_end {
+                    if usize::from(col) >= term.columns() {
+                        break;
+                    }
+                    let pos = vt::visible_pos(term, row, col);
+                    if vt::is_wide_spacer(&term.grid, pos) {
+                        continue;
+                    }
 
-                let symbol = if cell.has_contents() {
-                    cell.contents()
-                } else {
-                    " "
-                };
-                out.push_str(symbol);
+                    let before = out.len();
+                    vt::push_cell_text(&mut out, &term.grid, pos);
+                    if out.len() == before {
+                        // Blank cell: rio-vt stores it as NUL, not a space.
+                        out.push(' ');
+                    }
+                }
             }
 
             if row != end_row {
@@ -277,8 +285,8 @@ pub(crate) fn handle_mouse_input(
     };
 
     let window_size = window.resolution.size().max(Vec2::ONE);
-    let mouse_mode = runtime.parser.screen().mouse_protocol_mode();
-    let mouse_encoding = runtime.parser.screen().mouse_protocol_encoding();
+    let mouse_mode = vt::mouse_protocol_mode(&runtime.term);
+    let mouse_encoding = vt::mouse_protocol_encoding(&runtime.term);
 
     // Button releases delivered while the window is unfocused never reach the
     // handlers below, so losing focus mid-drag would otherwise leave held
@@ -516,9 +524,7 @@ pub(crate) fn handle_mouse_input(
                     mouse_encoding,
                 ));
             }
-        } else if mode == TerminalPresentationMode::Flat2d
-            && !runtime.parser.screen().alternate_screen()
-        {
+        } else if mode == TerminalPresentationMode::Flat2d && !vt::alternate_screen(&runtime.term) {
             let amount = match event.unit {
                 MouseScrollUnit::Line => {
                     app_config.terminal.mouse_scroll_lines as isize
@@ -534,10 +540,9 @@ pub(crate) fn handle_mouse_input(
             };
 
             if amount != 0 {
-                let screen = runtime.parser.screen_mut();
-                let current = screen.scrollback() as isize;
+                let current = vt::scrollback(&runtime.term) as isize;
                 let next = (current + amount).max(0) as usize;
-                screen.set_scrollback(next);
+                vt::set_scrollback(&mut runtime.term, next);
                 selection.clear();
                 redraw.request();
             }
@@ -758,5 +763,73 @@ mod wheel_zoom_tests {
         // The ordinary interactive range still behaves as before.
         assert_eq!(wheel_zoomed_orthographic_scale(1.0, 0.1), 0.9);
         assert_eq!(wheel_zoomed_orthographic_scale(3.95, -0.1), 4.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rio_vt::ansi::CursorShape;
+    use rio_vt::crosswords::{Crosswords, CrosswordsSize};
+    use rio_vt::event::WindowId;
+    use rio_vt::performer::handler::Processor;
+
+    use crate::vt::TerminalEventSink;
+
+    fn terminal(rows: u16, cols: u16, input: &str) -> VtTerminal {
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(usize::from(cols), usize::from(rows)),
+            CursorShape::Block,
+            TerminalEventSink::default(),
+            WindowId::from(0),
+            0,
+            1000,
+        );
+        Processor::default().advance(&mut term, input.as_bytes());
+        term
+    }
+
+    fn select(start: (u32, u32), end: (u32, u32)) -> TerminalSelection {
+        let mut selection = TerminalSelection::default();
+        selection.begin(UVec2::new(start.0, start.1));
+        selection.update(UVec2::new(end.0, end.1));
+        selection
+    }
+
+    #[test]
+    fn selection_returns_the_drawn_text() {
+        let term = terminal(3, 20, "hello world");
+        let selection = select((0, 0), (10, 0));
+        assert_eq!(
+            selection.selected_text(&term).as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn selection_spans_multiple_rows() {
+        let term = terminal(3, 20, "first\r\nsecond");
+        let selection = select((0, 0), (5, 1));
+        assert_eq!(
+            selection.selected_text(&term).as_deref(),
+            Some("first\nsecond")
+        );
+    }
+
+    #[test]
+    fn selection_preserves_wide_characters_and_combining_marks() {
+        let term = terminal(3, 20, "你好e\u{0301}z");
+        let selection = select((0, 0), (5, 0));
+        assert_eq!(
+            selection.selected_text(&term).as_deref(),
+            Some("你好e\u{0301}z")
+        );
+    }
+
+    #[test]
+    fn selection_without_a_drag_is_empty() {
+        let term = terminal(3, 20, "hello");
+        assert_eq!(TerminalSelection::default().selected_text(&term), None);
     }
 }

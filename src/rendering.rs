@@ -2,8 +2,12 @@
 
 use bevy::prelude::*;
 use bevy::render::render_resource::Extent3d;
+use rio_vt::crosswords::pos::Column;
+use rio_vt::crosswords::square::Wide;
+use rio_vt::crosswords::style::StyleFlags;
 
 use crate::terminal::TerminalSurface;
+use crate::vt::{self, CellColor, VtTerminal};
 
 type Rgba = [u8; 4];
 const DEBUG_BG: Rgba = [18, 20, 28, 255];
@@ -17,7 +21,7 @@ const DEBUG_BG_FALLBACK: Rgba = [31, 31, 40, 255];
 pub fn sync_terminal_debug_image(
     terminal: &TerminalSurface,
     images: &mut Assets<Image>,
-    screen: &vt100::Screen,
+    term: &VtTerminal,
 ) {
     let Some(handle) = terminal.back_image_handle.as_ref() else {
         return;
@@ -42,7 +46,7 @@ pub fn sync_terminal_debug_image(
         data.resize(rgba_len, 0);
     }
 
-    CellDebugImageRenderer::new(data, width, height, terminal.cols, terminal.rows).render(screen);
+    CellDebugImageRenderer::new(data, width, height, terminal.cols, terminal.rows).render(term);
 }
 
 /// Synchronizes an image handle across plane materials.
@@ -99,22 +103,40 @@ impl<'a> CellDebugImageRenderer<'a> {
         }
     }
 
-    fn render(&mut self, screen: &vt100::Screen) {
+    fn render(&mut self, term: &VtTerminal) {
         self.fill(DEBUG_BG);
 
+        let styles = vt::styles(term);
+        let columns = term.columns();
+        let mut text = String::new();
+
         for row in 0..self.rows {
+            let grid_row = u16::try_from(row)
+                .ok()
+                .and_then(|row| vt::visible_row(term, row));
+
             for col in 0..self.cols {
                 let rect = self.cell_rect(row, col);
                 self.draw_rect(rect, DEBUG_GRID);
                 self.draw_rect_outline(rect, DEBUG_GRID_OUTLINE);
 
-                let Some(cell) = screen.cell(row as u16, col as u16) else {
+                let Some(grid_row) = grid_row else {
                     continue;
                 };
+                if col as usize >= columns {
+                    continue;
+                }
+                let square = grid_row[Column(col as usize)];
 
-                let bg = vt100_debug_color(cell.bgcolor()).unwrap_or(DEBUG_BG_FALLBACK);
-                let fg = vt100_debug_color(cell.fgcolor()).unwrap_or(DEBUG_FG_FALLBACK);
-                let active = cell.has_contents() && !cell.is_wide_continuation();
+                let (fg, bg, flags) = vt::cell_attributes(styles, square);
+                let bg = debug_color(bg).unwrap_or(DEBUG_BG_FALLBACK);
+                let fg = debug_color(fg).unwrap_or(DEBUG_FG_FALLBACK);
+
+                text.clear();
+                if let (Ok(row), Ok(col)) = (u16::try_from(row), u16::try_from(col)) {
+                    vt::push_cell_text(&mut text, &term.grid, vt::visible_pos(term, row, col));
+                }
+                let active = !text.is_empty() && !matches!(square.wide(), Wide::Spacer);
                 let fill = if active {
                     bg
                 } else {
@@ -129,7 +151,7 @@ impl<'a> CellDebugImageRenderer<'a> {
                     self.draw_rect(indicator, fg);
                 }
 
-                if cell.underline() {
+                if flags.intersects(StyleFlags::ALL_UNDERLINES) {
                     let underline = CellRect {
                         x0: rect.x0.saturating_add(2),
                         y0: rect.y1.saturating_sub(2),
@@ -139,16 +161,16 @@ impl<'a> CellDebugImageRenderer<'a> {
                     self.draw_rect(underline, fg);
                 }
 
-                if cell.bold() {
+                if flags.contains(StyleFlags::BOLD) {
                     self.draw_rect_outline(rect.inset(1), [255, 255, 255, 90]);
                 }
             }
         }
 
-        if !screen.hide_cursor() {
-            let (cursor_row, cursor_col) = screen.cursor_position();
+        if !vt::cursor_hidden(term) {
+            let (cursor_row, cursor_col) = vt::cursor_position(term);
             self.draw_rect_outline(
-                self.cell_rect(cursor_row as u32, cursor_col as u32),
+                self.cell_rect(u32::from(cursor_row), u32::from(cursor_col)),
                 DEBUG_CURSOR,
             );
         }
@@ -284,11 +306,11 @@ fn blend_rgba(top: Rgba, bottom: Rgba, top_mix: f32) -> Rgba {
     ]
 }
 
-fn vt100_debug_color(color: vt100::Color) -> Option<Rgba> {
+fn debug_color(color: CellColor) -> Option<Rgba> {
     match color {
-        vt100::Color::Default => None,
-        vt100::Color::Idx(index) => Some(ansi_index_to_rgba(index)),
-        vt100::Color::Rgb(r, g, b) => Some([r, g, b, 255]),
+        CellColor::Default => None,
+        CellColor::Indexed(index) => Some(ansi_index_to_rgba(index)),
+        CellColor::Rgb(r, g, b) => Some([r, g, b, 255]),
     }
 }
 
