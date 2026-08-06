@@ -5,6 +5,7 @@ use bevy::prelude::*;
 use bevy::shader::Shader;
 use bevy::sprite_render::Material2dPlugin;
 
+use crate::bitmap::BitmapLimits;
 use crate::bitmap_material::{BITMAP_SURFACE_SHADER, BitmapSurfaceMaterial};
 use crate::camera::{
     ActivateTerminalCameraPreset, TerminalCameraSlots, TerminalCameraSystemSet,
@@ -47,14 +48,20 @@ pub struct TerminalPlugin;
 
 impl Plugin for TerminalPlugin {
     fn build(&self, app: &mut App) {
+        let bitmap_limits = app
+            .world()
+            .get_resource::<AppConfig>()
+            .map_or_else(BitmapLimits::default, |config| {
+                BitmapLimits::from(&config.bitmap)
+            });
         load_internal_asset!(
             app,
             BITMAP_SURFACE_SHADER,
             "shaders/bitmap_surface.wgsl",
             Shader::from_wgsl
         );
-        app.init_resource::<TerminalSelection>()
-            .init_resource::<TerminalInlineObjects>()
+        app.insert_resource(TerminalInlineObjects::with_bitmap_limits(bitmap_limits))
+            .init_resource::<TerminalSelection>()
             .init_resource::<TerminalRedrawState>()
             .init_resource::<TerminalKeyBindings>()
             .init_resource::<TerminalFrameDirty>()

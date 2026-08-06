@@ -129,6 +129,13 @@ pub struct TerminalInlineObjects {
 }
 
 impl TerminalInlineObjects {
+    pub(crate) fn with_bitmap_limits(limits: crate::bitmap::BitmapLimits) -> Self {
+        Self {
+            bitmap: BitmapSurfaceState::with_limits(limits),
+            ..Self::default()
+        }
+    }
+
     /// Consumes PTY output and extracts inline object control sequences.
     pub fn consume_pty_output(
         &mut self,

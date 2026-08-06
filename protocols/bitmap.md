@@ -37,6 +37,22 @@ through the next `ESC \` or C1 ST without retaining or displaying them, then
 resumes normal terminal parsing after the terminator. This bound applies only
 to the `ratty;i` namespace; it does not change RGP or Kitty limits.
 
+Ratty also applies configurable resource limits before PNG decoding and while
+retaining protocol state. The distributed defaults are:
+
+- maximum image width and height: 8192 pixels each
+- maximum decoded RGBA8 bytes per bitmap: 64 MiB
+- maximum decoded RGBA8 bytes across all registered bitmaps: 256 MiB
+- maximum decoded payload bytes across incomplete registrations and frames: 64 MiB
+- maximum concurrent incomplete registrations and frames: 16
+
+PNG decoding receives the configured dimension and allocation limits directly.
+Ratty also calculates `width * height * 4` with checked arithmetic before
+accepting a decoded bitmap. Exceeding any limit rejects the operation instead
+of evicting unrelated existing bitmaps or transfers. Registered-byte accounting
+remains active after pixel data is uploaded to the GPU and is released when the
+bitmap is deleted.
+
 Bitmap IDs, placement IDs, sequence numbers, source coordinates, and dimensions
 are unsigned decimal `u32` values on the wire. Destination `row` and `col` are
 unsigned decimal values limited to the `u16` range `0..=65535`. A bitmap ID is
@@ -126,8 +142,9 @@ decoded bytes while `more=1`.
 once, creates the bitmap, and clears the pending transfer. The bitmap becomes
 visible to placement commands only after successful finalization.
 
-A pending registration may contain at most 64 MiB of decoded payload bytes. If
-a chunk would exceed that limit, Ratty rejects the chunk and discards the whole
+A pending registration may contain at most 64 MiB of decoded payload bytes,
+subject to the configured aggregate pending-byte and transfer-count budgets. If
+a chunk would exceed a limit, Ratty rejects the chunk and discards the affected
 pending registration. An invalid PNG on finalization also clears the pending
 transfer and does not register a bitmap. Other malformed chunks make no state
 change.
