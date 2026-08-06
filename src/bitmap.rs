@@ -1,9 +1,11 @@
 //! Ratty Bitmap Surface protocol parsing.
 
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, io::Cursor};
 
 use base64::Engine as _;
 use bevy::prelude::{Handle, Image};
+
+use crate::config::BitmapConfig;
 
 /// Ratty Bitmap Surface APC prefix.
 pub const BITMAP_APC_START: &[u8] = b"\x1b_ratty;i;";
@@ -677,6 +679,7 @@ fn estimated_decoded_payload_len(payload: &str) -> Option<usize> {
 pub struct RegisteredBitmap {
     width: u32,
     height: u32,
+    decoded_bytes: u64,
     rgba: Vec<u8>,
     handle: Option<Handle<Image>>,
 }
@@ -796,19 +799,67 @@ struct PendingBitmapFrame {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BitmapLimits {
+    pub(crate) max_image_width: u32,
+    pub(crate) max_image_height: u32,
+    pub(crate) max_bitmap_bytes: u64,
+    pub(crate) max_total_bitmap_bytes: u64,
+    pub(crate) max_pending_bytes: u64,
+    pub(crate) max_pending_transfers: usize,
+}
+
+impl Default for BitmapLimits {
+    fn default() -> Self {
+        Self::from(&BitmapConfig::default())
+    }
+}
+
+impl BitmapLimits {
+    fn decoder_limits(self) -> image::Limits {
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(self.max_image_width);
+        limits.max_image_height = Some(self.max_image_height);
+        limits.max_alloc = Some(self.max_bitmap_bytes);
+        limits
+    }
+}
+
+impl From<&BitmapConfig> for BitmapLimits {
+    fn from(config: &BitmapConfig) -> Self {
+        Self {
+            max_image_width: config.max_image_width,
+            max_image_height: config.max_image_height,
+            max_bitmap_bytes: config.max_bitmap_bytes,
+            max_total_bitmap_bytes: config.max_total_bitmap_bytes,
+            max_pending_bytes: config.max_pending_bytes,
+            max_pending_transfers: config.max_pending_transfers,
+        }
+    }
+}
+
 /// In-memory lifecycle state for registered bitmaps, frames, and placements.
 #[derive(Default)]
 pub struct BitmapSurfaceState {
+    limits: BitmapLimits,
     pending_registrations: HashMap<u32, PendingBitmapTransfer>,
     pending_frames: HashMap<u32, PendingBitmapFrame>,
     bitmaps: HashMap<u32, RegisteredBitmap>,
     placements: HashMap<u32, BitmapPlacementState>,
     latest_frame_sequences: HashMap<u32, u32>,
     next_placement_generation: u64,
+    resident_bitmap_bytes: u64,
     dirty: bool,
 }
 
 impl BitmapSurfaceState {
+    pub(crate) fn with_limits(limits: BitmapLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     /// Parses and applies one complete bitmap APC sequence, including parser-directed cleanup.
     pub(crate) fn consume_and_apply(
         &mut self,
@@ -930,6 +981,7 @@ impl BitmapSurfaceState {
         }
 
         let bitmap_id = chunk.bitmap_id;
+        let had_pending = self.pending_registrations.contains_key(&bitmap_id);
         let mut pending = match self.pending_registrations.remove(&bitmap_id) {
             Some(pending) => {
                 if chunk
@@ -972,7 +1024,7 @@ impl BitmapSurfaceState {
             },
         };
 
-        pending
+        let new_len = pending
             .data
             .len()
             .checked_add(chunk.data.len())
@@ -980,6 +1032,7 @@ impl BitmapSurfaceState {
             .ok_or_else(|| {
                 BitmapProtocolError::new("bitmap registration payload exceeds 64 MiB")
             })?;
+        self.ensure_pending_budget(new_len, chunk.more && !had_pending)?;
         pending.data.extend_from_slice(&chunk.data);
 
         if chunk.more {
@@ -987,19 +1040,50 @@ impl BitmapSurfaceState {
             return Ok(());
         }
 
-        let decoded = image::load_from_memory_with_format(&pending.data, image::ImageFormat::Png)
-            .map_err(|_| BitmapProtocolError::new("invalid PNG bitmap payload"))?
+        let decoder_limits = self.limits.decoder_limits();
+        let mut dimension_reader =
+            image::ImageReader::with_format(Cursor::new(&pending.data), image::ImageFormat::Png);
+        dimension_reader.limits(decoder_limits.clone());
+        let (width, height) = dimension_reader
+            .into_dimensions()
+            .map_err(|_| BitmapProtocolError::new("invalid or oversized PNG bitmap payload"))?;
+        let decoded_bytes = decoded_rgba_bytes(width, height)?;
+        if decoded_bytes > self.limits.max_bitmap_bytes {
+            return Err(BitmapProtocolError::new(
+                "decoded bitmap exceeds the per-bitmap byte limit",
+            ));
+        }
+        let next_resident_bytes = self
+            .resident_bitmap_bytes
+            .checked_add(decoded_bytes)
+            .filter(|bytes| *bytes <= self.limits.max_total_bitmap_bytes)
+            .ok_or_else(|| {
+                BitmapProtocolError::new("decoded bitmap exceeds the total bitmap byte budget")
+            })?;
+
+        let mut reader =
+            image::ImageReader::with_format(Cursor::new(&pending.data), image::ImageFormat::Png);
+        reader.limits(decoder_limits);
+        let decoded = reader
+            .decode()
+            .map_err(|_| BitmapProtocolError::new("invalid or oversized PNG bitmap payload"))?
             .to_rgba8();
-        let (width, height) = decoded.dimensions();
+        if u64::try_from(decoded.as_raw().len()).ok() != Some(decoded_bytes) {
+            return Err(BitmapProtocolError::new(
+                "decoded bitmap byte length does not match its dimensions",
+            ));
+        }
         self.bitmaps.insert(
             bitmap_id,
             RegisteredBitmap {
                 width,
                 height,
+                decoded_bytes,
                 rgba: decoded.into_raw(),
                 handle: None,
             },
         );
+        self.resident_bitmap_bytes = next_resident_bytes;
         self.dirty = true;
         Ok(())
     }
@@ -1111,6 +1195,7 @@ impl BitmapSurfaceState {
         }
 
         let bitmap_id = chunk.bitmap_id;
+        let had_pending = self.pending_frames.contains_key(&bitmap_id);
         let mut pending = match self.pending_frames.remove(&bitmap_id) {
             Some(pending) if chunk.sequence < pending.sequence => {
                 self.pending_frames.insert(bitmap_id, pending);
@@ -1148,6 +1233,7 @@ impl BitmapSurfaceState {
                 ));
             }
         };
+        self.ensure_pending_budget(new_len, chunk.more && !had_pending)?;
         pending.data.reserve(new_len - pending.data.len());
         pending.data.extend_from_slice(&chunk.data);
         if chunk.more {
@@ -1177,11 +1263,43 @@ impl BitmapSurfaceState {
         self.pending_registrations.remove(&bitmap_id);
         self.pending_frames.remove(&bitmap_id);
         self.latest_frame_sequences.remove(&bitmap_id);
-        if self.bitmaps.remove(&bitmap_id).is_some() {
+        if let Some(bitmap) = self.bitmaps.remove(&bitmap_id) {
+            self.resident_bitmap_bytes -= bitmap.decoded_bytes;
             self.placements
                 .retain(|_, placement| placement.bitmap_id != bitmap_id);
             self.dirty = true;
         }
+    }
+
+    fn ensure_pending_budget(
+        &self,
+        transfer_bytes: usize,
+        adds_transfer: bool,
+    ) -> Result<(), BitmapProtocolError> {
+        let transfer_bytes = u64::try_from(transfer_bytes)
+            .map_err(|_| BitmapProtocolError::new("pending bitmap byte count overflow"))?;
+        self.pending_registrations
+            .values()
+            .map(|pending| pending.data.len())
+            .chain(
+                self.pending_frames
+                    .values()
+                    .map(|pending| pending.data.len()),
+            )
+            .try_fold(transfer_bytes, |total, bytes| {
+                let bytes = u64::try_from(bytes).ok()?;
+                total.checked_add(bytes)
+            })
+            .filter(|total| *total <= self.limits.max_pending_bytes)
+            .ok_or_else(|| BitmapProtocolError::new("pending bitmap byte budget exceeded"))?;
+
+        self.pending_registrations
+            .len()
+            .checked_add(self.pending_frames.len())
+            .and_then(|total| total.checked_add(usize::from(adds_transfer)))
+            .filter(|total| *total <= self.limits.max_pending_transfers)
+            .ok_or_else(|| BitmapProtocolError::new("pending bitmap transfer limit exceeded"))?;
+        Ok(())
     }
 
     fn apply_error_cleanup(&mut self, error: &BitmapProtocolError) {
@@ -1218,6 +1336,13 @@ impl BitmapSurfaceState {
             self.pending_frames.remove(bitmap_id);
         }
     }
+}
+
+fn decoded_rgba_bytes(width: u32, height: u32) -> Result<u64, BitmapProtocolError> {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| BitmapProtocolError::new("decoded bitmap dimensions overflow"))
 }
 
 fn new_pending_frame(
@@ -2333,5 +2458,95 @@ mod tests {
             .apply(registration_continuation(42, &PNG_2X2[20..], false))
             .expect("pending registration should still be completable");
         assert!(state.bitmap(42).is_some());
+    }
+
+    #[test]
+    fn rejects_png_dimensions_above_configured_limit() {
+        let mut state = BitmapSurfaceState::with_limits(BitmapLimits {
+            max_image_width: 1,
+            ..BitmapLimits::default()
+        });
+
+        assert!(state.apply(register_chunk(1, PNG_2X2, false)).is_err());
+        assert!(state.bitmap(1).is_none());
+
+        let mut state = BitmapSurfaceState::with_limits(BitmapLimits {
+            max_image_height: 1,
+            ..BitmapLimits::default()
+        });
+        assert!(state.apply(register_chunk(2, PNG_2X2, false)).is_err());
+        assert!(state.bitmap(2).is_none());
+    }
+
+    #[test]
+    fn rejects_png_above_configured_decoded_byte_limit() {
+        let mut state = BitmapSurfaceState::with_limits(BitmapLimits {
+            max_bitmap_bytes: 15,
+            ..BitmapLimits::default()
+        });
+
+        assert!(state.apply(register_chunk(1, PNG_2X2, false)).is_err());
+        assert!(state.bitmap(1).is_none());
+    }
+
+    #[test]
+    fn resident_budget_survives_upload_and_recovers_after_delete() {
+        let mut state = BitmapSurfaceState::with_limits(BitmapLimits {
+            max_total_bitmap_bytes: 16,
+            ..BitmapLimits::default()
+        });
+        state
+            .apply(register_chunk(1, PNG_2X2, false))
+            .expect("first bitmap should fit the resident budget");
+        assert!(
+            state
+                .bitmap_mut(1)
+                .expect("registered bitmap")
+                .take_pending_rgba()
+                .is_some()
+        );
+
+        assert!(state.apply(register_chunk(2, PNG_2X2, false)).is_err());
+        assert!(state.bitmap(2).is_none());
+
+        state
+            .apply(BitmapOperation::DeleteBitmap(1))
+            .expect("bitmap deletion should release its resident budget");
+        state
+            .apply(register_chunk(2, PNG_2X2, false))
+            .expect("released resident budget should be reusable");
+    }
+
+    #[test]
+    fn pending_byte_budget_is_shared_across_registrations_and_frames() {
+        let mut state = registered_state();
+        state.limits.max_pending_bytes = 7;
+        state
+            .apply(frame_chunk(1, 1, &[1; 4], true))
+            .expect("first pending frame should fit the byte budget");
+
+        assert!(state.apply(register_chunk(2, &[2; 4], true)).is_err());
+        assert!(!state.pending_registrations.contains_key(&2));
+        assert!(state.pending_frames.contains_key(&1));
+    }
+
+    #[test]
+    fn pending_transfer_cap_is_shared_and_recovers_after_completion() {
+        let mut state = registered_state();
+        state.limits.max_pending_transfers = 2;
+        state
+            .apply(frame_chunk(1, 1, &[1; 4], true))
+            .expect("first pending transfer should fit");
+        state
+            .apply(register_chunk(2, &[2; 4], true))
+            .expect("second pending transfer should fit");
+
+        assert!(state.apply(register_chunk(3, &[3; 4], true)).is_err());
+        state
+            .apply(frame_continuation(1, 1, &[1; 12], false))
+            .expect("completing a frame should release one transfer slot");
+        state
+            .apply(register_chunk(3, &[3; 4], true))
+            .expect("released transfer slot should be reusable");
     }
 }

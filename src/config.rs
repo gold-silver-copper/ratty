@@ -30,6 +30,8 @@ pub struct AppConfig {
     pub window: WindowConfig,
     /// Terminal grid settings.
     pub terminal: TerminalConfig,
+    /// Bitmap surface resource limits.
+    pub bitmap: BitmapConfig,
     /// Shell spawning settings.
     pub shell: ShellConfig,
     /// Extra environment variables.
@@ -42,6 +44,37 @@ pub struct AppConfig {
     pub theme: ThemeConfig,
     /// Cursor settings.
     pub cursor: CursorConfig,
+}
+
+/// Bitmap surface resource limits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BitmapConfig {
+    /// Maximum decoded bitmap width in pixels.
+    pub max_image_width: u32,
+    /// Maximum decoded bitmap height in pixels.
+    pub max_image_height: u32,
+    /// Maximum decoded bytes owned by one bitmap.
+    pub max_bitmap_bytes: u64,
+    /// Maximum decoded bytes owned by all registered bitmaps.
+    pub max_total_bitmap_bytes: u64,
+    /// Maximum decoded payload bytes retained across incomplete transfers.
+    pub max_pending_bytes: u64,
+    /// Maximum number of incomplete registrations and frames.
+    pub max_pending_transfers: usize,
+}
+
+impl Default for BitmapConfig {
+    fn default() -> Self {
+        Self {
+            max_image_width: 8_192,
+            max_image_height: 8_192,
+            max_bitmap_bytes: 64 * 1024 * 1024,
+            max_total_bitmap_bytes: 256 * 1024 * 1024,
+            max_pending_bytes: 64 * 1024 * 1024,
+            max_pending_transfers: 16,
+        }
+    }
 }
 
 impl AppConfig {
@@ -613,5 +646,28 @@ action = "Toggle3DMode"
             .collect::<Vec<_>>();
         slots.sort_unstable();
         assert_eq!(slots, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn parses_bitmap_resource_limits() {
+        let config: AppConfig = toml::from_str(
+            r#"
+[bitmap]
+max_image_width = 1024
+max_image_height = 768
+max_bitmap_bytes = 4194304
+max_total_bitmap_bytes = 16777216
+max_pending_bytes = 2097152
+max_pending_transfers = 3
+"#,
+        )
+        .expect("bitmap resource limits should deserialize");
+
+        assert_eq!(config.bitmap.max_image_width, 1024);
+        assert_eq!(config.bitmap.max_image_height, 768);
+        assert_eq!(config.bitmap.max_bitmap_bytes, 4_194_304);
+        assert_eq!(config.bitmap.max_total_bitmap_bytes, 16_777_216);
+        assert_eq!(config.bitmap.max_pending_bytes, 2_097_152);
+        assert_eq!(config.bitmap.max_pending_transfers, 3);
     }
 }
