@@ -5,7 +5,7 @@ use std::path::Path;
 
 use bevy::prelude::*;
 
-use crate::bitmap::{BitmapSurfaceState, MAX_BITMAP_APC_BYTES};
+use crate::bitmap::{BitmapLimits, BitmapSurfaceState, MAX_BITMAP_APC_BYTES};
 use crate::bitmap_material::{BitmapSurfaceMaterial, BitmapSurfaceUniform};
 use crate::camera::{OptionalVec3, TerminalCameraUpdate};
 use crate::kitty::{KittyOperation, KittyParserState, refresh_kitty_placeholder_anchors};
@@ -129,9 +129,10 @@ pub struct TerminalInlineObjects {
 }
 
 impl TerminalInlineObjects {
-    pub(crate) fn with_bitmap_limits(limits: crate::bitmap::BitmapLimits) -> Self {
+    pub(crate) fn with_bitmap_limits(limits: BitmapLimits) -> Self {
         Self {
             bitmap: BitmapSurfaceState::with_limits(limits),
+            kitty: KittyParserState::with_limits(limits),
             ..Self::default()
         }
     }
@@ -419,8 +420,8 @@ impl TerminalInlineObjects {
                 quiet,
             } => {
                 let reply = match result {
-                    Ok(()) if quiet == 1 => None,
-                    Err(_) if quiet == 2 => None,
+                    Ok(()) if quiet >= 1 => None,
+                    Err(_) if quiet >= 2 => None,
                     Ok(()) => Some(format!("\x1b_Gi={image_id};OK\x1b\\").into_bytes()),
                     Err(error) => {
                         Some(format!("\x1b_Gi={image_id};EINVAL:{error}\x1b\\").into_bytes())
@@ -972,9 +973,15 @@ mod tests {
             b"\x1b_Gi=9,s=2,v=2,a=q,t=d,f=24,q=2;AAAA\x1b\\",
             &mut parser,
         );
+        let fully_quiet_ok_replies = consume(
+            &mut objects,
+            b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24,q=2;AAAA\x1b\\",
+            &mut parser,
+        );
 
         assert!(ok_replies.is_empty());
         assert!(error_replies.is_empty());
+        assert!(fully_quiet_ok_replies.is_empty());
         assert!(objects.objects.is_empty());
         assert!(objects.anchors.is_empty());
     }

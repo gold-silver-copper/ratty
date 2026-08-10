@@ -280,9 +280,10 @@ stable image and placement state, and rendering. The application owns capture,
 network transport, codec choices such as VP8, and decoding compressed video to
 RGBA8 before sending frames to Ratty.
 
-The `[bitmap]` configuration section bounds image dimensions, bytes per decoded
-bitmap, total decoded bytes across registered bitmaps, retained bytes across
-incomplete transfers, and the number of concurrent incomplete transfers. See
+The `[bitmap]` configuration section bounds registered bitmap and placement
+counts, image dimensions, bytes per decoded bitmap, total decoded bytes across
+registered bitmaps, retained bytes across incomplete transfers, and the number
+of concurrent incomplete transfers. See
 [`config/ratty.toml`](config/ratty.toml) for the default limits.
 
 Current v1 boundaries:

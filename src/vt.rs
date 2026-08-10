@@ -63,10 +63,12 @@ impl EventListener for TerminalEventSink {
             // invoke and write back. Ratty answers none of them yet, so an
             // application that queries with a timeout waits it out:
             //   ColorRequest        OSC 4/10/11/12 palette queries
-            //   TextAreaSizeRequest CSI 14t/16t/18t pixel-geometry queries
+            //   TextAreaSizeRequest CSI 14t and XTSMGRAPHICS pixel-area queries
             //   ClipboardLoad       OSC 52 clipboard read
-            // Answering them needs, respectively, ratty's theme, its cell
-            // metrics, and a clipboard-read policy.
+            // Answering them needs, respectively, ratty's theme, its window
+            // texture dimensions, and a clipboard-read policy. Rio answers
+            // CSI 16t from the cell metrics supplied during resize and CSI 18t
+            // from the grid dimensions without an embedder callback.
             RioEvent::ColorRequest(..)
             | RioEvent::TextAreaSizeRequest(..)
             | RioEvent::ClipboardLoad(..) => {}

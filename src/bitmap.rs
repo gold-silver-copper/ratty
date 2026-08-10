@@ -801,6 +801,8 @@ struct PendingBitmapFrame {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BitmapLimits {
+    pub(crate) max_bitmaps: usize,
+    pub(crate) max_placements: usize,
     pub(crate) max_image_width: u32,
     pub(crate) max_image_height: u32,
     pub(crate) max_bitmap_bytes: u64,
@@ -816,7 +818,7 @@ impl Default for BitmapLimits {
 }
 
 impl BitmapLimits {
-    fn decoder_limits(self) -> image::Limits {
+    pub(crate) fn decoder_limits(self) -> image::Limits {
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(self.max_image_width);
         limits.max_image_height = Some(self.max_image_height);
@@ -828,6 +830,8 @@ impl BitmapLimits {
 impl From<&BitmapConfig> for BitmapLimits {
     fn from(config: &BitmapConfig) -> Self {
         Self {
+            max_bitmaps: config.max_bitmaps,
+            max_placements: config.max_placements,
             max_image_width: config.max_image_width,
             max_image_height: config.max_image_height,
             max_bitmap_bytes: config.max_bitmap_bytes,
@@ -982,6 +986,11 @@ impl BitmapSurfaceState {
 
         let bitmap_id = chunk.bitmap_id;
         let had_pending = self.pending_registrations.contains_key(&bitmap_id);
+        if !had_pending && self.bitmaps.len() >= self.limits.max_bitmaps {
+            return Err(BitmapProtocolError::new(
+                "registered bitmap count limit exceeded",
+            ));
+        }
         let mut pending = match self.pending_registrations.remove(&bitmap_id) {
             Some(pending) => {
                 if chunk
@@ -1039,6 +1048,11 @@ impl BitmapSurfaceState {
             self.pending_registrations.insert(bitmap_id, pending);
             return Ok(());
         }
+        if self.bitmaps.len() >= self.limits.max_bitmaps {
+            return Err(BitmapProtocolError::new(
+                "registered bitmap count limit exceeded",
+            ));
+        }
 
         let decoder_limits = self.limits.decoder_limits();
         let mut dimension_reader =
@@ -1091,6 +1105,11 @@ impl BitmapSurfaceState {
     fn apply_placement(&mut self, placement: BitmapPlacement) -> Result<(), BitmapProtocolError> {
         if self.placements.contains_key(&placement.placement_id) {
             return Err(BitmapProtocolError::new("placement ID is already in use"));
+        }
+        if self.placements.len() >= self.limits.max_placements {
+            return Err(BitmapProtocolError::new(
+                "bitmap placement count limit exceeded",
+            ));
         }
         let bitmap = self
             .bitmaps
@@ -2515,6 +2534,51 @@ mod tests {
         state
             .apply(register_chunk(2, PNG_2X2, false))
             .expect("released resident budget should be reusable");
+    }
+
+    #[test]
+    fn bitmap_count_limit_recovers_after_delete() {
+        let mut state = BitmapSurfaceState::with_limits(BitmapLimits {
+            max_bitmaps: 1,
+            ..BitmapLimits::default()
+        });
+        state
+            .apply(register_chunk(1, PNG_2X2, false))
+            .expect("first bitmap should fit the count limit");
+
+        assert!(state.apply(register_chunk(2, PNG_2X2, false)).is_err());
+        assert!(state.bitmap(2).is_none());
+
+        state
+            .apply(BitmapOperation::DeleteBitmap(1))
+            .expect("bitmap deletion should release the count limit");
+        state
+            .apply(register_chunk(2, PNG_2X2, false))
+            .expect("released bitmap slot should be reusable");
+    }
+
+    #[test]
+    fn placement_count_limit_recovers_after_delete() {
+        let mut state = BitmapSurfaceState::with_limits(BitmapLimits {
+            max_placements: 1,
+            ..BitmapLimits::default()
+        });
+        state
+            .apply(register_chunk(1, PNG_2X2, false))
+            .expect("bitmap registration should succeed");
+        state
+            .apply(placement(1, 1))
+            .expect("first placement should fit the count limit");
+
+        assert!(state.apply(placement(1, 2)).is_err());
+        assert!(state.placement(2).is_none());
+
+        state
+            .apply(BitmapOperation::DeletePlacement(1))
+            .expect("placement deletion should release the count limit");
+        state
+            .apply(placement(1, 2))
+            .expect("released placement slot should be reusable");
     }
 
     #[test]

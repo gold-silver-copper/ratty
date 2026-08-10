@@ -136,7 +136,14 @@ impl TerminalRuntime {
         let (_tx, rx) = mpsc::channel::<Vec<u8>>();
         let sink = TerminalEventSink::default();
         let term = Crosswords::new(
-            CrosswordsSize::new(usize::from(cols.max(1)), usize::from(rows.max(1))),
+            CrosswordsSize::new_with_dimensions(
+                usize::from(cols.max(1)),
+                usize::from(rows.max(1)),
+                u32::from(cols.max(1)),
+                u32::from(rows.max(1)),
+                1,
+                1,
+            ),
             CursorShape::Block,
             sink.clone(),
             WindowId::from(0),
@@ -242,7 +249,14 @@ impl TerminalRuntime {
 
         let sink = TerminalEventSink::default();
         let term = Crosswords::new(
-            CrosswordsSize::new(usize::from(cols.max(1)), usize::from(rows.max(1))),
+            CrosswordsSize::new_with_dimensions(
+                usize::from(cols.max(1)),
+                usize::from(rows.max(1)),
+                u32::from(cols.max(1)),
+                u32::from(rows.max(1)),
+                1,
+                1,
+            ),
             CursorShape::Block,
             sink.clone(),
             // Route and window ids are Rio's multiplexer bookkeeping; ratty
@@ -389,5 +403,14 @@ mod tests {
             command.get_env("TERM_PROGRAM_VERSION"),
             Some(OsStr::new(env!("CARGO_PKG_VERSION")))
         );
+    }
+
+    #[test]
+    fn initial_cell_size_query_has_a_nonzero_fallback() {
+        let mut runtime = TerminalRuntime::for_test(24, 80);
+
+        runtime.process(b"\x1b[16t");
+
+        assert_eq!(runtime.take_replies(), [b"\x1b[6;1;1t".to_vec()]);
     }
 }
