@@ -1,8 +1,10 @@
 //! Terminal surface rendering and Ratatui integration.
 
+use std::num::NonZeroU16;
+
 use bevy::prelude::*;
 use parley_ratatui::ratatui::Terminal;
-use parley_ratatui::ratatui::buffer::Buffer;
+use parley_ratatui::ratatui::buffer::{Buffer, CellDiffOption};
 use parley_ratatui::ratatui::layout::Rect;
 use parley_ratatui::ratatui::style::{Color as TuiColor, Modifier, Style};
 use parley_ratatui::ratatui::widgets::Widget;
@@ -400,15 +402,32 @@ impl Widget for TerminalWidget<'_> {
             };
             for col in 0..draw_cols {
                 let square = grid_row[Column(usize::from(col))];
-                // Both spacer kinds are padding rather than content and must be
-                // left at the buffer's blank default. `Spacer` is the second
-                // half of a wide glyph; `LeadingSpacer` is the pad rio-vt writes
-                // at end-of-line when a wide glyph wraps — it holds a space
-                // carrying the active SGR style, so drawing it would paint a
-                // styled block there and defeat the renderer's wide-cell
-                // heuristic, which only treats a trailing space as a
-                // continuation when it has no background.
-                if matches!(square.wide(), Wide::Spacer | Wide::LeadingSpacer) {
+                let cell = &mut buf[(area.x + col, area.y + row)];
+
+                // Ratatui normally skips the trailing buffer cell when diffing
+                // a width-2 symbol. That is correct for a real terminal, where
+                // printing the glyph updates both columns, but ParleyBackend is
+                // an in-memory cell buffer: skipping the update leaves whatever
+                // symbol occupied the continuation cell in an earlier frame.
+                // Keep the owner visually wide for Parley while forcing Ratatui
+                // to diff it as one cell, which lets its spacer participate in
+                // the normal diff instead of being skipped.
+                if matches!(square.wide(), Wide::Spacer) {
+                    let mut style =
+                        square_style(styles, square, &theme_palette, theme_fg, self.font_style);
+                    if selection.is_some_and(|bounds| bounds.contains(row, col)) {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    cell.set_symbol(" ").set_style(style);
+                    continue;
+                }
+
+                // A leading spacer is the end-of-line pad Rio writes before a
+                // wide glyph wraps. It is not part of the glyph and must remain
+                // an unstyled blank so the normal diff clears content left by
+                // a previous frame.
+                if matches!(square.wide(), Wide::LeadingSpacer) {
+                    cell.set_symbol(" ");
                     continue;
                 }
 
@@ -425,9 +444,11 @@ impl Widget for TerminalWidget<'_> {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
 
-                buf[(area.x + col, area.y + row)]
-                    .set_symbol(if symbol.is_empty() { " " } else { &symbol })
+                cell.set_symbol(if symbol.is_empty() { " " } else { &symbol })
                     .set_style(style);
+                if matches!(square.wide(), Wide::Wide) {
+                    cell.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+                }
             }
         }
     }
@@ -572,6 +593,37 @@ mod tests {
             .collect()
     }
 
+    /// Draws a terminal state through Ratatui's differential update path into
+    /// the persistent Parley backend buffer.
+    fn draw_term(tui: &mut Terminal<ParleyBackend>, term: &Crosswords<TerminalEventSink>) {
+        tui.draw(|frame| {
+            frame.render_widget(
+                TerminalWidget {
+                    term,
+                    selection: &TerminalSelection::default(),
+                    theme: &ThemeConfig::default(),
+                    font_style: FontStyleConfig::Regular,
+                },
+                frame.area(),
+            );
+        })
+        .expect("draw terminal frame");
+    }
+
+    /// Builds and draws a fresh terminal state through [`draw_term`].
+    fn draw_input(tui: &mut Terminal<ParleyBackend>, rows: u16, cols: u16, input: &[u8]) {
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(usize::from(cols), usize::from(rows)),
+            CursorShape::Block,
+            TerminalEventSink::default(),
+            WindowId::from(0),
+            0,
+            1000,
+        );
+        Processor::default().advance(&mut term, input);
+        draw_term(tui, &term);
+    }
+
     /// End-to-end guard for the defect that motivated this engine port: older
     /// rio-vt releases bound `visible_rows` to the DECSTBM scroll region, so a
     /// widget built on it drew the grid shifted up with blank rows at the bottom
@@ -602,8 +654,9 @@ mod tests {
     /// vt100 had no equivalent cell, so this guards buffer parity with it.
     #[test]
     fn wrapped_wide_characters_leave_an_unstyled_pad() {
-        // Green background, then text that pushes a wide glyph past the edge.
-        let rendered = render_cells(2, 14, b"\x1b[42mabcdefghijkl\xe4\xbd\xa0\x1b[0m");
+        // Green background, then thirteen narrow cells so the wide glyph cannot
+        // fit in the one remaining column and Rio writes a LeadingSpacer there.
+        let rendered = render_cells(2, 14, b"\x1b[42mabcdefghijklm\xe4\xbd\xa0\x1b[0m");
 
         let pad = &rendered[13];
         assert_eq!(pad.symbol(), " ", "the pad cell must stay blank");
@@ -612,6 +665,82 @@ mod tests {
             TuiColor::Reset,
             "the pad cell must not carry the active background"
         );
+    }
+
+    /// Ratatui skips a wide glyph's second cell when sending a diff to a real
+    /// terminal. ParleyBackend stores those diffs as cells, so the skipped
+    /// update used to retain the old symbol and background. Scrolling then
+    /// repeated those stale cells anywhere a CJK glyph or emoji moved.
+    #[test]
+    fn successive_draws_replace_wide_continuation_cells() {
+        let (rows, cols) = (2, 8);
+        let mut tui = Terminal::new(ParleyBackend::new(cols, rows)).expect("terminal");
+
+        draw_input(&mut tui, rows, cols, b"abcdefgh");
+        draw_input(
+            &mut tui,
+            rows,
+            cols,
+            "\x1b[42m\u{4f60}\u{1f600}\x1b[0m".as_bytes(),
+        );
+
+        let buffer = tui.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "\u{4f60}");
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
+        assert_eq!(buffer[(2, 0)].symbol(), "\u{1f600}");
+        assert_eq!(buffer[(3, 0)].symbol(), " ");
+        assert_eq!(buffer[(1, 0)].bg, buffer[(0, 0)].bg);
+        assert_eq!(buffer[(3, 0)].bg, buffer[(2, 0)].bg);
+        assert_ne!(buffer[(0, 0)].bg, TuiColor::Reset);
+        for col in 4..cols {
+            assert_eq!(
+                buffer[(col, 0)].symbol(),
+                " ",
+                "old content survived at column {col}"
+            );
+        }
+    }
+
+    /// Repeatedly moving wide graphemes into and out of the viewport must not
+    /// leave their owners or continuation cells behind on unrelated rows.
+    #[test]
+    fn scrollback_redraws_wide_graphemes_without_artifacts() {
+        let (rows, cols) = (2, 8);
+        let mut tui = Terminal::new(ParleyBackend::new(cols, rows)).expect("terminal");
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(usize::from(cols), usize::from(rows)),
+            CursorShape::Block,
+            TerminalEventSink::default(),
+            WindowId::from(0),
+            0,
+            1000,
+        );
+        Processor::default().advance(
+            &mut term,
+            "\x1b[42m\u{4f60}\u{1f600}\x1b[0m\r\nsecond\r\nthird\r\nfourth".as_bytes(),
+        );
+
+        for offset in [1, 2, 0, 2, 1, 2] {
+            crate::vt::set_scrollback(&mut term, offset);
+            draw_term(&mut tui, &term);
+
+            let buffer = tui.backend().buffer();
+            if offset == 2 {
+                assert_eq!(buffer[(0, 0)].symbol(), "\u{4f60}");
+                assert_eq!(buffer[(1, 0)].symbol(), " ");
+                assert_eq!(buffer[(2, 0)].symbol(), "\u{1f600}");
+                assert_eq!(buffer[(3, 0)].symbol(), " ");
+                assert_eq!(buffer[(1, 0)].bg, buffer[(0, 0)].bg);
+                assert_eq!(buffer[(3, 0)].bg, buffer[(2, 0)].bg);
+            } else {
+                assert!(
+                    buffer
+                        .content()
+                        .iter()
+                        .all(|cell| !matches!(cell.symbol(), "\u{4f60}" | "\u{1f600}"))
+                );
+            }
+        }
     }
 
     /// Earlier rio-vt releases aborted placing a double-width glyph in a
