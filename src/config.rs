@@ -50,6 +50,10 @@ pub struct AppConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct BitmapConfig {
+    /// Maximum number of registered bitmaps.
+    pub max_bitmaps: usize,
+    /// Maximum number of active bitmap placements.
+    pub max_placements: usize,
     /// Maximum decoded bitmap width in pixels.
     pub max_image_width: u32,
     /// Maximum decoded bitmap height in pixels.
@@ -67,6 +71,8 @@ pub struct BitmapConfig {
 impl Default for BitmapConfig {
     fn default() -> Self {
         Self {
+            max_bitmaps: 1_024,
+            max_placements: 4_096,
             max_image_width: 8_192,
             max_image_height: 8_192,
             max_bitmap_bytes: 64 * 1024 * 1024,
@@ -653,6 +659,8 @@ action = "Toggle3DMode"
         let config: AppConfig = toml::from_str(
             r#"
 [bitmap]
+max_bitmaps = 12
+max_placements = 34
 max_image_width = 1024
 max_image_height = 768
 max_bitmap_bytes = 4194304
@@ -663,6 +671,8 @@ max_pending_transfers = 3
         )
         .expect("bitmap resource limits should deserialize");
 
+        assert_eq!(config.bitmap.max_bitmaps, 12);
+        assert_eq!(config.bitmap.max_placements, 34);
         assert_eq!(config.bitmap.max_image_width, 1024);
         assert_eq!(config.bitmap.max_image_height, 768);
         assert_eq!(config.bitmap.max_bitmap_bytes, 4_194_304);

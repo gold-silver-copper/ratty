@@ -280,9 +280,10 @@ stable image and placement state, and rendering. The application owns capture,
 network transport, codec choices such as VP8, and decoding compressed video to
 RGBA8 before sending frames to Ratty.
 
-The `[bitmap]` configuration section bounds image dimensions, bytes per decoded
-bitmap, total decoded bytes across registered bitmaps, retained bytes across
-incomplete transfers, and the number of concurrent incomplete transfers. See
+The `[bitmap]` configuration section bounds registered bitmap and placement
+counts, image dimensions, bytes per decoded bitmap, total decoded bytes across
+registered bitmaps, retained bytes across incomplete transfers, and the number
+of concurrent incomplete transfers. See
 [`config/ratty.toml`](config/ratty.toml) for the default limits.
 
 Current v1 boundaries:
@@ -301,7 +302,7 @@ and [Bevy](https://bevyengine.org/) for scene presentation.
 
 Current workflow:
 
-1. PTY output is parsed by `vt100` and drawn into a Ratatui buffer on CPU
+1. PTY output is parsed by [`rio-vt`](https://crates.io/crates/rio-vt) and drawn into a Ratatui buffer on CPU
 2. `parley_ratatui` shapes the buffer with Parley and records it as a Vello scene
 3. The scene is handed to Bevy's render world through a double-buffered
    exchange (scenes are recycled between frames, never cloned or re-recorded)

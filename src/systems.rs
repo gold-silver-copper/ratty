@@ -48,6 +48,7 @@ use crate::scene::{
 use crate::terminal::{
     TerminalRedrawState, TerminalSurface, TerminalWidget, render_scale_for_window,
 };
+use crate::vt;
 use bevy::app::AppExit;
 use bevy::asset::AssetMut;
 use bevy::camera::visibility::NoFrustumCulling;
@@ -161,54 +162,37 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 /// scene.
 pub fn pump_pty_output(
     mut runtime: ResMut<TerminalRuntime>,
-    terminal: Res<TerminalSurface>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
     mut camera_update_writer: MessageWriter<TerminalCameraUpdate>,
     mut app_exit: MessageWriter<AppExit>,
     mut redraw: ResMut<TerminalRedrawState>,
 ) {
-    let (cell_width, cell_height) = terminal.cell_pixel_dimensions();
-    runtime
-        .parser
-        .callbacks_mut()
-        .set_cell_pixel_size(cell_width, cell_height);
-
-    let screen_rows = |screen: &vt100::Screen| {
-        let (_, cols) = screen.size();
-        screen.rows(0, cols).collect::<Vec<_>>()
-    };
-
     let mut processed_output = false;
     let mut camera_updates = Vec::new();
     loop {
         match runtime.try_recv() {
             Ok(chunk) => {
                 let track_scroll = inline_objects.has_scroll_tracked_anchors();
-                let prev_rows: Option<Vec<String>> = if track_scroll {
-                    let (_, cols) = runtime.parser.screen().size();
-                    Some(runtime.parser.screen().rows(0, cols).collect::<Vec<_>>())
-                } else {
-                    None
-                };
+                let prev_rows = track_scroll.then(|| vt::visible_row_texts(&runtime.term));
                 let mut replies = inline_objects.consume_pty_output(
                     &chunk,
-                    &mut runtime.parser,
+                    &mut runtime,
                     &mut camera_updates,
                     &mut processed_output,
                 );
                 for update in camera_updates.drain(..) {
                     camera_update_writer.write(update);
                 }
-                replies.extend(runtime.parser.callbacks_mut().take_replies());
+                replies.extend(runtime.take_replies());
                 for reply in replies {
                     runtime.write_input(&reply);
                 }
                 if let Some(prev_rows) = prev_rows {
-                    let next_rows = screen_rows(runtime.parser.screen());
+                    let next_rows = vt::visible_row_texts(&runtime.term);
                     let scrolled = infer_upward_scroll(&prev_rows, &next_rows);
                     inline_objects.apply_scroll(scrolled);
                 }
-                inline_objects.refresh_placeholder_anchors(runtime.parser.screen());
+                inline_objects.refresh_placeholder_anchors(&runtime.term);
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
@@ -289,8 +273,8 @@ pub(crate) fn handle_window_resize(
     };
 
     // Minimizing the window reports a 0x0 size. Skip it so the terminal keeps
-    // its last good grid instead of collapsing to a degenerate size that the
-    // vt100 parser can't safely process.
+    // its last good grid instead of collapsing to a degenerate size the VT
+    // engine can't safely process.
     if window_size.x < 1.0 || window_size.y < 1.0 {
         return;
     }
@@ -408,11 +392,11 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         return;
     }
 
-    let screen = runtime.parser.screen();
+    let term = &runtime.term;
     let _ = terminal.tui.draw(|frame| {
         frame.render_widget(
             TerminalWidget {
-                screen,
+                term,
                 selection,
                 theme: &app_config.theme,
                 font_style: app_config.font.style,
@@ -420,8 +404,8 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
             frame.area(),
         );
 
-        if !app_config.cursor.model.visible && !screen.hide_cursor() {
-            let (cursor_row, cursor_col) = screen.cursor_position();
+        if !app_config.cursor.model.visible && !vt::cursor_hidden(term) {
+            let (cursor_row, cursor_col) = vt::cursor_position(term);
             frame.set_cursor_position((cursor_col, cursor_row));
         }
     });
@@ -478,7 +462,7 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
 
     let in_3d = camera_slots.active().mode.is_3d();
     if in_3d {
-        sync_terminal_debug_image(terminal, images, runtime.parser.screen());
+        sync_terminal_debug_image(terminal, images, &runtime.term);
     }
 
     sync_plane_texture(terminal.image_handle.as_ref(), plane_materials, materials);
@@ -2046,8 +2030,7 @@ fn cursor_pose(
     let cell_height = ctx.viewport.size.y / rows;
     let scale = cell_width.min(cell_height) * app_config.cursor.model.scale_factor;
 
-    let screen = ctx.runtime.parser.screen();
-    let (cursor_row, cursor_col) = screen.cursor_position();
+    let (cursor_row, cursor_col) = vt::cursor_position(&ctx.runtime.term);
     let cursor_col = cursor_col.min(ctx.terminal.cols.saturating_sub(1)) as f32;
     let cursor_row = cursor_row.min(ctx.terminal.rows.saturating_sub(1)) as f32;
 
@@ -2069,7 +2052,7 @@ fn cursor_pose(
         (
             Vec3::new(local_x, local_y + bob, CURSOR_DEPTH),
             Quat::from_rotation_y(spin) * Quat::from_rotation_x(-0.25),
-            if !app_config.cursor.model.visible || screen.hide_cursor() {
+            if !app_config.cursor.model.visible || vt::cursor_hidden(&ctx.runtime.term) {
                 Visibility::Hidden
             } else {
                 Visibility::Visible

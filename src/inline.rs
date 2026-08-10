@@ -1,13 +1,11 @@
 //! Inline object state and APC handling.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
 use bevy::prelude::*;
-use vt100::Callbacks;
 
-use crate::bitmap::{BitmapSurfaceState, MAX_BITMAP_APC_BYTES};
+use crate::bitmap::{BitmapLimits, BitmapSurfaceState, MAX_BITMAP_APC_BYTES};
 use crate::bitmap_material::{BitmapSurfaceMaterial, BitmapSurfaceUniform};
 use crate::camera::{OptionalVec3, TerminalCameraUpdate};
 use crate::kitty::{KittyOperation, KittyParserState, refresh_kitty_placeholder_anchors};
@@ -18,6 +16,8 @@ use crate::rgp::{
     RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, RgpRegisterSource,
     consume_sequence as consume_rgp_sequence, support_reply,
 };
+use crate::runtime::TerminalRuntime;
+use crate::vt::{self, VtTerminal};
 
 const APC_START: &[u8] = b"\x1b_";
 const ST: &[u8] = b"\x1b\\";
@@ -129,24 +129,25 @@ pub struct TerminalInlineObjects {
 }
 
 impl TerminalInlineObjects {
-    pub(crate) fn with_bitmap_limits(limits: crate::bitmap::BitmapLimits) -> Self {
+    pub(crate) fn with_bitmap_limits(limits: BitmapLimits) -> Self {
         Self {
             bitmap: BitmapSurfaceState::with_limits(limits),
+            kitty: KittyParserState::with_limits(limits),
             ..Self::default()
         }
     }
 
     /// Consumes PTY output and extracts inline object control sequences.
-    pub fn consume_pty_output<CB: Callbacks>(
+    pub fn consume_pty_output(
         &mut self,
         chunk: &[u8],
-        parser: &mut vt100::Parser<CB>,
+        runtime: &mut TerminalRuntime,
         camera_updates: &mut Vec<TerminalCameraUpdate>,
         terminal_output: &mut bool,
     ) -> Vec<Vec<u8>> {
         self.consume_pty_output_with_limit(
             chunk,
-            parser,
+            runtime,
             camera_updates,
             terminal_output,
             MAX_BITMAP_APC_BYTES,
@@ -154,27 +155,27 @@ impl TerminalInlineObjects {
     }
 
     #[cfg(test)]
-    fn consume_pty_output_with_bitmap_limit<CB: Callbacks>(
+    fn consume_pty_output_with_bitmap_limit(
         &mut self,
         chunk: &[u8],
-        parser: &mut vt100::Parser<CB>,
+        runtime: &mut TerminalRuntime,
         bitmap_apc_limit: usize,
     ) -> Vec<Vec<u8>> {
         let mut camera_updates = Vec::new();
         let mut terminal_output = false;
         self.consume_pty_output_with_limit(
             chunk,
-            parser,
+            runtime,
             &mut camera_updates,
             &mut terminal_output,
             bitmap_apc_limit,
         )
     }
 
-    fn consume_pty_output_with_limit<CB: Callbacks>(
+    fn consume_pty_output_with_limit(
         &mut self,
         mut chunk: &[u8],
-        parser: &mut vt100::Parser<CB>,
+        runtime: &mut TerminalRuntime,
         camera_updates: &mut Vec<TerminalCameraUpdate>,
         terminal_output: &mut bool,
         bitmap_apc_limit: usize,
@@ -208,7 +209,7 @@ impl TerminalInlineObjects {
             let take = chunk.len().min(INGEST_BLOCK_BYTES).min(block_limit);
             self.pending_bytes.extend_from_slice(&chunk[..take]);
             chunk = &chunk[take..];
-            replies.extend(self.process_pending_bytes(parser, camera_updates, terminal_output));
+            replies.extend(self.process_pending_bytes(runtime, camera_updates, terminal_output));
 
             if self
                 .pending_bytes
@@ -221,9 +222,9 @@ impl TerminalInlineObjects {
         replies
     }
 
-    fn process_pending_bytes<CB: Callbacks>(
+    fn process_pending_bytes(
         &mut self,
-        parser: &mut vt100::Parser<CB>,
+        runtime: &mut TerminalRuntime,
         camera_updates: &mut Vec<TerminalCameraUpdate>,
         terminal_output: &mut bool,
     ) -> Vec<Vec<u8>> {
@@ -239,9 +240,7 @@ impl TerminalInlineObjects {
                 let keep_from = pending_apc_prefix_start(&self.pending_bytes, cursor);
                 if cursor < keep_from {
                     *terminal_output = true;
-                    parser.process(&normalize_hvp_sequences(
-                        &self.pending_bytes[cursor..keep_from],
-                    ));
+                    runtime.process(&self.pending_bytes[cursor..keep_from]);
                 }
                 if keep_from < pending_len {
                     self.pending_bytes.drain(..keep_from);
@@ -253,7 +252,7 @@ impl TerminalInlineObjects {
             let start = cursor + start_offset;
             if cursor < start {
                 *terminal_output = true;
-                parser.process(&normalize_hvp_sequences(&self.pending_bytes[cursor..start]));
+                runtime.process(&self.pending_bytes[cursor..start]);
             }
 
             let payload_start = start + APC_START.len();
@@ -264,7 +263,7 @@ impl TerminalInlineObjects {
             let sequence = self.pending_bytes[start..end].to_vec();
             let (handled, reply) = self.handle_apc_sequence(
                 &sequence,
-                parser.screen().cursor_position(),
+                vt::cursor_position(&runtime.term),
                 camera_updates,
             );
             if let Some(reply) = reply {
@@ -272,7 +271,7 @@ impl TerminalInlineObjects {
             }
             if !handled {
                 *terminal_output = true;
-                parser.process(&sequence);
+                runtime.process(&sequence);
             }
             cursor = end;
         }
@@ -359,8 +358,8 @@ impl TerminalInlineObjects {
     }
 
     /// Refreshes placeholder-derived Kitty anchors.
-    pub fn refresh_placeholder_anchors(&mut self, screen: &vt100::Screen) {
-        if refresh_kitty_placeholder_anchors(&self.objects, &mut self.anchors, screen) {
+    pub fn refresh_placeholder_anchors(&mut self, term: &VtTerminal) {
+        if refresh_kitty_placeholder_anchors(&self.objects, &mut self.anchors, term) {
             self.dirty = true;
         }
     }
@@ -421,8 +420,8 @@ impl TerminalInlineObjects {
                 quiet,
             } => {
                 let reply = match result {
-                    Ok(()) if quiet == 1 => None,
-                    Err(_) if quiet == 2 => None,
+                    Ok(()) if quiet >= 1 => None,
+                    Err(_) if quiet >= 2 => None,
                     Ok(()) => Some(format!("\x1b_Gi={image_id};OK\x1b\\").into_bytes()),
                     Err(error) => {
                         Some(format!("\x1b_Gi={image_id};EINVAL:{error}\x1b\\").into_bytes())
@@ -702,43 +701,6 @@ struct PendingRgpPayload {
     options: ObjectLoadOptions,
 }
 
-fn normalize_hvp_sequences(bytes: &[u8]) -> Cow<'_, [u8]> {
-    // vt100 handles CUP (`H`) but not HVP (`f`), so normalize cursor-positioning sequences.
-    let mut normalized = None;
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 2 < bytes.len() && bytes[i + 1] == b'[' {
-            let mut j = i + 2;
-            while j < bytes.len() && matches!(bytes[j], b'0'..=b'9' | b';') {
-                j += 1;
-            }
-
-            if j < bytes.len() && bytes[j] == b'f' && j > i + 2 {
-                let out = normalized.get_or_insert_with(|| {
-                    let mut out = Vec::with_capacity(bytes.len());
-                    out.extend_from_slice(&bytes[..i]);
-                    out
-                });
-                out.extend_from_slice(&bytes[i..j]);
-                out.push(b'H');
-                i = j + 1;
-                continue;
-            }
-        }
-
-        if let Some(out) = normalized.as_mut() {
-            out.push(bytes[i]);
-        }
-        i += 1;
-    }
-
-    match normalized {
-        Some(bytes) => Cow::Owned(bytes),
-        None => Cow::Borrowed(bytes),
-    }
-}
-
 fn pending_apc_prefix_start(bytes: &[u8], cursor: usize) -> usize {
     let start = cursor.min(bytes.len());
     if bytes[start..].ends_with(&APC_START[..1]) {
@@ -927,21 +889,28 @@ mod tests {
         0xab, 0xb6, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
 
-    fn parser() -> vt100::Parser {
-        vt100::Parser::new(24, 80, 0)
+    fn parser() -> TerminalRuntime {
+        TerminalRuntime::for_test(24, 80)
+    }
+
+    fn contents(runtime: &TerminalRuntime) -> String {
+        vt::visible_row_texts(&runtime.term)
+            .join("\n")
+            .trim_end()
+            .to_owned()
     }
 
     fn consume(
         objects: &mut TerminalInlineObjects,
         chunk: &[u8],
-        parser: &mut vt100::Parser,
+        parser: &mut TerminalRuntime,
     ) -> Vec<Vec<u8>> {
         let mut camera_updates = Vec::new();
         let mut terminal_output = false;
         objects.consume_pty_output(chunk, parser, &mut camera_updates, &mut terminal_output)
     }
 
-    fn register_bitmap(objects: &mut TerminalInlineObjects, parser: &mut vt100::Parser) {
+    fn register_bitmap(objects: &mut TerminalInlineObjects, parser: &mut TerminalRuntime) {
         let payload = base64::engine::general_purpose::STANDARD.encode(PNG_2X2);
         let command = format!("\x1b_ratty;i;r;id=7;fmt=png;source=payload;more=0;{payload}\x1b\\");
         assert!(consume(objects, command.as_bytes(), parser).is_empty());
@@ -955,13 +924,13 @@ mod tests {
         let replies = consume(&mut objects, b"left\x1b_ratty;i;s\x1b\\right", &mut parser);
 
         assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
-        assert_eq!(parser.screen().contents(), "leftright");
+        assert_eq!(contents(&parser), "leftright");
     }
 
     #[test]
     fn kitty_query_reports_support_without_storing_an_image() {
         let mut objects = TerminalInlineObjects::default();
-        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut parser = parser();
 
         let replies = consume(&mut objects, RATATUI_IMAGE_KITTY_QUERY, &mut parser);
 
@@ -973,7 +942,7 @@ mod tests {
     #[test]
     fn invalid_kitty_query_reports_error_without_mutating_state() {
         let mut objects = TerminalInlineObjects::default();
-        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut parser = parser();
 
         let replies = consume(
             &mut objects,
@@ -992,7 +961,7 @@ mod tests {
     #[test]
     fn kitty_query_quiet_levels_suppress_the_requested_reply_class() {
         let mut objects = TerminalInlineObjects::default();
-        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut parser = parser();
 
         let ok_replies = consume(
             &mut objects,
@@ -1004,9 +973,15 @@ mod tests {
             b"\x1b_Gi=9,s=2,v=2,a=q,t=d,f=24,q=2;AAAA\x1b\\",
             &mut parser,
         );
+        let fully_quiet_ok_replies = consume(
+            &mut objects,
+            b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24,q=2;AAAA\x1b\\",
+            &mut parser,
+        );
 
         assert!(ok_replies.is_empty());
         assert!(error_replies.is_empty());
+        assert!(fully_quiet_ok_replies.is_empty());
         assert!(objects.objects.is_empty());
         assert!(objects.anchors.is_empty());
     }
@@ -1017,11 +992,11 @@ mod tests {
         let mut parser = parser();
 
         assert!(consume(&mut objects, b"before\x1b_ratty;i;", &mut parser).is_empty());
-        assert_eq!(parser.screen().contents(), "before");
+        assert_eq!(contents(&parser), "before");
         let replies = consume(&mut objects, b"s\x1b\\after", &mut parser);
 
         assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
-        assert_eq!(parser.screen().contents(), "beforeafter");
+        assert_eq!(contents(&parser), "beforeafter");
     }
 
     #[test]
@@ -1047,7 +1022,7 @@ mod tests {
         );
 
         assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
-        assert_eq!(parser.screen().contents(), "beforeafter");
+        assert_eq!(contents(&parser), "beforeafter");
         assert!(!objects.discarding_oversized_bitmap_apc);
         assert!(objects.pending_bytes.len() <= limit);
     }
@@ -1070,7 +1045,7 @@ mod tests {
         );
 
         assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
-        assert_eq!(parser.screen().contents(), "tail");
+        assert_eq!(contents(&parser), "tail");
         assert!(!objects.discarding_oversized_bitmap_apc);
     }
 
@@ -1084,7 +1059,7 @@ mod tests {
         let replies = objects.consume_pty_output_with_bitmap_limit(b"s\x1b\\", &mut parser, limit);
 
         assert_eq!(replies, vec![crate::rgp::support_reply()]);
-        assert!(parser.screen().contents().is_empty());
+        assert!(contents(&parser).is_empty());
     }
 
     #[test]
@@ -1095,7 +1070,7 @@ mod tests {
         let replies = consume(&mut objects, b"\x1b_ratty;i;s\x9c", &mut parser);
 
         assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
-        assert!(parser.screen().contents().is_empty());
+        assert!(contents(&parser).is_empty());
     }
 
     #[test]
@@ -1113,7 +1088,7 @@ mod tests {
             replies,
             vec![BITMAP_SUPPORT_REPLY.to_vec(), crate::rgp::support_reply()]
         );
-        assert!(parser.screen().contents().is_empty());
+        assert!(contents(&parser).is_empty());
     }
 
     #[test]
@@ -1130,7 +1105,7 @@ mod tests {
 
         assert_eq!(replies, vec![BITMAP_SUPPORT_REPLY.to_vec()]);
         assert!(objects.bitmap.bitmap(7).is_some());
-        assert!(parser.screen().contents().is_empty());
+        assert!(contents(&parser).is_empty());
     }
 
     #[test]
@@ -1145,7 +1120,7 @@ mod tests {
         );
 
         assert!(replies.is_empty());
-        assert_eq!(parser.screen().contents(), "beforeafter");
+        assert_eq!(contents(&parser), "beforeafter");
     }
 
     #[test]

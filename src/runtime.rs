@@ -1,6 +1,5 @@
-//! PTY runtime and parser state.
+//! PTY runtime and terminal state.
 
-use std::collections::HashSet;
 use std::env;
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
@@ -12,9 +11,13 @@ use anyhow::Context;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::Resource;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-use vt100::{Callbacks, Parser, Screen};
+use rio_vt::ansi::CursorShape;
+use rio_vt::crosswords::{Crosswords, CrosswordsSize};
+use rio_vt::event::WindowId;
+use rio_vt::performer::handler::Processor;
 
 use crate::config::AppConfig;
+use crate::vt::{TerminalEventSink, VtTerminal};
 
 /// Command-line runtime overrides.
 #[derive(Debug, Clone, Default)]
@@ -23,166 +26,6 @@ pub struct RuntimeOptions {
     pub command: Option<Vec<String>>,
     /// Working directory used for the spawned PTY command.
     pub working_dir: Option<PathBuf>,
-}
-
-/// Callback state for unhandled parser sequences.
-#[derive(Default)]
-pub struct TerminalParserCallbacks {
-    seen_csi: HashSet<String>,
-    seen_escape: HashSet<String>,
-    pending_replies: Vec<Vec<u8>>,
-    kitty_keyboard_flags: u8,
-    modify_other_keys: Option<u8>,
-    cell_pixel_size: Option<(u16, u16)>,
-}
-
-impl TerminalParserCallbacks {
-    /// Drains any terminal replies queued by parser callbacks.
-    pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.pending_replies)
-    }
-
-    /// Returns the active kitty keyboard enhancement flags.
-    pub fn kitty_keyboard_flags(&self) -> u8 {
-        self.kitty_keyboard_flags
-    }
-
-    /// Returns the active xterm `modifyOtherKeys` level.
-    pub fn modify_other_keys(&self) -> Option<u8> {
-        self.modify_other_keys
-    }
-
-    /// Updates the physical pixel dimensions reported for one terminal cell.
-    pub fn set_cell_pixel_size(&mut self, width: u16, height: u16) {
-        self.cell_pixel_size = Some((width.max(1), height.max(1)));
-    }
-}
-
-impl Callbacks for TerminalParserCallbacks {
-    fn unhandled_csi(
-        &mut self,
-        screen: &mut Screen,
-        i1: Option<u8>,
-        i2: Option<u8>,
-        params: &[&[u16]],
-        c: char,
-    ) {
-        // CSI 0 c = primary device attributes request.
-        if i1.is_none() && i2.is_none() && c == 'c' && params.len() == 1 && params[0] == [0] {
-            self.pending_replies.push(b"\x1b[?1;2c".to_vec());
-            return;
-        }
-
-        // CSI 5 n = device status report request.
-        if i1.is_none() && i2.is_none() && c == 'n' && params.len() == 1 && params[0] == [5] {
-            self.pending_replies.push(b"\x1b[0n".to_vec());
-            return;
-        }
-
-        // CSI 6 n = cursor position report request.
-        if i1.is_none() && i2.is_none() && c == 'n' && params.len() == 1 && params[0] == [6] {
-            let (row, col) = screen.cursor_position();
-            self.pending_replies
-                .push(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes());
-            return;
-        }
-
-        // CSI 16 t = report terminal cell size in pixels.
-        if i1.is_none() && i2.is_none() && c == 't' && params.len() == 1 && params[0] == [16] {
-            if let Some((width, height)) = self.cell_pixel_size {
-                self.pending_replies
-                    .push(format!("\x1b[6;{height};{width}t").into_bytes());
-            }
-            return;
-        }
-
-        // CSI ? u = kitty keyboard protocol flag query. Reply with the currently active flags so
-        // apps can detect whether enhanced key reporting is enabled.
-        if i1 == Some(b'?') && i2.is_none() && c == 'u' && params.is_empty() {
-            self.pending_replies
-                .push(format!("\x1b[?{}u", self.kitty_keyboard_flags).into_bytes());
-            return;
-        }
-
-        // CSI > flags u = enable kitty keyboard protocol flags for subsequent key reports.
-        if i1 == Some(b'>') && i2.is_none() && c == 'u' && params.len() == 1 && params[0].len() == 1
-        {
-            self.kitty_keyboard_flags = params[0][0].min(u8::MAX as u16) as u8;
-            return;
-        }
-
-        // CSI < 1 u = pop kitty keyboard enhancement state and fall back to legacy reporting.
-        if i1 == Some(b'<') && i2.is_none() && c == 'u' && params.len() == 1 && params[0] == [1] {
-            self.kitty_keyboard_flags = 0;
-            return;
-        }
-
-        // CSI > 4 ; level m = xterm modifyOtherKeys mode. We track the current level so keys like
-        // Ctrl+Enter can be encoded in the form the foreground app asked for.
-        if i1 == Some(b'>') && i2.is_none() && c == 'm' {
-            match params {
-                [resource, level] if *resource == [4] && level.len() == 1 => {
-                    self.modify_other_keys = Some(level[0].min(u8::MAX as u16) as u8);
-                    return;
-                }
-                [resource] if *resource == [4] => {
-                    self.modify_other_keys = None;
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        // CSI ? 7 h / CSI ? 7 l toggle line wrapping. Ratty does not model the mode yet, but
-        // treating it as known avoids noisy warnings for shells and TUIs that flip it frequently.
-        if i1 == Some(b'?')
-            && i2.is_none()
-            && params.len() == 1
-            && params[0] == [7]
-            && matches!(c, 'h' | 'l')
-        {
-            return;
-        }
-
-        let mut sequence = String::from("\u{1b}[");
-        if let Some(i1) = i1 {
-            sequence.push(i1 as char);
-        }
-        if let Some(i2) = i2 {
-            sequence.push(i2 as char);
-        }
-        for (idx, param) in params.iter().enumerate() {
-            if idx > 0 {
-                sequence.push(';');
-            }
-            for (j, value) in param.iter().enumerate() {
-                if j > 0 {
-                    sequence.push(':');
-                }
-                sequence.push_str(&value.to_string());
-            }
-        }
-        sequence.push(c);
-
-        if self.seen_csi.insert(sequence.clone()) {
-            bevy::log::warn!("unhandled terminal CSI sequence: {sequence}");
-        }
-    }
-
-    fn unhandled_escape(&mut self, _: &mut Screen, i1: Option<u8>, i2: Option<u8>, b: u8) {
-        let mut sequence = String::from("\u{1b}");
-        if let Some(i1) = i1 {
-            sequence.push(i1 as char);
-        }
-        if let Some(i2) = i2 {
-            sequence.push(i2 as char);
-        }
-        sequence.push(b as char);
-
-        if self.seen_escape.insert(sequence.clone()) {
-            bevy::log::warn!("unhandled terminal escape sequence: {sequence}");
-        }
-    }
 }
 
 fn apply_terminal_identity(command: &mut CommandBuilder) {
@@ -208,9 +51,12 @@ pub struct TerminalRuntime {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     /// PTY reader thread.
     reader_thread: Option<JoinHandle<()>>,
-    /// Terminal parser.
-    pub parser: Parser<TerminalParserCallbacks>,
-    scrollback_len: usize,
+    /// Terminal grid and VT state.
+    pub term: VtTerminal,
+    /// VT state machine feeding [`Self::term`].
+    processor: Processor,
+    /// Reply queue shared with the terminal's event listener.
+    sink: TerminalEventSink,
     /// Indicates PTY shutdown.
     pub pty_disconnected: bool,
     shutdown_started: bool,
@@ -285,6 +131,40 @@ fn find_git_bash() -> Option<String> {
 }
 
 impl TerminalRuntime {
+    #[cfg(test)]
+    pub(crate) fn for_test(rows: u16, cols: u16) -> Self {
+        let (_tx, rx) = mpsc::channel::<Vec<u8>>();
+        let sink = TerminalEventSink::default();
+        let term = Crosswords::new(
+            CrosswordsSize::new_with_dimensions(
+                usize::from(cols.max(1)),
+                usize::from(rows.max(1)),
+                u32::from(cols.max(1)),
+                u32::from(rows.max(1)),
+                1,
+                1,
+            ),
+            CursorShape::Block,
+            sink.clone(),
+            WindowId::from(0),
+            0,
+            1000,
+        );
+
+        Self {
+            rx: SyncCell::new(rx),
+            writer: Arc::new(Mutex::new(None)),
+            master: SyncCell::new(None),
+            child: None,
+            reader_thread: None,
+            term,
+            processor: Processor::default(),
+            sink,
+            pty_disconnected: false,
+            shutdown_started: false,
+        }
+    }
+
     /// Spawns the shell PTY runtime.
     ///
     /// # Errors
@@ -367,22 +247,47 @@ impl TerminalRuntime {
             }
         });
 
+        let sink = TerminalEventSink::default();
+        let term = Crosswords::new(
+            CrosswordsSize::new_with_dimensions(
+                usize::from(cols.max(1)),
+                usize::from(rows.max(1)),
+                u32::from(cols.max(1)),
+                u32::from(rows.max(1)),
+                1,
+                1,
+            ),
+            CursorShape::Block,
+            sink.clone(),
+            // Route and window ids are Rio's multiplexer bookkeeping; ratty
+            // drives a single terminal, so both are zero.
+            WindowId::from(0),
+            0,
+            config.terminal.scrollback,
+        );
+
         Ok(Self {
             rx: SyncCell::new(rx),
             writer: Arc::new(Mutex::new(Some(writer))),
             master: SyncCell::new(Some(pair.master)),
             child: Some(child),
             reader_thread: Some(reader_thread),
-            parser: Parser::new_with_callbacks(
-                rows,
-                cols,
-                config.terminal.scrollback,
-                TerminalParserCallbacks::default(),
-            ),
-            scrollback_len: config.terminal.scrollback,
+            term,
+            processor: Processor::default(),
+            sink,
             pty_disconnected: false,
             shutdown_started: false,
         })
+    }
+
+    /// Feeds bytes from the PTY into the VT state machine.
+    pub fn process(&mut self, bytes: &[u8]) {
+        self.processor.advance(&mut self.term, bytes);
+    }
+
+    /// Drains the replies rio-vt has queued for write-back to the PTY.
+    pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
+        self.sink.take_replies()
     }
 
     /// Receives pending PTY output without blocking.
@@ -419,26 +324,30 @@ impl TerminalRuntime {
             });
         }
 
-        let (_, old_cols) = self.parser.screen().size();
-        if old_cols == cols || self.parser.screen().alternate_screen() {
-            self.parser.screen_mut().set_size(rows, cols);
-            return;
-        }
-
-        let state = self.parser.screen().state_formatted();
-        let callbacks = std::mem::take(self.parser.callbacks_mut());
-        self.parser = Parser::new_with_callbacks(rows, cols, self.scrollback_len, callbacks);
-        self.parser.process(&state);
+        // rio-vt reflows content and resets the scrolling region natively, so
+        // the grid resize is the whole operation — no snapshot and replay.
+        let pixel_width = u32::from(pw);
+        let pixel_height = u32::from(ph);
+        let cell_width = pixel_width.div_ceil(u32::from(cols));
+        let cell_height = pixel_height.div_ceil(u32::from(rows));
+        self.term.resize(CrosswordsSize::new_with_dimensions(
+            usize::from(cols),
+            usize::from(rows),
+            pixel_width,
+            pixel_height,
+            cell_width,
+            cell_height,
+        ));
     }
 
     /// Returns the active kitty keyboard enhancement flags.
     pub fn kitty_keyboard_flags(&self) -> u8 {
-        self.parser.callbacks().kitty_keyboard_flags()
+        crate::vt::kitty_keyboard_flags(&self.term)
     }
 
     /// Returns the active xterm `modifyOtherKeys` level.
     pub fn modify_other_keys(&self) -> Option<u8> {
-        self.parser.callbacks().modify_other_keys()
+        self.term.modify_other_keys()
     }
 
     /// Shuts down the PTY runtime without blocking the Bevy main thread indefinitely.
@@ -483,19 +392,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cell_size_query_reports_current_pixel_dimensions() {
-        let mut parser = Parser::new_with_callbacks(24, 80, 0, TerminalParserCallbacks::default());
-        parser.callbacks_mut().set_cell_pixel_size(10, 20);
-
-        parser.process(b"\x1b[16t");
-
-        assert_eq!(
-            parser.callbacks_mut().take_replies(),
-            [b"\x1b[6;20;10t".to_vec()]
-        );
-    }
-
-    #[test]
     fn ratty_child_environment_identifies_the_terminal() {
         let mut command = CommandBuilder::new("rchat-tui");
 
@@ -507,5 +403,14 @@ mod tests {
             command.get_env("TERM_PROGRAM_VERSION"),
             Some(OsStr::new(env!("CARGO_PKG_VERSION")))
         );
+    }
+
+    #[test]
+    fn initial_cell_size_query_has_a_nonzero_fallback() {
+        let mut runtime = TerminalRuntime::for_test(24, 80);
+
+        runtime.process(b"\x1b[16t");
+
+        assert_eq!(runtime.take_replies(), [b"\x1b[6;1;1t".to_vec()]);
     }
 }

@@ -70,7 +70,7 @@ impl Plugin for TerminalPlugin {
             .add_message::<ActivateTerminalCameraPreset>()
             .add_systems(Startup, setup_scene)
             .add_systems(Update, request_exit_on_primary_window_close)
-            .add_systems(Update, pump_pty_output)
+            .add_systems(Update, pump_pty_output.after(handle_window_resize))
             .configure_sets(
                 Update,
                 (

@@ -40,6 +40,8 @@ to the `ratty;i` namespace; it does not change RGP or Kitty limits.
 Ratty also applies configurable resource limits before PNG decoding and while
 retaining protocol state. The distributed defaults are:
 
+- maximum registered bitmaps: 1024
+- maximum active placements: 4096
 - maximum image width and height: 8192 pixels each
 - maximum decoded RGBA8 bytes per bitmap: 64 MiB
 - maximum decoded RGBA8 bytes across all registered bitmaps: 256 MiB
@@ -149,8 +151,9 @@ pending registration. An invalid PNG on finalization also clears the pending
 transfer and does not register a bitmap. Other malformed chunks make no state
 change.
 
-Registering an `id` that is already registered is rejected and never replaces
-the existing bitmap or its placements.
+Registering an `id` that is already registered or would exceed the configured
+global bitmap limit is rejected and never replaces the existing bitmap or its
+placements. Deleting a registered bitmap releases its bitmap-count slot.
 
 ## Place bitmap (`p`)
 
@@ -172,8 +175,9 @@ dimensions must be nonzero. The optional placement fields are:
 A source rectangle, when present, must contain all four source fields. Opacity
 must be finite and is clamped to the inclusive range `[0,1]`.
 
-Placement fails without mutation when the bitmap does not exist or `pid` is
-already in use. A bitmap can have any number of distinct placements.
+Placement fails without mutation when the bitmap does not exist, `pid` is
+already in use, or the configured global placement limit has been reached.
+Multiple distinct placements may share a bitmap within that limit.
 
 ## Update placement (`u`)
 

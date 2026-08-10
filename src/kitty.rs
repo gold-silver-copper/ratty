@@ -1,10 +1,13 @@
 //! Kitty graphics protocol parsing.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Cursor};
 
 use base64::Engine as _;
+use rio_vt::crosswords::pos::Column;
 
+use crate::bitmap::BitmapLimits;
 use crate::inline::{InlineAnchor, InlineObject, InlineStyle, KittyInlineObject, RasterObject};
+use crate::vt::{self, CellColor, VtTerminal};
 
 /// Kitty graphics APC prefix.
 pub const KITTY_APC_START: &[u8] = b"\x1b_G";
@@ -16,9 +19,17 @@ const C1_ST: u8 = 0x9c;
 pub struct KittyParserState {
     transfer: Option<KittyTransfer>,
     next_object_id: u32,
+    limits: BitmapLimits,
 }
 
 impl KittyParserState {
+    pub(crate) fn with_limits(limits: BitmapLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     /// Consumes a Kitty graphics APC sequence.
     pub fn consume_sequence(
         &mut self,
@@ -63,7 +74,7 @@ impl KittyParserState {
                 let format = params
                     .get("f")
                     .and_then(|value| value.parse().ok())
-                    .unwrap_or(100);
+                    .unwrap_or(32);
                 let width = params
                     .get("s")
                     .and_then(|value| value.parse().ok())
@@ -73,12 +84,9 @@ impl KittyParserState {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(0);
                 let medium = params.get("t").copied().unwrap_or("d");
-                let result = base64::engine::general_purpose::STANDARD
-                    .decode(payload)
-                    .map_err(|_| "invalid pixel data")
-                    .and_then(|payload| {
-                        validate_direct_query(format, width, height, medium, &payload)
-                    });
+                let result = decode_query_payload(payload, self.limits).and_then(|payload| {
+                    validate_direct_query(format, width, height, medium, &payload, self.limits)
+                });
                 Some(KittyOperation::Query {
                     image_id,
                     result,
@@ -264,25 +272,76 @@ fn validate_direct_query(
     height: u32,
     medium: &str,
     payload: &[u8],
+    limits: BitmapLimits,
 ) -> Result<(), &'static str> {
     if medium != "d" {
         return Err("unsupported transmission medium");
     }
-    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width > limits.max_image_width || height > limits.max_image_height {
+        return Err("image dimensions exceed limit");
+    }
+    if matches!(format, 24 | 32) && (width == 0 || height == 0) {
+        return Err("raw image dimensions must be nonzero");
+    }
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or("image dimensions exceed limit")?;
     let expected = match format {
-        24 => pixels.saturating_mul(3),
-        32 => pixels.saturating_mul(4),
+        24 => pixels.checked_mul(3),
+        32 => pixels.checked_mul(4),
         100 => {
-            return image::load_from_memory_with_format(payload, image::ImageFormat::Png)
-                .map(|_| ())
-                .map_err(|_| "invalid PNG data");
+            let decoder_limits = limits.decoder_limits();
+            let mut dimension_reader =
+                image::ImageReader::with_format(Cursor::new(payload), image::ImageFormat::Png);
+            dimension_reader.limits(decoder_limits.clone());
+            let (png_width, png_height) = dimension_reader
+                .into_dimensions()
+                .map_err(|_| "invalid or oversized PNG data")?;
+            let decoded_bytes = u64::from(png_width)
+                .checked_mul(u64::from(png_height))
+                .and_then(|pixels| pixels.checked_mul(4))
+                .filter(|bytes| *bytes <= limits.max_bitmap_bytes)
+                .ok_or("decoded PNG exceeds limit")?;
+
+            let mut reader =
+                image::ImageReader::with_format(Cursor::new(payload), image::ImageFormat::Png);
+            reader.limits(decoder_limits);
+            let decoded = reader
+                .decode()
+                .map_err(|_| "invalid or oversized PNG data")?;
+            if u64::try_from(decoded.to_rgba8().as_raw().len()).ok() != Some(decoded_bytes) {
+                return Err("decoded PNG byte length does not match its dimensions");
+            }
+            return Ok(());
         }
         _ => return Err("unsupported pixel format"),
-    };
+    }
+    .filter(|bytes| *bytes <= limits.max_bitmap_bytes)
+    .ok_or("decoded image exceeds limit")?;
     if payload.len() as u64 != expected {
         return Err("invalid pixel data");
     }
     Ok(())
+}
+
+fn decode_query_payload(payload: &[u8], limits: BitmapLimits) -> Result<Vec<u8>, &'static str> {
+    let max_encoded_bytes = limits
+        .max_bitmap_bytes
+        .checked_add(2)
+        .map(|bytes| bytes / 3)
+        .and_then(|groups| groups.checked_mul(4))
+        .unwrap_or(u64::MAX);
+    if u64::try_from(payload.len()).unwrap_or(u64::MAX) > max_encoded_bytes {
+        return Err("query payload exceeds limit");
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| "invalid pixel data")?;
+    if u64::try_from(decoded.len()).unwrap_or(u64::MAX) > limits.max_bitmap_bytes {
+        return Err("query payload exceeds limit");
+    }
+    Ok(decoded)
 }
 
 struct KittyTransfer {
@@ -343,11 +402,11 @@ impl KittyTransfer {
     }
 }
 
-/// Refreshes placeholder-backed Kitty anchors from the VT100 screen.
+/// Refreshes placeholder-backed Kitty anchors from the terminal grid.
 pub fn refresh_kitty_placeholder_anchors(
     objects: &HashMap<u32, InlineObject>,
     anchors: &mut HashMap<u32, InlineAnchor>,
-    screen: &vt100::Screen,
+    term: &VtTerminal,
 ) -> bool {
     let placeholder_ids = objects
         .iter()
@@ -365,16 +424,25 @@ pub fn refresh_kitty_placeholder_anchors(
         .collect::<HashMap<_, _>>();
 
     let mut bounds = HashMap::<u32, (u16, u16, u16, u16)>::new();
-    let (rows, cols) = screen.size();
+    let rows = u16::try_from(term.screen_lines()).unwrap_or(u16::MAX);
+    let cols = u16::try_from(term.columns()).unwrap_or(u16::MAX);
+    let styles = vt::styles(term);
     for row in 0..rows {
+        let Some(grid_row) = vt::visible_row(term, row) else {
+            continue;
+        };
+        // rio-vt flags rows holding a U+10EEEE placeholder, so rows without one
+        // skip the per-cell scan entirely.
+        if !grid_row.kitty_virtual_placeholder {
+            continue;
+        }
         for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
-                continue;
-            };
-            if !cell.contents().starts_with('\u{10EEEE}') {
+            let square = grid_row[Column(usize::from(col))];
+            if square.c() != '\u{10EEEE}' {
                 continue;
             }
-            let vt100::Color::Rgb(r, g, b) = cell.fgcolor() else {
+            let (fg, _, _) = vt::cell_attributes(styles, square);
+            let CellColor::Rgb(r, g, b) = fg else {
                 continue;
             };
             let placeholder_id = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
@@ -455,6 +523,82 @@ mod tests {
                 image_id: 9,
                 result: Err("invalid pixel data"),
                 quiet: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn kitty_query_defaults_to_rgba() {
+        let mut state = KittyParserState::default();
+
+        let operation =
+            state.consume_sequence(b"\x1b_Gi=10,s=1,v=1,a=q,t=d;AAAAAA==\x1b\\", (0, 0));
+
+        assert!(matches!(
+            operation,
+            Some(KittyOperation::Query {
+                image_id: 10,
+                result: Ok(()),
+                quiet: 0,
+            })
+        ));
+    }
+
+    #[test]
+    fn kitty_raw_query_rejects_zero_dimensions() {
+        let mut state = KittyParserState::default();
+
+        let operation = state.consume_sequence(b"\x1b_Gi=13,a=q,t=d,f=32;\x1b\\", (0, 0));
+
+        assert!(matches!(
+            operation,
+            Some(KittyOperation::Query {
+                result: Err("raw image dimensions must be nonzero"),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn kitty_query_rejects_payload_before_decoding_past_limit() {
+        let mut state = KittyParserState::with_limits(BitmapLimits {
+            max_bitmap_bytes: 2,
+            ..BitmapLimits::default()
+        });
+
+        let operation =
+            state.consume_sequence(b"\x1b_Gi=11,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", (0, 0));
+
+        assert!(matches!(
+            operation,
+            Some(KittyOperation::Query {
+                result: Err("query payload exceeds limit"),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn kitty_png_query_obeys_decoder_limits() {
+        let mut png = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode PNG");
+        let payload = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        let sequence = format!("\x1b_Gi=12,a=q,t=d,f=100;{payload}\x1b\\");
+        let mut state = KittyParserState::with_limits(BitmapLimits {
+            max_image_width: 1,
+            max_image_height: 1,
+            ..BitmapLimits::default()
+        });
+
+        let operation = state.consume_sequence(sequence.as_bytes(), (0, 0));
+
+        assert!(matches!(
+            operation,
+            Some(KittyOperation::Query {
+                result: Err("invalid or oversized PNG data"),
+                ..
             })
         ));
     }
