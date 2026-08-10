@@ -572,10 +572,10 @@ mod tests {
             .collect()
     }
 
-    /// End-to-end guard for the defect that motivated this engine port: rio-vt's
-    /// `visible_rows` is bound to the DECSTBM scroll region, so a widget built on
-    /// it draws the grid shifted up with blank rows at the bottom the moment an
-    /// application narrows the region — which vim, less, htop and tmux all do.
+    /// End-to-end guard for the defect that motivated this engine port: older
+    /// rio-vt releases bound `visible_rows` to the DECSTBM scroll region, so a
+    /// widget built on it drew the grid shifted up with blank rows at the bottom
+    /// the moment an application narrowed the region.
     #[test]
     fn widget_draws_every_row_with_a_scroll_region_set() {
         let mut input = Vec::new();

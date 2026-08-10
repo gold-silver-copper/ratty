@@ -136,7 +136,7 @@ impl<'a> CellDebugImageRenderer<'a> {
                 if let (Ok(row), Ok(col)) = (u16::try_from(row), u16::try_from(col)) {
                     vt::push_cell_text(&mut text, &term.grid, vt::visible_pos(term, row, col));
                 }
-                let active = !text.is_empty() && !matches!(square.wide(), Wide::Spacer);
+                let active = cell_is_active(&text, square.wide());
                 let fill = if active {
                     bg
                 } else {
@@ -258,6 +258,10 @@ impl<'a> CellDebugImageRenderer<'a> {
     }
 }
 
+fn cell_is_active(text: &str, wide: Wide) -> bool {
+    !text.is_empty() && !matches!(wide, Wide::Spacer | Wide::LeadingSpacer)
+}
+
 #[derive(Clone, Copy)]
 struct CellRect {
     x0: u32,
@@ -344,5 +348,38 @@ fn ansi_index_to_rgba(index: u8) -> Rgba {
             let shade = 8 + (index - 232) * 10;
             [shade, shade, shade, 255]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use rio_vt::ansi::CursorShape;
+    use rio_vt::crosswords::{Crosswords, CrosswordsSize};
+    use rio_vt::event::WindowId;
+    use rio_vt::performer::handler::Processor;
+
+    use crate::vt::TerminalEventSink;
+
+    #[test]
+    fn wrapped_wide_character_padding_is_not_active_content() {
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(14, 2),
+            CursorShape::Block,
+            TerminalEventSink::default(),
+            WindowId::from(0),
+            0,
+            1000,
+        );
+        Processor::default().advance(&mut term, "abcdefghijklm\u{4f60}".as_bytes());
+
+        let row = vt::visible_row(&term, 0).expect("row 0");
+        let square = row[Column(13)];
+        assert!(matches!(square.wide(), Wide::LeadingSpacer));
+
+        let mut text = String::new();
+        vt::push_cell_text(&mut text, &term.grid, vt::visible_pos(&term, 0, 13));
+        assert!(!cell_is_active(&text, square.wide()));
     }
 }

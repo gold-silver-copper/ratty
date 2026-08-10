@@ -512,10 +512,10 @@ mod tests {
         }
     }
 
-    /// rio-vt's `visible_rows` iterates the DECSTBM scroll region, so a widget
-    /// built on it renders the grid shifted up and truncates the bottom rows as
-    /// soon as an application narrows the region. Every row the terminal
-    /// reports must stay reachable and correctly indexed.
+    /// Older rio-vt releases made `visible_rows` iterate the DECSTBM scroll
+    /// region, so a widget built on it rendered the grid shifted up and
+    /// truncated the bottom rows as soon as an application narrowed the region.
+    /// Keep every reported row reachable so that bug cannot return here.
     #[test]
     fn every_row_stays_reachable_with_a_scroll_region_set() {
         let mut harness = Harness::new(10, 20);
