@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 
 use base64::Engine as _;
+use rio_vt::crosswords::pos::Column;
 
 use crate::inline::{InlineAnchor, InlineObject, InlineStyle, KittyInlineObject, RasterObject};
+use crate::vt::{self, CellColor, VtTerminal};
 
 /// Kitty graphics APC prefix.
 pub const KITTY_APC_START: &[u8] = b"\x1b_G";
@@ -273,11 +275,11 @@ impl KittyTransfer {
     }
 }
 
-/// Refreshes placeholder-backed Kitty anchors from the VT100 screen.
+/// Refreshes placeholder-backed Kitty anchors from the terminal grid.
 pub fn refresh_kitty_placeholder_anchors(
     objects: &HashMap<u32, InlineObject>,
     anchors: &mut HashMap<u32, InlineAnchor>,
-    screen: &vt100::Screen,
+    term: &VtTerminal,
 ) -> bool {
     let placeholder_ids = objects
         .iter()
@@ -295,16 +297,25 @@ pub fn refresh_kitty_placeholder_anchors(
         .collect::<HashMap<_, _>>();
 
     let mut bounds = HashMap::<u32, (u16, u16, u16, u16)>::new();
-    let (rows, cols) = screen.size();
+    let rows = u16::try_from(term.screen_lines()).unwrap_or(u16::MAX);
+    let cols = u16::try_from(term.columns()).unwrap_or(u16::MAX);
+    let styles = vt::styles(term);
     for row in 0..rows {
+        let Some(grid_row) = vt::visible_row(term, row) else {
+            continue;
+        };
+        // rio-vt flags rows holding a U+10EEEE placeholder, so rows without one
+        // skip the per-cell scan entirely.
+        if !grid_row.kitty_virtual_placeholder {
+            continue;
+        }
         for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
-                continue;
-            };
-            if !cell.contents().starts_with('\u{10EEEE}') {
+            let square = grid_row[Column(usize::from(col))];
+            if square.c() != '\u{10EEEE}' {
                 continue;
             }
-            let vt100::Color::Rgb(r, g, b) = cell.fgcolor() else {
+            let (fg, _, _) = vt::cell_attributes(styles, square);
+            let CellColor::Rgb(r, g, b) = fg else {
                 continue;
             };
             let placeholder_id = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
