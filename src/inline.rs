@@ -240,7 +240,12 @@ impl TerminalInlineObjects {
                 let keep_from = pending_apc_prefix_start(&self.pending_bytes, cursor);
                 if cursor < keep_from {
                     *terminal_output = true;
-                    runtime.process(&self.pending_bytes[cursor..keep_from]);
+                    let scrolled = process_terminal_output(
+                        &self.pending_bytes[cursor..keep_from],
+                        runtime,
+                        self.has_scroll_tracked_anchors(),
+                    );
+                    self.apply_scroll(scrolled);
                 }
                 if keep_from < pending_len {
                     self.pending_bytes.drain(..keep_from);
@@ -252,7 +257,12 @@ impl TerminalInlineObjects {
             let start = cursor + start_offset;
             if cursor < start {
                 *terminal_output = true;
-                runtime.process(&self.pending_bytes[cursor..start]);
+                let scrolled = process_terminal_output(
+                    &self.pending_bytes[cursor..start],
+                    runtime,
+                    self.has_scroll_tracked_anchors(),
+                );
+                self.apply_scroll(scrolled);
             }
 
             let payload_start = start + APC_START.len();
@@ -271,7 +281,9 @@ impl TerminalInlineObjects {
             }
             if !handled {
                 *terminal_output = true;
-                runtime.process(&sequence);
+                let scrolled =
+                    process_terminal_output(&sequence, runtime, self.has_scroll_tracked_anchors());
+                self.apply_scroll(scrolled);
             }
             cursor = end;
         }
@@ -694,6 +706,14 @@ impl TerminalInlineObjects {
     }
 }
 
+fn process_terminal_output(bytes: &[u8], runtime: &mut TerminalRuntime, track_scroll: bool) -> u16 {
+    let previous = track_scroll.then(|| vt::scroll_snapshot(&runtime.term));
+    runtime.process(bytes);
+    previous.map_or(0, |previous| {
+        vt::upward_scroll_since(previous, &runtime.term)
+    })
+}
+
 struct PendingRgpPayload {
     format: String,
     name: Option<String>,
@@ -914,6 +934,10 @@ mod tests {
         let payload = base64::engine::general_purpose::STANDARD.encode(PNG_2X2);
         let command = format!("\x1b_ratty;i;r;id=7;fmt=png;source=payload;more=0;{payload}\x1b\\");
         assert!(consume(objects, command.as_bytes(), parser).is_empty());
+    }
+
+    fn scroll_one_row() -> Vec<u8> {
+        b"x\r\n".repeat(24)
     }
 
     #[test]
@@ -1150,5 +1174,58 @@ mod tests {
             3
         );
         assert!(objects.needs_sync(Vec2::ZERO, 0, 0));
+    }
+
+    #[test]
+    fn placement_before_scrolling_text_moves_in_wire_order() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+        register_bitmap(&mut objects, &mut parser);
+        let mut chunk = b"\x1b_ratty;i;p;id=7;pid=9;row=5;col=2;w=8;h=3\x1b\\".to_vec();
+        chunk.extend(scroll_one_row());
+
+        consume(&mut objects, &chunk, &mut parser);
+
+        assert_eq!(
+            objects
+                .bitmap
+                .placement(9)
+                .expect("placement should survive one row of scrolling")
+                .row(),
+            4
+        );
+    }
+
+    #[test]
+    fn placement_after_scrolling_text_is_not_moved_retroactively() {
+        let mut objects = TerminalInlineObjects::default();
+        let mut parser = parser();
+        register_bitmap(&mut objects, &mut parser);
+        consume(
+            &mut objects,
+            b"\x1b_ratty;i;p;id=7;pid=8;row=10;col=2;w=8;h=3\x1b\\",
+            &mut parser,
+        );
+        let mut chunk = scroll_one_row();
+        chunk.extend(b"\x1b_ratty;i;p;id=7;pid=9;row=5;col=2;w=8;h=3\x1b\\");
+
+        consume(&mut objects, &chunk, &mut parser);
+
+        assert_eq!(
+            objects
+                .bitmap
+                .placement(8)
+                .expect("older placement should survive one row of scrolling")
+                .row(),
+            9
+        );
+        assert_eq!(
+            objects
+                .bitmap
+                .placement(9)
+                .expect("new placement should be created after the scroll")
+                .row(),
+            5
+        );
     }
 }

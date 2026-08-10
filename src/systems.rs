@@ -172,8 +172,6 @@ pub fn pump_pty_output(
     loop {
         match runtime.try_recv() {
             Ok(chunk) => {
-                let track_scroll = inline_objects.has_scroll_tracked_anchors();
-                let prev_rows = track_scroll.then(|| vt::visible_row_texts(&runtime.term));
                 let mut replies = inline_objects.consume_pty_output(
                     &chunk,
                     &mut runtime,
@@ -186,11 +184,6 @@ pub fn pump_pty_output(
                 replies.extend(runtime.take_replies());
                 for reply in replies {
                     runtime.write_input(&reply);
-                }
-                if let Some(prev_rows) = prev_rows {
-                    let next_rows = vt::visible_row_texts(&runtime.term);
-                    let scrolled = infer_upward_scroll(&prev_rows, &next_rows);
-                    inline_objects.apply_scroll(scrolled);
                 }
                 inline_objects.refresh_placeholder_anchors(&runtime.term);
             }
@@ -208,21 +201,6 @@ pub fn pump_pty_output(
     if processed_output {
         redraw.request();
     }
-}
-
-fn infer_upward_scroll(prev_rows: &[String], next_rows: &[String]) -> u16 {
-    let max_shift = prev_rows.len().min(next_rows.len());
-    for shift in (1..max_shift).rev() {
-        if prev_rows
-            .iter()
-            .skip(shift)
-            .zip(next_rows.iter())
-            .all(|(prev, next)| prev == next)
-        {
-            return shift as u16;
-        }
-    }
-    0
 }
 
 #[derive(SystemParam)]
@@ -834,7 +812,7 @@ pub(crate) fn sync_bitmap_placements(mut params: SyncBitmapParams) {
             destination,
             placement.fit(),
         );
-        let uniform = bitmap_uniform(&placement, layout);
+        let uniform = bitmap_uniform(&placement, layout, terminal.cols, terminal.rows);
         let transform = Transform::from_xyz(center.x, center.y, 5.0);
         let render_state = BitmapPlacementRenderState {
             image: image.clone(),
@@ -970,7 +948,10 @@ fn sync_bitmap_image(
 fn bitmap_uniform(
     placement: &BitmapPlacementState,
     layout: crate::bitmap_material::ResolvedBitmapLayout,
+    terminal_cols: u16,
+    terminal_rows: u16,
 ) -> BitmapSurfaceUniform {
+    let (clip_min, clip_max) = bitmap_clip_bounds(placement, terminal_cols, terminal_rows);
     BitmapSurfaceUniform {
         uv_min: layout.uv_min,
         uv_max: layout.uv_max,
@@ -981,7 +962,29 @@ fn bitmap_uniform(
         },
         content_min: layout.content_min,
         content_max: layout.content_max,
+        clip_min,
+        clip_max,
     }
+}
+
+fn bitmap_clip_bounds(
+    placement: &BitmapPlacementState,
+    terminal_cols: u16,
+    terminal_rows: u16,
+) -> (Vec2, Vec2) {
+    let col = f64::from(placement.col());
+    let row = placement.row() as f64;
+    let columns = f64::from(placement.columns());
+    let rows = f64::from(placement.rows());
+    let clip_min = Vec2::new(
+        (-col / columns).clamp(0.0, 1.0) as f32,
+        (-row / rows).clamp(0.0, 1.0) as f32,
+    );
+    let clip_max = Vec2::new(
+        ((f64::from(terminal_cols) - col) / columns).clamp(0.0, 1.0) as f32,
+        ((f64::from(terminal_rows) - row) / rows).clamp(0.0, 1.0) as f32,
+    );
+    (clip_min, clip_max)
 }
 
 fn inline_layout(
@@ -2150,13 +2153,119 @@ fn mobius_surface_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitmap::{
+        BitmapFilter, BitmapFit, BitmapOperation, BitmapPlacement, BitmapRegisterChunk,
+    };
+    use crate::runtime::TerminalRuntime;
     use crate::scene::MobiusEnterZoomFloor;
+
+    const PNG_2X2: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72,
+        0xb6, 0x0d, 0x24, 0x00, 0x00, 0x00, 0x12, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x0c, 0x81, 0x34, 0x18, 0x00, 0x00, 0x49, 0xc8, 0x09, 0xf7, 0xf9,
+        0xab, 0xb6, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
 
     #[derive(Resource, Default)]
     struct CameraChangedProbe(bool);
 
     #[derive(Resource, Default)]
     struct VisibilityChangedProbe(usize);
+
+    #[test]
+    fn scroll_tracking_ignores_unchanged_terminal_state() {
+        let runtime = TerminalRuntime::for_test(24, 80);
+        let previous = vt::scroll_snapshot(&runtime.term);
+
+        assert_eq!(vt::upward_scroll_since(previous, &runtime.term), 0);
+    }
+
+    #[test]
+    fn scroll_tracking_uses_the_vt_viewport_top() {
+        let mut runtime = TerminalRuntime::for_test(3, 10);
+        let previous = vt::scroll_snapshot(&runtime.term);
+
+        runtime.process(b"a\r\nb\r\nc\r\nd");
+
+        assert_eq!(vt::upward_scroll_since(previous, &runtime.term), 1);
+    }
+
+    #[test]
+    fn scroll_tracking_holds_content_while_viewing_scrollback() {
+        let mut runtime = TerminalRuntime::for_test(3, 10);
+        runtime.process(b"a\r\nb\r\nc\r\nd\r\ne\r\nf");
+        vt::set_scrollback(&mut runtime.term, 2);
+        let previous = vt::scroll_snapshot(&runtime.term);
+
+        runtime.process(b"\r\ng");
+
+        assert_eq!(vt::upward_scroll_since(previous, &runtime.term), 0);
+    }
+
+    #[test]
+    fn scroll_tracking_does_not_cross_screen_buffers() {
+        let mut runtime = TerminalRuntime::for_test(3, 10);
+        let previous = vt::scroll_snapshot(&runtime.term);
+
+        runtime.process(b"\x1b[?1049h");
+
+        assert_eq!(vt::upward_scroll_since(previous, &runtime.term), 0);
+    }
+
+    #[test]
+    fn fragmented_bitmap_frame_does_not_move_its_placement() {
+        let mut runtime = TerminalRuntime::for_test(24, 80);
+        let mut objects = TerminalInlineObjects::default();
+        objects
+            .bitmap
+            .apply(BitmapOperation::Register(BitmapRegisterChunk {
+                bitmap_id: 1,
+                format: Some("png".into()),
+                source: Some("payload".into()),
+                name: None,
+                more: false,
+                data: PNG_2X2.to_vec(),
+            }))
+            .expect("valid PNG registration should succeed");
+        objects
+            .bitmap
+            .apply(BitmapOperation::Place(BitmapPlacement {
+                bitmap_id: 1,
+                placement_id: 2,
+                row: 5,
+                col: 2,
+                columns: 8,
+                rows: 4,
+                source: None,
+                fit: BitmapFit::Contain,
+                filter: BitmapFilter::Linear,
+                opacity: 1.0,
+            }))
+            .expect("valid placement should succeed");
+        let command =
+            b"\x1b_ratty;i;f;id=1;seq=1;fmt=rgba8;w=2;h=2;more=0;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\";
+        let mut camera_updates = Vec::new();
+        let mut terminal_output = false;
+
+        for fragment in command.chunks(13) {
+            objects.consume_pty_output(
+                fragment,
+                &mut runtime,
+                &mut camera_updates,
+                &mut terminal_output,
+            );
+        }
+
+        assert_eq!(
+            objects
+                .bitmap
+                .placement(2)
+                .expect("frame fragments must preserve the placement")
+                .row(),
+            5
+        );
+    }
 
     fn record_camera_change(
         camera_slots: Res<TerminalCameraSlots>,
@@ -2608,6 +2717,8 @@ mod bitmap_sync_tests {
                 filter_mode: 1,
                 content_min: Vec2::ZERO,
                 content_max: Vec2::ONE,
+                clip_min: Vec2::ZERO,
+                clip_max: Vec2::ONE,
             },
         }
     }
@@ -2747,6 +2858,34 @@ mod bitmap_sync_tests {
         assert_eq!(rendered.len(), 2);
         assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
         assert_eq!(rendered[&7].1, rendered[&8].1);
+    }
+
+    #[test]
+    fn partially_scrolled_placement_is_clipped_without_resizing_its_quad() {
+        let mut app = test_app();
+        register_and_place(&mut app, &[1]);
+        app.update();
+        let before = rendered_placements(&mut app)
+            .remove(&1)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+
+        app.world_mut()
+            .resource_mut::<TerminalInlineObjects>()
+            .bitmap
+            .apply_scroll(2);
+        app.update();
+
+        let after = rendered_placements(&mut app)
+            .remove(&1)
+            .expect("partially visible placement should remain rendered");
+        assert_eq!(before.2, after.2, "scrolling must preserve the full quad");
+        let material = app
+            .world()
+            .resource::<Assets<BitmapSurfaceMaterial>>()
+            .get(&after.3)
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        assert_eq!(material.params.clip_min, Vec2::new(0.0, 0.25));
+        assert_eq!(material.params.clip_max, Vec2::ONE);
     }
 
     #[test]

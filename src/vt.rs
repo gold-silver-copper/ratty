@@ -24,6 +24,35 @@ use rio_vt::event::{EventListener, RioEvent, WindowId};
 /// The rio-vt state machine ratty drives.
 pub type VtTerminal = Crosswords<TerminalEventSink>;
 
+/// Scroll position snapshot tied to one terminal screen buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScrollSnapshot {
+    alternate_screen: bool,
+    viewport_top: u64,
+}
+
+/// Captures the stable absolute row at the top of the visible viewport.
+pub(crate) fn scroll_snapshot(term: &VtTerminal) -> ScrollSnapshot {
+    let absolute_top = term
+        .lines_evicted()
+        .saturating_add(u64::try_from(term.history_size()).unwrap_or(u64::MAX));
+    ScrollSnapshot {
+        alternate_screen: term.mode().contains(Mode::ALT_SCREEN),
+        viewport_top: absolute_top
+            .saturating_sub(u64::try_from(term.display_offset()).unwrap_or(u64::MAX)),
+    }
+}
+
+/// Returns exact upward viewport movement since a snapshot.
+pub(crate) fn upward_scroll_since(previous: ScrollSnapshot, term: &VtTerminal) -> u16 {
+    let current = scroll_snapshot(term);
+    if current.alternate_screen != previous.alternate_screen {
+        return 0;
+    }
+
+    u16::try_from(current.viewport_top.saturating_sub(previous.viewport_top)).unwrap_or(u16::MAX)
+}
+
 /// Sink for the events rio-vt raises while parsing.
 ///
 /// The only variant ratty acts on today is [`RioEvent::PtyWrite`] — the
@@ -227,8 +256,8 @@ pub fn visible_pos(term: &VtTerminal, row: u16, col: u16) -> Pos {
 
 /// Returns each visible row as a trailing-trimmed string.
 ///
-/// Allocates, so it is only worth calling when something actually diffs rows —
-/// today that is inline-object scroll tracking.
+/// Allocates, so production rendering should prefer borrowing rows and cells
+/// directly; this helper is primarily useful for snapshots and tests.
 pub fn visible_row_texts(term: &VtTerminal) -> Vec<String> {
     let columns = term.columns();
     (0..term.screen_lines())

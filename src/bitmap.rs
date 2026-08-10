@@ -721,7 +721,7 @@ impl RegisteredBitmap {
 pub struct BitmapPlacementState {
     generation: u64,
     bitmap_id: u32,
-    row: u16,
+    row: i64,
     col: u16,
     columns: u32,
     rows: u32,
@@ -743,7 +743,7 @@ impl BitmapPlacementState {
     }
 
     /// Returns the placement's terminal row.
-    pub(crate) fn row(&self) -> u16 {
+    pub(crate) fn row(&self) -> i64 {
         self.row
     }
 
@@ -963,14 +963,13 @@ impl BitmapSurfaceState {
 
         let mut changed = false;
         self.placements.retain(|_, placement| {
-            let new_row = placement.row as i64 - rows_scrolled as i64;
+            let new_row = placement.row.saturating_sub(i64::from(rows_scrolled));
             if new_row + placement.rows as i64 <= 0 {
                 changed = true;
                 return false;
             }
-            let row = new_row.max(0) as u16;
-            changed |= row != placement.row;
-            placement.row = row;
+            changed |= new_row != placement.row;
+            placement.row = new_row;
             true
         });
         self.dirty |= changed;
@@ -1132,7 +1131,7 @@ impl BitmapSurfaceState {
             BitmapPlacementState {
                 generation,
                 bitmap_id: placement.bitmap_id,
-                row: placement.row,
+                row: i64::from(placement.row),
                 col: placement.col,
                 columns: placement.columns,
                 rows: placement.rows,
@@ -1171,7 +1170,7 @@ impl BitmapSurfaceState {
             .ok_or_else(|| BitmapProtocolError::new("placement bitmap is not registered"))?;
         let mut next = current.clone();
         if let Some(row) = update.row {
-            next.row = row;
+            next.row = i64::from(row);
         }
         if let Some(col) = update.col {
             next.col = col;
@@ -2459,6 +2458,26 @@ mod tests {
         assert!(state.placement(11).is_none());
         assert_eq!(state.bitmaps().count(), 0);
         assert_eq!(state.placements().count(), 0);
+    }
+
+    #[test]
+    fn scrolling_preserves_a_negative_origin_until_the_placement_is_fully_clipped() {
+        let mut state = registered_state();
+        state
+            .apply(placement(1, 10))
+            .expect("valid bitmap test fixture should succeed");
+
+        state.apply_scroll(2);
+
+        let placement = state
+            .placement(10)
+            .expect("partially visible placement should remain active");
+        assert_eq!(placement.row(), -1);
+        assert_eq!(placement.rows(), 4);
+
+        state.apply_scroll(3);
+
+        assert!(state.placement(10).is_none());
     }
 
     #[test]

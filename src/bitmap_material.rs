@@ -42,6 +42,10 @@ pub struct BitmapSurfaceUniform {
     pub content_min: Vec2,
     /// Bottom-right normalized destination content bound.
     pub content_max: Vec2,
+    /// Top-left normalized terminal-viewport clip bound.
+    pub clip_min: Vec2,
+    /// Bottom-right normalized terminal-viewport clip bound.
+    pub clip_max: Vec2,
 }
 
 impl Material2d for BitmapSurfaceMaterial {

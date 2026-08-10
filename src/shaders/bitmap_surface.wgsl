@@ -8,6 +8,8 @@ struct BitmapSurfaceUniform {
     filter_mode: u32,
     content_min: vec2<f32>,
     content_max: vec2<f32>,
+    clip_min: vec2<f32>,
+    clip_max: vec2<f32>,
 };
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var bitmap_image: texture_2d<f32>;
@@ -37,6 +39,9 @@ fn sample_linear(uv: vec2<f32>, minimum: vec2<i32>, maximum: vec2<i32>) -> vec4<
 
 @fragment
 fn fragment(mesh: VertexOutput) -> @location(0) vec4<f32> {
+    if (any(mesh.uv < params.clip_min) || any(mesh.uv > params.clip_max)) {
+        return vec4<f32>(0.0);
+    }
     if (any(mesh.uv < params.content_min) || any(mesh.uv > params.content_max)) {
         return vec4<f32>(0.0);
     }
