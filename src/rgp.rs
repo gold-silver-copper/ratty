@@ -7,6 +7,8 @@ use crate::scene::TerminalPresentationMode;
 
 /// Ratty Graphics Protocol APC prefix.
 pub const RGP_APC_START: &[u8] = b"\x1b_ratty;g;";
+/// Maximum encoded control-header bytes accepted before any RGP payload.
+pub(crate) const RGP_CONTROL_HEADER_LIMIT: usize = 16 * 1024;
 const ST: &[u8] = b"\x1b\\";
 const C1_ST: u8 = 0x9c;
 
@@ -105,6 +107,14 @@ impl Default for RgpRegisterOptions {
 
 /// Consumes an RGP APC sequence.
 pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
+    consume_sequence_with_payload_limit(sequence, usize::MAX)
+}
+
+/// Consumes an RGP APC sequence while bounding one decoded payload chunk.
+pub(crate) fn consume_sequence_with_payload_limit(
+    sequence: &[u8],
+    max_payload_bytes: usize,
+) -> Option<RgpOperation> {
     if !sequence.starts_with(RGP_APC_START) {
         return None;
     }
@@ -116,9 +126,15 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
     } else {
         return None;
     };
-    let content = std::str::from_utf8(&sequence[RGP_APC_START.len()..content_end]).ok()?;
+    let content_bytes = &sequence[RGP_APC_START.len()..content_end];
+    let payload_start = rgp_payload_start(content_bytes);
+    if payload_start.unwrap_or(content_bytes.len()) > RGP_CONTROL_HEADER_LIMIT {
+        return Some(RgpOperation::Ignored);
+    }
+    let content = std::str::from_utf8(content_bytes).ok()?;
     let mut parts = content.split(';');
     let verb = parts.next()?;
+    let mut part_offset = verb.len().saturating_add(1);
     let mut id = None;
     let mut format = None;
     let mut path = None;
@@ -128,6 +144,7 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
     let mut name = None;
     let mut set = None;
     let mut invalid_camera_field = false;
+    let mut invalid_style_field = false;
     let mut row = None;
     let mut col = None;
     let mut width = None;
@@ -149,15 +166,21 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
     let mut sz = None;
     let mut normalize = None;
     let mut payload = None;
-    for part in parts.filter(|part| !part.is_empty()) {
+    for part in parts {
+        let part_start = part_offset;
+        part_offset = part_offset.saturating_add(part.len()).saturating_add(1);
+        if part.is_empty() {
+            continue;
+        }
+        if payload_start == Some(part_start) {
+            payload = Some(part.to_string());
+            break;
+        }
         let Some((key, value)) = part.split_once('=') else {
-            if verb == "r" && source.as_deref() == Some("payload") {
-                payload = Some(part.to_string());
-                break;
-            }
             // A value-less token in a camera command is a truncated or broken
             // emitter; reject the whole command instead of partially applying.
             invalid_camera_field |= verb == "c";
+            invalid_style_field |= matches!(verb, "p" | "u");
             continue;
         };
         match key {
@@ -183,47 +206,65 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
             "scale" => {
                 scale = parse_finite_f32(value);
                 invalid_camera_field |= verb == "c" && scale.is_none();
+                invalid_style_field |= matches!(verb, "p" | "u") && scale.is_none();
             }
             "fov" => {
                 // Degrees on the wire; radians everywhere past this point.
                 fov = parse_finite_f32(value).map(f32::to_radians);
                 invalid_camera_field |= verb == "c" && fov.is_none();
             }
-            "depth" => depth = value.parse().ok(),
+            "depth" => {
+                depth = parse_finite_f32(value);
+                invalid_style_field |= matches!(verb, "p" | "u") && depth.is_none();
+            }
             "color" | "tint" => color = parse_color(value),
-            "brightness" => brightness = value.parse().ok(),
+            "brightness" => {
+                brightness = parse_finite_f32(value);
+                invalid_style_field |= matches!(verb, "p" | "u") && brightness.is_none();
+            }
             "px" => {
                 px = parse_finite_f32(value);
                 invalid_camera_field |= verb == "c" && px.is_none();
+                invalid_style_field |= matches!(verb, "p" | "u") && px.is_none();
             }
             "py" => {
                 py = parse_finite_f32(value);
                 invalid_camera_field |= verb == "c" && py.is_none();
+                invalid_style_field |= matches!(verb, "p" | "u") && py.is_none();
             }
             "pz" => {
                 pz = parse_finite_f32(value);
                 invalid_camera_field |= verb == "c" && pz.is_none();
+                invalid_style_field |= matches!(verb, "p" | "u") && pz.is_none();
             }
             "rx" => {
                 rx = parse_finite_f32(value);
                 invalid_camera_field |= verb == "c" && rx.is_none();
+                invalid_style_field |= matches!(verb, "p" | "u") && rx.is_none();
             }
             "ry" => {
                 ry = parse_finite_f32(value);
                 invalid_camera_field |= verb == "c" && ry.is_none();
+                invalid_style_field |= matches!(verb, "p" | "u") && ry.is_none();
             }
             "rz" => {
                 rz = parse_finite_f32(value);
                 invalid_camera_field |= verb == "c" && rz.is_none();
+                invalid_style_field |= matches!(verb, "p" | "u") && rz.is_none();
             }
-            "sx" => sx = value.parse().ok(),
-            "sy" => sy = value.parse().ok(),
-            "sz" => sz = value.parse().ok(),
+            "sx" => {
+                sx = parse_finite_f32(value);
+                invalid_style_field |= matches!(verb, "p" | "u") && sx.is_none();
+            }
+            "sy" => {
+                sy = parse_finite_f32(value);
+                invalid_style_field |= matches!(verb, "p" | "u") && sy.is_none();
+            }
+            "sz" => {
+                sz = parse_finite_f32(value);
+                invalid_style_field |= matches!(verb, "p" | "u") && sz.is_none();
+            }
             "normalize" => normalize = parse_bool(value),
-            _ if verb == "r" && source.as_deref() == Some("payload") => {
-                payload = Some(part.to_string());
-                break;
-            }
             _ => {}
         }
     }
@@ -269,9 +310,21 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
                 if source.as_deref() != Some("payload") {
                     return None;
                 }
+                let payload = payload.unwrap_or_default();
+                let max_encoded_bytes = max_payload_bytes
+                    .checked_add(2)
+                    .map(|bytes| bytes / 3)
+                    .and_then(|groups| groups.checked_mul(4))
+                    .unwrap_or(usize::MAX);
+                if payload.len() > max_encoded_bytes {
+                    return Some(RgpOperation::Ignored);
+                }
                 let data = base64::engine::general_purpose::STANDARD
-                    .decode(payload.unwrap_or_default())
+                    .decode(payload)
                     .ok()?;
+                if data.len() > max_payload_bytes {
+                    return Some(RgpOperation::Ignored);
+                }
                 RgpRegisterSource::Payload {
                     name,
                     more: more.unwrap_or(false),
@@ -279,6 +332,7 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
                 }
             },
         }),
+        "p" if invalid_style_field => Some(RgpOperation::Ignored),
         "p" => Some(RgpOperation::Place {
             object_id: id?,
             anchor: RgpAnchor {
@@ -298,6 +352,7 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
                 },
             },
         }),
+        "u" if invalid_style_field => Some(RgpOperation::Ignored),
         "u" => Some(RgpOperation::Update {
             object_id: id?,
             update: RgpPlacementUpdate {
@@ -313,6 +368,101 @@ pub fn consume_sequence(sequence: &[u8]) -> Option<RgpOperation> {
         }),
         "d" => Some(RgpOperation::Delete { object_id: id }),
         _ => Some(RgpOperation::Ignored),
+    }
+}
+
+fn rgp_payload_start(content: &[u8]) -> Option<usize> {
+    let mut tokens = content.split(|byte| *byte == b';');
+    if tokens.next() != Some(b"r".as_slice()) {
+        return None;
+    }
+    let mut offset = 2usize;
+
+    let mut source_is_payload = false;
+    for token in tokens {
+        let token_start = offset;
+        offset = offset.saturating_add(token.len()).saturating_add(1);
+        if token.is_empty() {
+            continue;
+        }
+        if source_is_payload
+            && (!is_known_rgp_control_field(token) || is_standard_base64_token(token))
+        {
+            return Some(token_start);
+        }
+        if let Some(value) = token.strip_prefix(b"source=") {
+            source_is_payload = value == b"payload";
+        }
+    }
+
+    None
+}
+
+fn is_known_rgp_control_field(token: &[u8]) -> bool {
+    let Some(separator) = token.iter().position(|byte| *byte == b'=') else {
+        return false;
+    };
+    matches!(
+        &token[..separator],
+        b"id"
+            | b"fmt"
+            | b"path"
+            | b"type"
+            | b"source"
+            | b"more"
+            | b"name"
+            | b"set"
+            | b"row"
+            | b"col"
+            | b"w"
+            | b"h"
+            | b"animate"
+            | b"scale"
+            | b"fov"
+            | b"depth"
+            | b"color"
+            | b"tint"
+            | b"brightness"
+            | b"px"
+            | b"py"
+            | b"pz"
+            | b"rx"
+            | b"ry"
+            | b"rz"
+            | b"sx"
+            | b"sy"
+            | b"sz"
+            | b"normalize"
+    )
+}
+
+fn is_standard_base64_token(token: &[u8]) -> bool {
+    if token.is_empty() {
+        return true;
+    }
+
+    let mut padding = 0usize;
+    let mut saw_padding = false;
+    for byte in token {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/') {
+            if saw_padding {
+                return false;
+            }
+        } else if *byte == b'=' {
+            saw_padding = true;
+            padding = padding.saturating_add(1);
+            if padding > 2 {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    if padding > 0 {
+        token.len().is_multiple_of(4)
+    } else {
+        token.len() % 4 != 1
     }
 }
 
@@ -405,7 +555,10 @@ fn parse_bool(value: &str) -> Option<bool> {
 }
 
 fn parse_finite_f32(value: &str) -> Option<f32> {
-    value.parse::<f32>().ok().filter(|value| value.is_finite())
+    value
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite() && value.abs() <= 1_000_000.0)
 }
 
 #[cfg(test)]
@@ -486,5 +639,88 @@ mod camera_tests {
             };
             assert_eq!(settings.camera_type, Some(expected));
         }
+    }
+
+    #[test]
+    fn rejects_non_finite_and_extreme_object_style_floats() {
+        for body in [
+            "p;id=1;row=1;col=1;w=1;h=1;depth=NaN",
+            "p;id=1;row=1;col=1;w=1;h=1;sx=inf",
+            "u;id=1;brightness=-inf",
+            "u;id=1;scale=1000001",
+        ] {
+            let sequence = format!("\x1b_ratty;g;{body}\x1b\\");
+            assert!(
+                matches!(
+                    consume_sequence(sequence.as_bytes()),
+                    Some(RgpOperation::Ignored)
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_oversized_control_header_before_string_materialization() {
+        let sequence = format!(
+            "\x1b_ratty;g;r;id=1;fmt=obj;path={}\x1b\\",
+            "a".repeat(RGP_CONTROL_HEADER_LIMIT)
+        );
+        assert!(matches!(
+            consume_sequence_with_payload_limit(sequence.as_bytes(), usize::MAX),
+            Some(RgpOperation::Ignored)
+        ));
+    }
+
+    #[test]
+    fn permits_a_payload_larger_than_the_control_header_limit() {
+        let encoded = "A".repeat(RGP_CONTROL_HEADER_LIMIT + 4);
+        let sequence = format!("\x1b_ratty;g;r;id=1;fmt=obj;source=payload;more=0;{encoded}\x1b\\");
+        let Some(RgpOperation::Register {
+            source: RgpRegisterSource::Payload { data, .. },
+            ..
+        }) = consume_sequence_with_payload_limit(sequence.as_bytes(), RGP_CONTROL_HEADER_LIMIT)
+        else {
+            panic!("expected a bounded payload registration");
+        };
+        assert_eq!(data.len(), (RGP_CONTROL_HEADER_LIMIT + 4) / 4 * 3);
+    }
+
+    #[test]
+    fn parses_a_padded_payload_that_looks_like_a_control_field() {
+        let expected = base64::engine::general_purpose::STANDARD
+            .decode("row=")
+            .expect("test payload");
+        for controls in ["", "row=1;"] {
+            let sequence =
+                format!("\x1b_ratty;g;r;id=1;fmt=obj;source=payload;{controls}row=\x1b\\");
+            let Some(RgpOperation::Register {
+                source: RgpRegisterSource::Payload { data, .. },
+                ..
+            }) = consume_sequence_with_payload_limit(sequence.as_bytes(), 16)
+            else {
+                panic!("expected padded payload after {controls:?}");
+            };
+            assert_eq!(
+                data.as_slice(),
+                expected.as_slice(),
+                "controls: {controls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_source_fields_cannot_hide_an_oversized_header() {
+        let content = format!(
+            "r;id=1;fmt=obj;source=payload;source=path;A;name={}",
+            "a".repeat(RGP_CONTROL_HEADER_LIMIT)
+        );
+        assert_eq!(rgp_payload_start(content.as_bytes()), None);
+
+        let sequence = format!("\x1b_ratty;g;{content}\x1b\\");
+        assert!(matches!(
+            consume_sequence_with_payload_limit(sequence.as_bytes(), usize::MAX),
+            Some(RgpOperation::Ignored)
+        ));
     }
 }

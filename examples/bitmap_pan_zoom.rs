@@ -178,6 +178,8 @@ fn encode_registration(bitmap_id: u32, encoded_png: &str) -> Vec<Vec<u8>> {
 }
 
 fn encode_placement(bitmap_id: u32, placement_id: u32, destination: Destination) -> Vec<u8> {
+    // row/col are visible coordinates now; Ratty attaches the resulting
+    // placement to this alternate-screen content for later scroll/reflow.
     encode_command(format!(
         "p;id={bitmap_id};pid={placement_id};row={};col={};w={};h={};fit=contain;filter=linear;opacity=1",
         destination.row, destination.col, destination.columns, destination.rows

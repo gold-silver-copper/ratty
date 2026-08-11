@@ -1,492 +1,344 @@
-//! Kitty graphics protocol parsing.
+//! Renderer-side integration for rio-vt's native Kitty graphics state.
+//!
+//! Ratty deliberately does not parse Kitty APCs here. Complete APC frames are
+//! forwarded unchanged to rio-vt; this module only owns Bevy asset handles and
+//! converts rio-vt's direct/Unicode-placeholder placement geometry into draw
+//! records.
 
-use std::{collections::HashMap, io::Cursor};
+use std::collections::HashMap;
 
-use base64::Engine as _;
+use bevy::prelude::*;
+use rio_graphics::GraphicData;
+use rio_vt::ansi::graphics::{OverlayViewport, UpdateQueues, kitty_overlay_geometry};
+use rio_vt::ansi::kitty_virtual::{IncompletePlacement, PlaceholderRun, compute_run_geometry};
 use rio_vt::crosswords::pos::Column;
 
-use crate::bitmap::BitmapLimits;
-use crate::inline::{InlineAnchor, InlineObject, InlineStyle, KittyInlineObject, RasterObject};
-use crate::vt::{self, CellColor, VtTerminal};
+use crate::bitmap_material::BitmapSurfaceMaterial;
+use crate::vt::{self, VtTerminal};
 
-/// Kitty graphics APC prefix.
-pub const KITTY_APC_START: &[u8] = b"\x1b_G";
-const ST: &[u8] = b"\x1b\\";
-const C1_ST: u8 = 0x9c;
+/// Marker for one native Kitty draw entity.
+#[derive(Component)]
+pub struct TerminalKittyPlacement;
 
-/// Parser state for Kitty graphics sequences.
+/// Stable Bevy image asset for one Kitty protocol image id.
+pub(crate) struct KittyImageAsset {
+    pub(crate) handle: Handle<Image>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+/// Renderer-owned state. Pixel lifetime and placement truth remain in rio-vt.
 #[derive(Default)]
-pub struct KittyParserState {
-    transfer: Option<KittyTransfer>,
-    next_object_id: u32,
-    limits: BitmapLimits,
+pub(crate) struct KittyRenderCache {
+    pub(crate) images: HashMap<u32, KittyImageAsset>,
+    /// Final queued frontend action per image id. Replacements coalesce so a
+    /// burst of retransmissions cannot retain one decoded pixel buffer per APC.
+    pub(crate) pending_updates: HashMap<u32, Option<GraphicData>>,
+    pub(crate) meshes: Vec<Handle<Mesh>>,
+    pub(crate) sprite_materials: Vec<Handle<BitmapSurfaceMaterial>>,
+    pub(crate) plane_materials: Vec<Handle<StandardMaterial>>,
+    dirty: bool,
 }
 
-impl KittyParserState {
-    pub(crate) fn with_limits(limits: BitmapLimits) -> Self {
-        Self {
-            limits,
-            ..Self::default()
-        }
-    }
-
-    /// Consumes a Kitty graphics APC sequence.
-    pub fn consume_sequence(
-        &mut self,
-        sequence: &[u8],
-        cursor_position: (u16, u16),
-    ) -> Option<KittyOperation> {
-        if !sequence.starts_with(KITTY_APC_START) {
-            return None;
-        }
-
-        let content_end = if sequence.ends_with(&[C1_ST]) {
-            sequence.len() - 1
-        } else if sequence.ends_with(ST) {
-            sequence.len() - 2
-        } else {
-            return None;
-        };
-        let content = &sequence[KITTY_APC_START.len()..content_end];
-        let separator = content.iter().position(|byte| *byte == b';')?;
-        let header = std::str::from_utf8(&content[..separator]).ok()?;
-        let payload = &content[separator + 1..];
-
-        let mut params = HashMap::new();
-        for part in header.split(',').filter(|part| !part.is_empty()) {
-            let Some((key, value)) = part.split_once('=') else {
-                continue;
-            };
-            params.insert(key, value);
-        }
-
-        let action = params.get("a").copied().unwrap_or("T");
-        match action {
-            "q" => {
-                let image_id = params
-                    .get("i")
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
-                let quiet = params
-                    .get("q")
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
-                let format = params
-                    .get("f")
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(32);
-                let width = params
-                    .get("s")
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
-                let height = params
-                    .get("v")
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
-                let medium = params.get("t").copied().unwrap_or("d");
-                let result = decode_query_payload(payload, self.limits).and_then(|payload| {
-                    validate_direct_query(format, width, height, medium, &payload, self.limits)
-                });
-                Some(KittyOperation::Query {
-                    image_id,
-                    result,
-                    quiet,
-                })
+impl KittyRenderCache {
+    pub(crate) fn queue_updates(&mut self, updates: impl IntoIterator<Item = UpdateQueues>) {
+        let mut changed = false;
+        for update in updates {
+            for key in update.remove_queue {
+                let Ok(image_id) = u32::try_from(key) else {
+                    continue;
+                };
+                self.pending_updates.insert(image_id, None);
+                changed = true;
             }
-            "T" | "t" => {
-                let starts_new_transfer = self.transfer.is_none()
-                    || params.contains_key("a")
-                    || params.contains_key("f")
-                    || params.contains_key("s")
-                    || params.contains_key("v")
-                    || params.contains_key("i");
-                if starts_new_transfer {
-                    let object_id = params
-                        .get("i")
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(self.next_object_id.max(1));
-                    self.next_object_id = self.next_object_id.max(object_id + 1);
-                    self.transfer = Some(KittyTransfer {
-                        action: action.to_owned(),
-                        object_id,
-                        format: params
-                            .get("f")
-                            .and_then(|value| value.parse().ok())
-                            .unwrap_or(100),
-                        width: params.get("s").and_then(|value| value.parse().ok()),
-                        height: params.get("v").and_then(|value| value.parse().ok()),
-                        columns: params.get("c").and_then(|value| value.parse().ok()),
-                        rows: params.get("r").and_then(|value| value.parse().ok()),
-                        uses_placeholders: params.get("U").copied() == Some("1"),
-                        anchor_row: cursor_position.0,
-                        anchor_col: cursor_position.1,
-                        bytes: Vec::new(),
-                    });
-                }
-
-                let transfer = self.transfer.as_mut()?;
-                let chunk = base64::engine::general_purpose::STANDARD
-                    .decode(payload)
-                    .ok()?;
-                transfer.bytes.extend_from_slice(&chunk);
-
-                if params.get("m").copied().unwrap_or("0") == "1" {
-                    return Some(KittyOperation::Pending);
-                }
-
-                let transfer = self.transfer.take()?;
-                let image = transfer.finalize()?;
-                if transfer.action == "T" {
-                    return Some(KittyOperation::TransmitAndPlace {
-                        object_id: transfer.object_id,
-                        image,
-                        anchor: KittyAnchor {
-                            row: transfer.anchor_row,
-                            col: transfer.anchor_col,
-                            columns: transfer.columns.unwrap_or(1),
-                            rows: transfer.rows.unwrap_or(1),
-                        },
-                    });
-                }
-                Some(KittyOperation::TransmitOnly {
-                    object_id: transfer.object_id,
-                    image,
-                })
+            for (image_id, graphic) in update.pending_images {
+                self.pending_updates.insert(image_id, Some(graphic));
+                changed = true;
             }
-            "p" => Some(KittyOperation::PlaceExisting {
-                object_id: params.get("i")?.parse().ok()?,
-                anchor: KittyAnchor {
-                    row: cursor_position.0,
-                    col: cursor_position.1,
-                    columns: params
-                        .get("c")
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(1),
-                    rows: params
-                        .get("r")
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(1),
-                },
-            }),
-            "d" => Some(match params.get("i").and_then(|value| value.parse().ok()) {
-                Some(object_id) => KittyOperation::Delete {
-                    object_id: Some(object_id),
-                },
-                None => KittyOperation::Delete { object_id: None },
-            }),
-            _ => Some(KittyOperation::Ignored),
         }
+        self.dirty |= changed;
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty || !self.pending_updates.is_empty()
+    }
+
+    pub(crate) fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 }
 
-/// Decoded Kitty image payload.
-#[derive(Default)]
-pub struct KittyImage {
-    /// Image width in pixels.
-    pub width: u32,
-    /// Image height in pixels.
-    pub height: u32,
-    /// RGBA image bytes.
-    pub rgba: Vec<u8>,
-    /// Indicates placeholder mode.
-    pub uses_placeholders: bool,
+/// One resolved native Kitty quad in terminal-local top-left pixel space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct KittyDraw {
+    pub(crate) image_id: u32,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) width: f32,
+    pub(crate) height: f32,
+    pub(crate) source_rect: [f32; 4],
+    pub(crate) z_index: i32,
+    /// Resolved Bevy depth after sorting by the Kitty `(z, image_id)` rule.
+    pub(crate) depth: f32,
 }
 
-impl KittyImage {
-    /// Converts the decoded image into an inline object.
-    pub fn rasterize(self) -> KittyInlineObject {
-        KittyInlineObject {
-            raster: RasterObject {
-                width: self.width,
-                height: self.height,
-                rgba: self.rgba,
-                handle: None,
-            },
-            uses_placeholders: self.uses_placeholders,
-            plane: None,
-        }
-    }
-}
-
-/// Kitty object anchor.
-#[derive(Clone, Copy)]
-pub struct KittyAnchor {
-    /// Anchor row.
-    pub row: u16,
-    /// Anchor column.
-    pub col: u16,
-    /// Object width in cells.
-    pub columns: u32,
-    /// Object height in cells.
-    pub rows: u32,
-}
-
-/// Parsed Kitty graphics operation.
-pub enum KittyOperation {
-    /// Indicates a multipart transfer is still pending.
-    Pending,
-    /// Indicates the sequence was ignored.
-    Ignored,
-    /// Capability query result, returned without storing image state.
-    Query {
-        /// Image identifier echoed in the protocol reply.
-        image_id: u32,
-        /// Validation result for the probed payload.
-        result: Result<(), &'static str>,
-        /// Kitty `q` response-suppression level.
-        quiet: u8,
-    },
-    /// Image registration without placement.
-    TransmitOnly {
-        /// Object identifier.
-        object_id: u32,
-        /// Decoded image.
-        image: KittyImage,
-    },
-    /// Image registration with placement.
-    TransmitAndPlace {
-        /// Object identifier.
-        object_id: u32,
-        /// Decoded image.
-        image: KittyImage,
-        /// Placement anchor.
-        anchor: KittyAnchor,
-    },
-    /// Placement of a previously registered image.
-    PlaceExisting {
-        /// Object identifier.
-        object_id: u32,
-        /// Placement anchor.
-        anchor: KittyAnchor,
-    },
-    /// Image deletion.
-    Delete {
-        /// Optional object identifier.
-        object_id: Option<u32>,
-    },
-}
-
-fn validate_direct_query(
-    format: u32,
-    width: u32,
-    height: u32,
-    medium: &str,
-    payload: &[u8],
-    limits: BitmapLimits,
-) -> Result<(), &'static str> {
-    if medium != "d" {
-        return Err("unsupported transmission medium");
-    }
-    if width > limits.max_image_width || height > limits.max_image_height {
-        return Err("image dimensions exceed limit");
-    }
-    if matches!(format, 24 | 32) && (width == 0 || height == 0) {
-        return Err("raw image dimensions must be nonzero");
-    }
-    let pixels = u64::from(width)
-        .checked_mul(u64::from(height))
-        .ok_or("image dimensions exceed limit")?;
-    let expected = match format {
-        24 => pixels.checked_mul(3),
-        32 => pixels.checked_mul(4),
-        100 => {
-            let decoder_limits = limits.decoder_limits();
-            let mut dimension_reader =
-                image::ImageReader::with_format(Cursor::new(payload), image::ImageFormat::Png);
-            dimension_reader.limits(decoder_limits.clone());
-            let (png_width, png_height) = dimension_reader
-                .into_dimensions()
-                .map_err(|_| "invalid or oversized PNG data")?;
-            let decoded_bytes = u64::from(png_width)
-                .checked_mul(u64::from(png_height))
-                .and_then(|pixels| pixels.checked_mul(4))
-                .filter(|bytes| *bytes <= limits.max_bitmap_bytes)
-                .ok_or("decoded PNG exceeds limit")?;
-
-            let mut reader =
-                image::ImageReader::with_format(Cursor::new(payload), image::ImageFormat::Png);
-            reader.limits(decoder_limits);
-            let decoded = reader
-                .decode()
-                .map_err(|_| "invalid or oversized PNG data")?;
-            if u64::try_from(decoded.to_rgba8().as_raw().len()).ok() != Some(decoded_bytes) {
-                return Err("decoded PNG byte length does not match its dimensions");
-            }
-            return Ok(());
-        }
-        _ => return Err("unsupported pixel format"),
-    }
-    .filter(|bytes| *bytes <= limits.max_bitmap_bytes)
-    .ok_or("decoded image exceeds limit")?;
-    if payload.len() as u64 != expected {
-        return Err("invalid pixel data");
-    }
-    Ok(())
-}
-
-fn decode_query_payload(payload: &[u8], limits: BitmapLimits) -> Result<Vec<u8>, &'static str> {
-    let max_encoded_bytes = limits
-        .max_bitmap_bytes
-        .checked_add(2)
-        .map(|bytes| bytes / 3)
-        .and_then(|groups| groups.checked_mul(4))
-        .unwrap_or(u64::MAX);
-    if u64::try_from(payload.len()).unwrap_or(u64::MAX) > max_encoded_bytes {
-        return Err("query payload exceeds limit");
-    }
-
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(payload)
-        .map_err(|_| "invalid pixel data")?;
-    if u64::try_from(decoded.len()).unwrap_or(u64::MAX) > limits.max_bitmap_bytes {
-        return Err("query payload exceeds limit");
-    }
-    Ok(decoded)
-}
-
-struct KittyTransfer {
-    action: String,
-    object_id: u32,
-    format: u32,
-    width: Option<u32>,
-    height: Option<u32>,
-    columns: Option<u32>,
-    rows: Option<u32>,
-    uses_placeholders: bool,
-    anchor_row: u16,
-    anchor_col: u16,
-    bytes: Vec<u8>,
-}
-
-impl KittyTransfer {
-    fn finalize(&self) -> Option<KittyImage> {
-        let (width, height, rgba) = match self.format {
-            100 => {
-                let image =
-                    image::load_from_memory_with_format(&self.bytes, image::ImageFormat::Png)
-                        .ok()?;
-                let rgba = image.to_rgba8();
-                (rgba.width(), rgba.height(), rgba.into_raw())
-            }
-            24 => {
-                let width = self.width?;
-                let height = self.height?;
-                let expected = width as usize * height as usize * 3;
-                if self.bytes.len() != expected {
-                    return None;
-                }
-                let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-                for rgb in self.bytes.chunks_exact(3) {
-                    rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-                }
-                (width, height, rgba)
-            }
-            32 => {
-                let width = self.width?;
-                let height = self.height?;
-                let expected = width as usize * height as usize * 4;
-                if self.bytes.len() != expected {
-                    return None;
-                }
-                (width, height, self.bytes.clone())
-            }
-            _ => return None,
-        };
-
-        Some(KittyImage {
-            width,
-            height,
-            rgba,
-            uses_placeholders: self.uses_placeholders,
-        })
-    }
-}
-
-/// Refreshes placeholder-backed Kitty anchors from the terminal grid.
-pub fn refresh_kitty_placeholder_anchors(
-    objects: &HashMap<u32, InlineObject>,
-    anchors: &mut HashMap<u32, InlineAnchor>,
+/// Resolves all active-screen direct and Unicode-placeholder placements.
+pub(crate) fn collect_draws(
     term: &VtTerminal,
-) -> bool {
-    let placeholder_ids = objects
-        .iter()
-        .filter_map(|(object_id, object)| match object {
-            InlineObject::KittyImage(object) => object.uses_placeholders.then_some(*object_id),
-            InlineObject::RgpObject(_) => None,
-        })
-        .collect::<Vec<_>>();
-    if placeholder_ids.is_empty() {
-        return false;
+    cache: &KittyRenderCache,
+    cell_width: f32,
+    cell_height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Vec<KittyDraw> {
+    if cell_width <= 0.0 || cell_height <= 0.0 {
+        return Vec::new();
     }
-    let placeholder_lookup = placeholder_ids
-        .iter()
-        .map(|object_id| (object_id & 0x00ff_ffff, *object_id))
-        .collect::<HashMap<_, _>>();
 
-    let mut bounds = HashMap::<u32, (u16, u16, u16, u16)>::new();
-    let rows = u16::try_from(term.screen_lines()).unwrap_or(u16::MAX);
-    let cols = u16::try_from(term.columns()).unwrap_or(u16::MAX);
+    let viewport = OverlayViewport {
+        cell_width,
+        cell_height,
+        origin_x: 0.0,
+        origin_y: 0.0,
+        history_size: i64::try_from(term.lines_evicted()).unwrap_or(i64::MAX)
+            + i64::try_from(term.history_size()).unwrap_or(i64::MAX),
+        display_offset: i64::try_from(term.display_offset()).unwrap_or(i64::MAX),
+        screen_lines: i64::try_from(term.screen_lines()).unwrap_or(i64::MAX),
+    };
+    let mut draws = Vec::new();
+
+    for placement in term.graphics.kitty_placements.values() {
+        let Some(image) = cache.images.get(&placement.image_id) else {
+            continue;
+        };
+        let Some(geometry) = kitty_overlay_geometry(
+            placement,
+            image.width as usize,
+            image.height as usize,
+            &viewport,
+        ) else {
+            continue;
+        };
+        let mut draw = KittyDraw {
+            image_id: placement.image_id,
+            x: geometry.x,
+            y: geometry.y,
+            width: geometry.width,
+            height: geometry.height,
+            source_rect: geometry.source_rect,
+            z_index: placement.z_index,
+            depth: 0.0,
+        };
+        if clip_draw(&mut draw, viewport_width, viewport_height) {
+            draws.push(draw);
+        }
+    }
+
+    collect_placeholder_draws(
+        term,
+        cache,
+        cell_width,
+        cell_height,
+        viewport_width,
+        viewport_height,
+        &mut draws,
+    );
+    resolve_stack_depths(&mut draws);
+    draws
+}
+
+fn resolve_stack_depths(draws: &mut [KittyDraw]) {
+    draws.sort_by_key(|draw| (draw.z_index, draw.image_id));
+    let negative_count = draws.iter().take_while(|draw| draw.z_index < 0).count();
+    for (index, draw) in draws[..negative_count].iter_mut().enumerate() {
+        draw.depth = distributed_depth(-1.5, index, negative_count);
+    }
+    let nonnegative_count = draws.len().saturating_sub(negative_count);
+    for (index, draw) in draws[negative_count..].iter_mut().enumerate() {
+        draw.depth = distributed_depth(1.5, index, nonnegative_count);
+    }
+}
+
+fn distributed_depth(center: f32, index: usize, count: usize) -> f32 {
+    if count <= 1 {
+        return center;
+    }
+    center - 0.4 + 0.8 * index as f32 / (count - 1) as f32
+}
+
+fn collect_placeholder_draws(
+    term: &VtTerminal,
+    cache: &KittyRenderCache,
+    cell_width: f32,
+    cell_height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    draws: &mut Vec<KittyDraw>,
+) {
     let styles = vt::styles(term);
-    for row in 0..rows {
+    let columns = term.columns();
+    for screen_line in 0..term.screen_lines() {
+        let Ok(row) = u16::try_from(screen_line) else {
+            break;
+        };
         let Some(grid_row) = vt::visible_row(term, row) else {
             continue;
         };
-        // rio-vt flags rows holding a U+10EEEE placeholder, so rows without one
-        // skip the per-cell scan entirely.
         if !grid_row.kitty_virtual_placeholder {
             continue;
         }
-        for col in 0..cols {
-            let square = grid_row[Column(usize::from(col))];
-            if square.c() != '\u{10EEEE}' {
+
+        let mut current: Option<(IncompletePlacement, usize)> = None;
+        for col in 0..columns {
+            let square = grid_row[Column(col)];
+            if square.c() != rio_vt::ansi::graphics::KITTY_PLACEHOLDER {
+                flush_placeholder_run(
+                    term,
+                    cache,
+                    current.take(),
+                    screen_line,
+                    cell_width,
+                    cell_height,
+                    viewport_width,
+                    viewport_height,
+                    draws,
+                );
                 continue;
             }
-            let (fg, _, _) = vt::cell_attributes(styles, square);
-            let CellColor::Rgb(r, g, b) = fg else {
-                continue;
-            };
-            let placeholder_id = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-            let Some(object_id) = placeholder_lookup.get(&placeholder_id).copied() else {
-                continue;
-            };
-            bounds
-                .entry(object_id)
-                .and_modify(|(top, left, bottom, right)| {
-                    *top = (*top).min(row);
-                    *left = (*left).min(col);
-                    *bottom = (*bottom).max(row);
-                    *right = (*right).max(col);
-                })
-                .or_insert((row, col, row, col));
-        }
-    }
 
-    let mut changed = false;
-    for object_id in placeholder_ids {
-        if let Some((top, left, bottom, right)) = bounds.get(&object_id).copied() {
-            let columns = u32::from(right - left + 1);
-            let rows = u32::from(bottom - top + 1);
-            let new_anchor = InlineAnchor {
-                row: top,
-                col: left,
-                columns,
-                rows,
-                style: InlineStyle::default(),
-            };
-            changed |= anchors
-                .insert(object_id, new_anchor)
-                .is_none_or(|old_anchor| {
-                    old_anchor.row != top
-                        || old_anchor.col != left
-                        || old_anchor.columns != columns
-                        || old_anchor.rows != rows
-                });
-        } else {
-            changed |= anchors.remove(&object_id).is_some();
+            let style = styles
+                .get(usize::from(square.style_id()))
+                .copied()
+                .unwrap_or_default();
+            let combining = square
+                .extras_id()
+                .and_then(|id| term.grid.extras_table.get(id))
+                .map_or(&[][..], |extras| extras.zerowidth.as_slice());
+            let next = IncompletePlacement::from_cell(style.fg, style.underline_color, combining);
+            match current.as_mut() {
+                Some((run, _)) if run.can_append(&next) => run.append(),
+                _ => {
+                    flush_placeholder_run(
+                        term,
+                        cache,
+                        current.take(),
+                        screen_line,
+                        cell_width,
+                        cell_height,
+                        viewport_width,
+                        viewport_height,
+                        draws,
+                    );
+                    current = Some((next, col));
+                }
+            }
         }
+        flush_placeholder_run(
+            term,
+            cache,
+            current,
+            screen_line,
+            cell_width,
+            cell_height,
+            viewport_width,
+            viewport_height,
+            draws,
+        );
     }
+}
 
-    changed
+#[allow(clippy::too_many_arguments)]
+fn flush_placeholder_run(
+    term: &VtTerminal,
+    cache: &KittyRenderCache,
+    current: Option<(IncompletePlacement, usize)>,
+    screen_line: usize,
+    cell_width: f32,
+    cell_height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    draws: &mut Vec<KittyDraw>,
+) {
+    let Some((incomplete, start_col)) = current else {
+        return;
+    };
+    let run: PlaceholderRun = incomplete.complete();
+    let Some(placement) = term
+        .graphics
+        .kitty_virtual_placements
+        .get(&(run.image_id, run.placement_id))
+    else {
+        return;
+    };
+    let Some(image) = cache.images.get(&run.image_id) else {
+        return;
+    };
+    let Some(geometry) = compute_run_geometry(
+        &run,
+        placement.columns,
+        placement.rows,
+        image.width,
+        image.height,
+        (placement.x, placement.y, placement.width, placement.height),
+        cell_width,
+        cell_height,
+        0.0,
+        0.0,
+        screen_line,
+        start_col,
+    ) else {
+        return;
+    };
+    let mut draw = KittyDraw {
+        image_id: run.image_id,
+        x: geometry.x,
+        y: geometry.y,
+        width: geometry.width,
+        height: geometry.height,
+        source_rect: geometry.source_rect,
+        z_index: placement.z_index,
+        depth: 0.0,
+    };
+    if clip_draw(&mut draw, viewport_width, viewport_height) {
+        draws.push(draw);
+    }
+}
+
+fn clip_draw(draw: &mut KittyDraw, width: f32, height: f32) -> bool {
+    if draw.width <= 0.0 || draw.height <= 0.0 {
+        return false;
+    }
+    let x0 = draw.x;
+    let y0 = draw.y;
+    let x1 = x0 + draw.width;
+    let y1 = y0 + draw.height;
+    let clipped_x0 = x0.max(0.0);
+    let clipped_y0 = y0.max(0.0);
+    let clipped_x1 = x1.min(width);
+    let clipped_y1 = y1.min(height);
+    if clipped_x1 <= clipped_x0 || clipped_y1 <= clipped_y0 {
+        return false;
+    }
+    let [u0, v0, u1, v1] = draw.source_rect;
+    let left = (clipped_x0 - x0) / draw.width;
+    let right = (clipped_x1 - x0) / draw.width;
+    let top = (clipped_y0 - y0) / draw.height;
+    let bottom = (clipped_y1 - y0) / draw.height;
+    draw.source_rect = [
+        u0 + (u1 - u0) * left,
+        v0 + (v1 - v0) * top,
+        u0 + (u1 - u0) * right,
+        v0 + (v1 - v0) * bottom,
+    ];
+    draw.x = clipped_x0;
+    draw.y = clipped_y0;
+    draw.width = clipped_x1 - clipped_x0;
+    draw.height = clipped_y1 - clipped_y0;
+    true
 }
 
 #[cfg(test)]
@@ -494,112 +346,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kitty_query_parses_valid_direct_transfer_probe() {
-        let mut state = KittyParserState::default();
-
-        let operation =
-            state.consume_sequence(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", (0, 0));
-
-        assert!(matches!(
-            operation,
-            Some(KittyOperation::Query {
-                image_id: 31,
-                result: Ok(()),
-                quiet: 0,
-            })
-        ));
+    fn viewport_clipping_adjusts_geometry_and_uv_together() {
+        let mut draw = KittyDraw {
+            image_id: 1,
+            x: -10.0,
+            y: -5.0,
+            width: 20.0,
+            height: 20.0,
+            source_rect: [0.0, 0.0, 1.0, 1.0],
+            z_index: 0,
+            depth: 0.0,
+        };
+        assert!(clip_draw(&mut draw, 100.0, 100.0));
+        assert_eq!(
+            (draw.x, draw.y, draw.width, draw.height),
+            (0.0, 0.0, 10.0, 15.0)
+        );
+        assert_eq!(draw.source_rect, [0.5, 0.25, 1.0, 1.0]);
     }
 
     #[test]
-    fn kitty_query_preserves_quiet_level() {
-        let mut state = KittyParserState::default();
+    fn stacking_uses_z_then_image_id_and_keeps_text_boundary() {
+        let draw = |image_id, z_index| KittyDraw {
+            image_id,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            source_rect: [0.0, 0.0, 1.0, 1.0],
+            z_index,
+            depth: 0.0,
+        };
+        let mut draws = vec![draw(9, 0), draw(5, -1), draw(3, 0), draw(1, -2)];
+        resolve_stack_depths(&mut draws);
 
-        let operation =
-            state.consume_sequence(b"\x1b_Gi=9,s=2,v=2,a=q,t=d,f=24,q=2;AAAA\x1b\\", (0, 0));
-
-        assert!(matches!(
-            operation,
-            Some(KittyOperation::Query {
-                image_id: 9,
-                result: Err("invalid pixel data"),
-                quiet: 2,
-            })
-        ));
-    }
-
-    #[test]
-    fn kitty_query_defaults_to_rgba() {
-        let mut state = KittyParserState::default();
-
-        let operation =
-            state.consume_sequence(b"\x1b_Gi=10,s=1,v=1,a=q,t=d;AAAAAA==\x1b\\", (0, 0));
-
-        assert!(matches!(
-            operation,
-            Some(KittyOperation::Query {
-                image_id: 10,
-                result: Ok(()),
-                quiet: 0,
-            })
-        ));
-    }
-
-    #[test]
-    fn kitty_raw_query_rejects_zero_dimensions() {
-        let mut state = KittyParserState::default();
-
-        let operation = state.consume_sequence(b"\x1b_Gi=13,a=q,t=d,f=32;\x1b\\", (0, 0));
-
-        assert!(matches!(
-            operation,
-            Some(KittyOperation::Query {
-                result: Err("raw image dimensions must be nonzero"),
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn kitty_query_rejects_payload_before_decoding_past_limit() {
-        let mut state = KittyParserState::with_limits(BitmapLimits {
-            max_bitmap_bytes: 2,
-            ..BitmapLimits::default()
-        });
-
-        let operation =
-            state.consume_sequence(b"\x1b_Gi=11,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\", (0, 0));
-
-        assert!(matches!(
-            operation,
-            Some(KittyOperation::Query {
-                result: Err("query payload exceeds limit"),
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn kitty_png_query_obeys_decoder_limits() {
-        let mut png = Cursor::new(Vec::new());
-        image::DynamicImage::new_rgba8(2, 2)
-            .write_to(&mut png, image::ImageFormat::Png)
-            .expect("encode PNG");
-        let payload = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
-        let sequence = format!("\x1b_Gi=12,a=q,t=d,f=100;{payload}\x1b\\");
-        let mut state = KittyParserState::with_limits(BitmapLimits {
-            max_image_width: 1,
-            max_image_height: 1,
-            ..BitmapLimits::default()
-        });
-
-        let operation = state.consume_sequence(sequence.as_bytes(), (0, 0));
-
-        assert!(matches!(
-            operation,
-            Some(KittyOperation::Query {
-                result: Err("invalid or oversized PNG data"),
-                ..
-            })
-        ));
+        assert_eq!(
+            draws
+                .iter()
+                .map(|draw| (draw.z_index, draw.image_id))
+                .collect::<Vec<_>>(),
+            vec![(-2, 1), (-1, 5), (0, 3), (0, 9)]
+        );
+        assert!(draws.windows(2).all(|pair| pair[0].depth < pair[1].depth));
+        assert!(draws[1].depth < 0.0);
+        assert!(draws[2].depth > 0.0);
     }
 }

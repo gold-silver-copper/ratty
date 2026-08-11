@@ -111,6 +111,56 @@ source rectangle is clamped to the bitmap bounds. The command is rejected if
 the clamped intersection is empty. Source and destination widths and heights
 must be nonzero.
 
+### Terminal attachment and mutation rules
+
+Wire `row,col` values are interpreted as visible-cell coordinates on the
+active screen at the exact point where the placement or row update occurs in
+the PTY stream. Ratty converts that row to rio-vt's signed absolute grid space;
+the placement is then attached to terminal content rather than to a fixed
+viewport pixel. Normal terminal bytes before and after an APC in the same PTY
+read therefore affect it in wire order.
+
+Each globally unique `pid` is owned by exactly one screen at a time. A new
+placement, or an update containing `row`, attaches it to the currently active
+main or alternate screen. A `col`, span, crop, fit, filter, or opacity-only
+update retains the placement's existing screen and absolute row. Main and
+alternate placement sets are isolated: switching screens renders only the
+active set, and entering a fresh 1049 alternate screen clears old alternate
+placements without clearing main-screen placements. A placement ID is still
+global, so explicitly moving the same `pid` on the other screen transfers its
+ownership rather than duplicating it.
+
+Content-attached placements follow the grid mutation that owns their rows:
+
+- Full-screen upward scroll caused by LF, IND, or SU carries the placement into
+  retained main-screen history. It reappears when the user views that history
+  and expires only when its entire remaining row range has been evicted from
+  the history ring. Downward RI and SD move placements with their content.
+- With DECSTBM/page margins, a placement moves only when its entire current row
+  range is inside the affected scrolling region. A placement wholly outside
+  the region, or crossing either margin before the mutation, stays fixed.
+  When a moved placement crosses the top or bottom margin, the escaped rows are
+  clipped and its source-row offset advances as needed. If no rows remain, the
+  placement expires.
+- IL and DL apply the same rule to the cursor-to-bottom subregion: wholly
+  contained placements move down or up with inserted or deleted lines, while
+  outside or margin-crossing placements remain fixed. Counts are clamped to
+  the affected region; a move may clip or expire the placement completely.
+- A top-anchored partial region can grow history while rows below its bottom
+  margin remain visually fixed. rio-vt adjusts absolute row space at the grid
+  mutation boundary, so those fixed placements do not drift.
+- Resize and reflow remap a content-attached placement's top row through the
+  same row mapping as terminal text. Viewport geometry and clipping are then
+  recomputed for the new dimensions. A placement whose anchor content is
+  dropped by truncation expires.
+
+Ordinary text writes, overwrites, EL, ED, and other text erasure do not delete
+bitmap placements; bitmap placement and pixel lifetime are controlled by the
+`d` verb. Clearing retained history can nevertheless expire a placement whose
+entire row range is discarded. A full terminal reset (RIS) clears placement
+records on both screens but leaves no stale renderer entity; registered bitmap
+pixels remain available until bitmap deletion or process teardown.
+
 ## Register bitmap (`r`)
 
 Registration carries a base64-encoded PNG payload. A one-chunk registration is:
@@ -204,6 +254,11 @@ must be finite and is clamped to `[0,1]`.
 Updates are transactional. A partial `w/h` pair, partial source quartet,
 unknown placement, invalid value, or failed validation rejects the whole
 command and leaves the placement unchanged.
+
+When `row` is present, its new value is resolved in visible coordinates on the
+active screen and moves the placement there. Without `row`, the update retains
+the terminal-owned absolute anchor and screen even if `col`, `w`, or `h`
+changes.
 
 ## Replace frame (`f`)
 

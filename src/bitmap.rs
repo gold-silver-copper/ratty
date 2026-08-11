@@ -1,6 +1,11 @@
 //! Ratty Bitmap Surface protocol parsing.
 
-use std::{collections::HashMap, fmt, io::Cursor};
+use std::{
+    collections::HashMap,
+    fmt,
+    io::Cursor,
+    time::{Duration, Instant},
+};
 
 use base64::Engine as _;
 use bevy::prelude::{Handle, Image};
@@ -18,8 +23,20 @@ const MAX_BITMAP_CHUNK_BASE64_BYTES: usize = MAX_BITMAP_CHUNK_DECODED_BYTES.div_
 pub(crate) const MAX_BITMAP_APC_BYTES: usize =
     BITMAP_APC_START.len() + BITMAP_APC_HEADER_ALLOWANCE + MAX_BITMAP_CHUNK_BASE64_BYTES + ST.len();
 const MAX_REGISTRATION_BYTES: usize = 64 * 1024 * 1024;
+const BITMAP_INCOMPLETE_TIMEOUT: Duration = Duration::from_secs(10);
 const CHUNK_PAYLOAD_TOO_LARGE: &str = "bitmap APC chunk payload exceeds 64 MiB";
 const HEADER_TOO_LARGE: &str = "bitmap APC header exceeds 4 KiB";
+type BitmapConsumeResult = Option<Result<(BitmapOperation, Option<Vec<u8>>), BitmapProtocolError>>;
+
+/// Returns the largest base64 representation of a decoded byte budget.
+pub(crate) fn max_base64_encoded_bytes(max_decoded_bytes: u64) -> usize {
+    usize::try_from(max_decoded_bytes)
+        .unwrap_or(usize::MAX)
+        .checked_add(2)
+        .map(|bytes| bytes / 3)
+        .and_then(|groups| groups.checked_mul(4))
+        .unwrap_or(usize::MAX)
+}
 
 /// How source pixels are fitted into a placement's destination rectangle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -788,6 +805,7 @@ struct PendingBitmapTransfer {
     source: String,
     name: Option<String>,
     data: Vec<u8>,
+    last_touched: Instant,
 }
 
 struct PendingBitmapFrame {
@@ -797,6 +815,7 @@ struct PendingBitmapFrame {
     height: u32,
     expected_len: usize,
     data: Vec<u8>,
+    last_touched: Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -865,6 +884,7 @@ impl BitmapSurfaceState {
     }
 
     /// Parses and applies one complete bitmap APC sequence, including parser-directed cleanup.
+    #[cfg(test)]
     pub(crate) fn consume_and_apply(
         &mut self,
         sequence: &[u8],
@@ -879,11 +899,29 @@ impl BitmapSurfaceState {
         })
     }
 
+    /// Parses and applies one command while returning the exact operation
+    /// whose terminal placement mutation must be committed at the same wire
+    /// boundary.
+    pub(crate) fn consume_apply_and_return(&mut self, sequence: &[u8]) -> BitmapConsumeResult {
+        let parsed = consume_sequence(sequence)?;
+        Some(match parsed {
+            Ok(operation) => {
+                let applied = operation.clone();
+                self.apply(operation).map(|reply| (applied, reply))
+            }
+            Err(error) => {
+                self.apply_error_cleanup(&error);
+                Err(error)
+            }
+        })
+    }
+
     /// Applies one parsed bitmap protocol operation transactionally.
     pub fn apply(
         &mut self,
         operation: BitmapOperation,
     ) -> Result<Option<Vec<u8>>, BitmapProtocolError> {
+        self.evict_stale_pending_transfers();
         match operation {
             BitmapOperation::SupportQuery => Ok(Some(support_reply())),
             BitmapOperation::Register(chunk) => {
@@ -935,7 +973,6 @@ impl BitmapSurfaceState {
     }
 
     /// Returns a placement without allowing map mutation.
-    #[cfg(test)]
     pub(crate) fn placement(&self, placement_id: u32) -> Option<&BitmapPlacementState> {
         self.placements.get(&placement_id)
     }
@@ -953,26 +990,6 @@ impl BitmapSurfaceState {
     /// Returns and clears the visible-state dirty flag.
     pub(crate) fn take_dirty(&mut self) -> bool {
         std::mem::take(&mut self.dirty)
-    }
-
-    /// Applies terminal upward scrolling to cell-anchored placements.
-    pub(crate) fn apply_scroll(&mut self, rows_scrolled: u16) {
-        if rows_scrolled == 0 || self.placements.is_empty() {
-            return;
-        }
-
-        let mut changed = false;
-        self.placements.retain(|_, placement| {
-            let new_row = placement.row.saturating_sub(i64::from(rows_scrolled));
-            if new_row + placement.rows as i64 <= 0 {
-                changed = true;
-                return false;
-            }
-            changed |= new_row != placement.row;
-            placement.row = new_row;
-            true
-        });
-        self.dirty |= changed;
     }
 
     fn apply_registration(
@@ -1029,6 +1046,7 @@ impl BitmapSurfaceState {
                     })?,
                 name: chunk.name.clone(),
                 data: Vec::new(),
+                last_touched: Instant::now(),
             },
         };
 
@@ -1042,6 +1060,7 @@ impl BitmapSurfaceState {
             })?;
         self.ensure_pending_budget(new_len, chunk.more && !had_pending)?;
         pending.data.extend_from_slice(&chunk.data);
+        pending.last_touched = Instant::now();
 
         if chunk.more {
             self.pending_registrations.insert(bitmap_id, pending);
@@ -1254,6 +1273,7 @@ impl BitmapSurfaceState {
         self.ensure_pending_budget(new_len, chunk.more && !had_pending)?;
         pending.data.reserve(new_len - pending.data.len());
         pending.data.extend_from_slice(&chunk.data);
+        pending.last_touched = Instant::now();
         if chunk.more {
             self.pending_frames.insert(bitmap_id, pending);
             return Ok(());
@@ -1275,11 +1295,11 @@ impl BitmapSurfaceState {
     }
 
     fn delete_bitmap(&mut self, bitmap_id: u32) {
+        self.pending_registrations.remove(&bitmap_id);
+        self.pending_frames.remove(&bitmap_id);
         if !self.bitmaps.contains_key(&bitmap_id) {
             return;
         }
-        self.pending_registrations.remove(&bitmap_id);
-        self.pending_frames.remove(&bitmap_id);
         self.latest_frame_sequences.remove(&bitmap_id);
         if let Some(bitmap) = self.bitmaps.remove(&bitmap_id) {
             self.resident_bitmap_bytes -= bitmap.decoded_bytes;
@@ -1287,6 +1307,13 @@ impl BitmapSurfaceState {
                 .retain(|_, placement| placement.bitmap_id != bitmap_id);
             self.dirty = true;
         }
+    }
+
+    /// Abort every incomplete bitmap registration/frame after outer APC
+    /// framing has discarded bytes that the protocol parser never saw.
+    pub(crate) fn abort_all_pending_transfers(&mut self) {
+        self.pending_registrations.clear();
+        self.pending_frames.clear();
     }
 
     fn ensure_pending_budget(
@@ -1318,6 +1345,16 @@ impl BitmapSurfaceState {
             .filter(|total| *total <= self.limits.max_pending_transfers)
             .ok_or_else(|| BitmapProtocolError::new("pending bitmap transfer limit exceeded"))?;
         Ok(())
+    }
+
+    fn evict_stale_pending_transfers(&mut self) {
+        let now = Instant::now();
+        self.pending_registrations.retain(|_, pending| {
+            now.saturating_duration_since(pending.last_touched) <= BITMAP_INCOMPLETE_TIMEOUT
+        });
+        self.pending_frames.retain(|_, pending| {
+            now.saturating_duration_since(pending.last_touched) <= BITMAP_INCOMPLETE_TIMEOUT
+        });
     }
 
     fn apply_error_cleanup(&mut self, error: &BitmapProtocolError) {
@@ -1395,6 +1432,7 @@ fn new_pending_frame(
         height,
         expected_len,
         data: Vec::new(),
+        last_touched: Instant::now(),
     })
 }
 
@@ -2461,27 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn scrolling_preserves_a_negative_origin_until_the_placement_is_fully_clipped() {
-        let mut state = registered_state();
-        state
-            .apply(placement(1, 10))
-            .expect("valid bitmap test fixture should succeed");
-
-        state.apply_scroll(2);
-
-        let placement = state
-            .placement(10)
-            .expect("partially visible placement should remain active");
-        assert_eq!(placement.row(), -1);
-        assert_eq!(placement.rows(), 4);
-
-        state.apply_scroll(3);
-
-        assert!(state.placement(10).is_none());
-    }
-
-    #[test]
-    fn deleting_unknown_bitmap_preserves_its_pending_registration() {
+    fn deleting_unknown_bitmap_aborts_its_pending_registration() {
         let mut state = BitmapSurfaceState::default();
         state
             .apply(register_chunk(42, &PNG_2X2[..20], true))
@@ -2491,11 +2509,38 @@ mod tests {
             .apply(BitmapOperation::DeleteBitmap(42))
             .expect("deleting an unknown bitmap is a no-op");
 
-        assert!(state.pending_registrations.contains_key(&42));
+        assert!(!state.pending_registrations.contains_key(&42));
+        assert!(
+            state
+                .apply(registration_continuation(42, &PNG_2X2[20..], false))
+                .is_err()
+        );
         state
-            .apply(registration_continuation(42, &PNG_2X2[20..], false))
-            .expect("pending registration should still be completable");
+            .apply(register_chunk(42, PNG_2X2, false))
+            .expect("a fresh registration should recover the slot");
         assert!(state.bitmap(42).is_some());
+    }
+
+    #[test]
+    fn stale_pending_bitmap_transfer_expires_and_releases_its_slot() {
+        let mut state = BitmapSurfaceState::default();
+        state.limits.max_pending_transfers = 1;
+        state
+            .apply(register_chunk(42, &PNG_2X2[..20], true))
+            .expect("first registration chunk should remain pending");
+        state
+            .pending_registrations
+            .get_mut(&42)
+            .expect("registration chunk must remain pending")
+            .last_touched = Instant::now() - BITMAP_INCOMPLETE_TIMEOUT - Duration::from_secs(1);
+
+        state
+            .apply(BitmapOperation::SupportQuery)
+            .expect("support query should trigger expiration without failing");
+        assert!(state.pending_registrations.is_empty());
+        state
+            .apply(register_chunk(7, &PNG_2X2[..20], true))
+            .expect("expired transfer must release its slot");
     }
 
     #[test]

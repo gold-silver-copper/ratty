@@ -148,7 +148,7 @@ Fields:
 - `more`: continuation flag
   - `1`: more register chunks follow for this object id
   - `0`: this is the final chunk and registration can be finalized
-- `name`: optional source name for diagnostics and temporary asset naming
+- `name`: optional source name for diagnostics
 - `normalize`: optional OBJ normalization flag on the first payload chunk, defaults to `1`
 
 The terminal accumulates chunks for the same `id` until it receives the final
@@ -157,6 +157,22 @@ normally.
 
 Path-based and payload-based registration are additive modes of the same `r` verb.
 Clients may continue using `path=...` exactly as before.
+
+RGP registrations share the configured bitmap safety budgets: one encoded
+source is limited by `max_bitmap_bytes`, registered object count by
+`max_bitmaps`, total retained encoded/decoded mesh bytes by
+`max_total_bitmap_bytes`, and incomplete payloads by the pending byte,
+transfer-count, and ten-second inactivity limits. Path sources are resolved to
+canonical regular files and read through the same per-object byte limit;
+devices, FIFOs, directories, and oversized files are rejected. RGP GLB is
+restricted to exactly one self-contained BIN buffer, scene, node, mesh, and
+triangle primitive with an identity node transform, explicit float POSITION
+and NORMAL attributes, and optional U16/U32 triangle indices. Materials,
+nested nodes, animations, skins, cameras, morph targets, extensions, external
+buffers, images, samplers, and textures are rejected. JSON `.gltf` is
+rejected. The GLB JSON DOM, accessors, and render copies are bounded before
+parsing; accepted geometry is synchronously decoded into Ratty-owned mesh data
+from the exact validated bytes, without a mutable runtime asset path.
 
 ### 3. Place Object
 
@@ -185,6 +201,44 @@ Fields:
 - `sx`, `sy`, `sz`: optional non-uniform scale, defaults to `1`
 
 Clients that only send the original v1 fields still work unchanged.
+
+#### Terminal attachment and mutation rules
+
+RGP's `row,col` is a center anchor in visible cell coordinates on the active
+screen at the exact point where the `p` APC occurs. Ratty derives the
+placement's top-left cell from that center and span, then registers a signed
+absolute, content-attached placement with rio-vt. Terminal text and RGP APCs
+within one PTY read are applied strictly in wire order.
+
+An object has at most one placed instance and one owning screen. Placing the
+same object ID again transfers its placement to the active main or alternate
+screen; it does not duplicate the object. Different object IDs may remain on
+their independently owned screens. Entering a fresh 1049 alternate screen
+clears stale alternate placements while preserving main-screen placements and
+registered object assets.
+
+The terminal, not Ratty's RGP parser, mutates the anchor:
+
+- Full-screen LF/IND/SU and RI/SD move it with content. Main-screen objects can
+  enter retained scrollback, reappear during scrollback navigation, and expire
+  only after their complete remaining row range is evicted.
+- Under DECSTBM/page margins, only an object placement wholly contained in the
+  affected region moves. Outside and pre-mutation margin-crossing placements
+  stay fixed. A contained placement's terminal-owned visible/source geometry
+  is clipped when movement carries rows past a margin and expires if no rows
+  remain. Ratty preserves the original 3D transform for a partial result; exact
+  fragment clipping at an interior margin is not yet implemented, so model
+  fragments can overdraw that margin until the placement fully expires.
+- IL/DL use the same rule for their cursor-to-bottom mutation region, including
+  clipped or expired results for large counts.
+- Resize and reflow map the anchor row through rio-vt's text reflow mapping and
+  recompute visible geometry. A dropped anchor expires.
+
+Text writes, overwrites, and erase commands do not delete an RGP placement.
+The `d` verb deletes it deliberately. RIS clears placements on both screens;
+the registered asset can be placed again unless it is deleted through RGP.
+The `u` verb changes only RGP presentation style and never moves the
+terminal-owned anchor.
 
 ### 4. Update Object
 

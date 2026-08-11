@@ -9,6 +9,7 @@
 //! - `scene::apply_terminal_presentation`
 //! - `apply_inline_objects`
 //! - `render_terminal_widget`
+//! - `sync_bitmap_placements`
 //! - `sync_inline_objects`
 //! - `animate_inline_kitty_planes`
 //! - `sync_rgp_objects`
@@ -32,8 +33,9 @@ use crate::direct_render::DirectTerminalSceneExchange;
 use crate::inline::{
     BitmapPlacementRenderCache, BitmapPlacementRenderState, InlineKittyPlaneLayout, InlineObject,
     TerminalBitmapPlacement, TerminalInlineObjectPlane, TerminalInlineObjectSprite,
-    TerminalInlineObjects, TerminalRgpObject,
+    TerminalInlineObjects, TerminalRgpObject, bitmap_external_id, rgp_external_id,
 };
+use crate::kitty::{KittyDraw, KittyRenderCache, TerminalKittyPlacement, collect_draws};
 use crate::model::CursorModel;
 use crate::model::spawn_cursor_model;
 use crate::mouse::TerminalSelection;
@@ -61,18 +63,24 @@ use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::{PrimaryWindow, Window, WindowCloseRequested, WindowResized};
+use rio_graphics::{ColorType as RioColorType, GraphicData};
+use rio_vt::crosswords::external_placement::ExternalPlacementGeometry;
 
 struct InlineLayout {
-    columns: u32,
-    rows: u32,
     center_x: f32,
     center_y: f32,
     local_x: f32,
     local_y: f32,
-    local_width: f32,
-    local_height: f32,
     pixel_width: f32,
     pixel_height: f32,
+}
+
+#[derive(Clone, Copy)]
+struct InlineGeometry {
+    row: i64,
+    col: usize,
+    columns: u32,
+    rows: u32,
 }
 
 struct KittyRenderContext<'a> {
@@ -81,9 +89,10 @@ struct KittyRenderContext<'a> {
     warp_amount: f32,
     elapsed_secs: f32,
     materials: &'a mut Assets<StandardMaterial>,
-    images: &'a mut Assets<Image>,
+    sprite_materials: &'a mut Assets<BitmapSurfaceMaterial>,
     meshes: &'a mut Assets<Mesh>,
     plane_children: &'a mut Vec<Entity>,
+    cache: &'a mut KittyRenderCache,
 }
 
 struct CursorPoseContext<'a, 'w, 's> {
@@ -158,8 +167,8 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
 /// from [`TerminalRuntime`], feeds it through [`TerminalInlineObjects::consume_pty_output`] and
 /// requests a redraw through [`TerminalRedrawState`] when terminal state changed.
 ///
-/// It also updates scroll-coupled inline anchors before the redraw and sync passes rebuild the
-/// scene.
+/// rio-vt mutates terminal-owned inline placement geometry while parsing; later sync passes read
+/// that authoritative geometry when rebuilding or repositioning the scene.
 pub fn pump_pty_output(
     mut runtime: ResMut<TerminalRuntime>,
     mut inline_objects: ResMut<TerminalInlineObjects>,
@@ -172,7 +181,7 @@ pub fn pump_pty_output(
     loop {
         match runtime.try_recv() {
             Ok(chunk) => {
-                let mut replies = inline_objects.consume_pty_output(
+                let replies = inline_objects.consume_pty_output(
                     &chunk,
                     &mut runtime,
                     &mut camera_updates,
@@ -181,11 +190,9 @@ pub fn pump_pty_output(
                 for update in camera_updates.drain(..) {
                     camera_update_writer.write(update);
                 }
-                replies.extend(runtime.take_replies());
                 for reply in replies {
                     runtime.write_input(&reply);
                 }
-                inline_objects.refresh_placeholder_anchors(&runtime.term);
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
@@ -196,6 +203,13 @@ pub fn pump_pty_output(
                 break;
             }
         }
+    }
+
+    inline_objects
+        .kitty_render
+        .queue_updates(runtime.take_graphics_updates());
+    for reply in runtime.take_replies() {
+        runtime.write_input(&reply);
     }
 
     if processed_output {
@@ -507,11 +521,12 @@ pub(crate) fn finish_terminal_model_load(mut params: ModelLoadParams) {
     }
 }
 
-/// Synchronizes Kitty inline objects.
+/// Synchronizes native Kitty and RGP inline objects.
 #[derive(SystemParam)]
 pub(crate) struct SyncInlineParams<'w, 's> {
     commands: Commands<'w, 's>,
     inline_objects: ResMut<'w, TerminalInlineObjects>,
+    runtime: Res<'w, TerminalRuntime>,
     terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
     camera_slots: Res<'w, TerminalCameraSlots>,
@@ -529,18 +544,19 @@ pub(crate) struct SyncInlineParams<'w, 's> {
         ),
     >,
     plane_image_query: Query<'w, 's, Entity, With<TerminalInlineObjectPlane>>,
-    rgp_query: Query<'w, 's, Entity, With<TerminalRgpObject>>,
+    rgp_query: Query<'w, 's, (Entity, &'static TerminalRgpObject)>,
     asset_server: Res<'w, AssetServer>,
     materials: ResMut<'w, Assets<StandardMaterial>>,
+    sprite_materials: ResMut<'w, Assets<BitmapSurfaceMaterial>>,
     images: ResMut<'w, Assets<Image>>,
     meshes: ResMut<'w, Assets<Mesh>>,
 }
 
-/// Synchronizes Kitty inline object entities.
+/// Synchronizes native Kitty image and registered RGP object entities.
 ///
-/// This runs after [`render_terminal_widget`]. It rebuilds the scene entities for registered
-/// [`InlineObject::KittyImage`] values and clears stale inline entities first so the scene matches
-/// the latest terminal anchors exactly.
+/// This runs after [`render_terminal_widget`]. It rebuilds entities from rio-vt's native Kitty
+/// placements and terminal-owned RGP placement geometry, clearing stale entities first so the
+/// scene matches current terminal content.
 ///
 /// In 2D mode it spawns [`TerminalInlineObjectSprite`] entities. In 3D mode it also generates
 /// plane-attached meshes under [`TerminalPlane`] so images follow the warped terminal surface.
@@ -549,6 +565,7 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
     let SyncInlineParams {
         commands,
         inline_objects,
+        runtime,
         terminal,
         viewport,
         camera_slots,
@@ -561,11 +578,24 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         rgp_query,
         asset_server,
         materials,
+        sprite_materials,
         images,
         meshes,
     } = &mut params;
-    if !inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows) {
+    inline_objects.reconcile_terminal_placements(&runtime.term);
+    sync_kitty_updates(&mut inline_objects.kitty_render, images);
+    if !inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows, &runtime.term) {
         return;
+    }
+
+    for handle in inline_objects.kitty_render.meshes.drain(..) {
+        meshes.remove(&handle);
+    }
+    for handle in inline_objects.kitty_render.sprite_materials.drain(..) {
+        sprite_materials.remove(&handle);
+    }
+    for handle in inline_objects.kitty_render.plane_materials.drain(..) {
+        materials.remove(&handle);
     }
 
     for entity in sprite_query.iter() {
@@ -574,8 +604,20 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
     for entity in plane_image_query.iter() {
         commands.entity(entity).despawn();
     }
-    for entity in rgp_query.iter() {
-        commands.entity(entity).despawn();
+    let mut existing_rgp = HashMap::new();
+    for (entity, object) in rgp_query.iter() {
+        if inline_objects.dirty_rgp_objects.contains(&object.object_id) {
+            commands.entity(entity).despawn();
+        } else {
+            match existing_rgp.entry(object.object_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(entity);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    commands.entity(entity).despawn();
+                }
+            }
+        }
     }
 
     let Ok((plane_entity, _plane_transform)) = plane_query.single() else {
@@ -585,44 +627,72 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
     let elapsed_secs = time.elapsed_secs();
-    let renderable_ids = inline_objects
-        .anchors
-        .iter()
-        .filter_map(|(object_id, anchor)| {
-            inline_objects.objects.get(object_id)?;
-            let start = anchor.row as i32;
-            let end = start + anchor.rows as i32;
-            (start < terminal.rows as i32 && end > 0).then_some(*object_id)
-        })
-        .collect::<Vec<_>>();
 
     let mut plane_children = Vec::new();
-    for object_id in renderable_ids {
-        let Some(anchor) = inline_objects.anchors.get(&object_id) else {
+    let kitty_draws = collect_draws(
+        &runtime.term,
+        &inline_objects.kitty_render,
+        cell_width,
+        cell_height,
+        viewport.size.x,
+        viewport.size.y,
+    );
+    for draw in kitty_draws {
+        let Some(image) = inline_objects
+            .kitty_render
+            .images
+            .get(&draw.image_id)
+            .map(|image| image.handle.clone())
+        else {
             continue;
         };
-        let layout = inline_layout(anchor, terminal, viewport, cell_width, cell_height);
-        let style = anchor.style;
+        let mut ctx = KittyRenderContext {
+            mode: camera_slots.active().mode,
+            mobius_progress: active_mobius_progress(camera_slots.active().mode, mobius_transition),
+            warp_amount: plane_warp.amount,
+            elapsed_secs,
+            materials,
+            sprite_materials,
+            meshes,
+            plane_children: &mut plane_children,
+            cache: &mut inline_objects.kitty_render,
+        };
+        sync_native_kitty_draw(
+            commands,
+            &draw,
+            &image,
+            viewport,
+            cell_width,
+            cell_height,
+            &mut ctx,
+        );
+    }
+
+    let rgp_geometries = runtime
+        .term
+        .external_placement_geometries()
+        .into_iter()
+        .filter_map(|geometry| {
+            let object_id = u32::try_from(geometry.id & u64::from(u32::MAX)).ok()?;
+            (geometry.id == rgp_external_id(object_id)).then_some((object_id, geometry))
+        })
+        .collect::<HashMap<_, _>>();
+    let renderable_ids = inline_objects.objects.keys().copied().collect::<Vec<_>>();
+    for object_id in renderable_ids {
+        let Some(placement) = inline_objects.anchors.get(&object_id) else {
+            continue;
+        };
+        if !rgp_geometries.contains_key(&object_id) {
+            continue;
+        }
+        if existing_rgp.remove(&object_id).is_some() {
+            continue;
+        }
+        let style = placement.style;
         let Some(object) = inline_objects.objects.get_mut(&object_id) else {
             continue;
         };
         match object {
-            InlineObject::KittyImage(object) => {
-                let mut ctx = KittyRenderContext {
-                    mode: camera_slots.active().mode,
-                    mobius_progress: active_mobius_progress(
-                        camera_slots.active().mode,
-                        mobius_transition,
-                    ),
-                    warp_amount: plane_warp.amount,
-                    elapsed_secs,
-                    materials,
-                    images,
-                    meshes,
-                    plane_children: &mut plane_children,
-                };
-                sync_kitty_inline_image(commands, object, &layout, &mut ctx);
-            }
             InlineObject::RgpObject(object) => {
                 spawn_rgp_object(
                     commands,
@@ -636,12 +706,15 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
             }
         }
     }
+    for entity in existing_rgp.into_values() {
+        commands.entity(entity).despawn();
+    }
 
     if !plane_children.is_empty() {
         commands.entity(plane_entity).add_children(&plane_children);
     }
 
-    inline_objects.finish_sync(viewport.size, terminal.cols, terminal.rows);
+    inline_objects.finish_sync(viewport.size, terminal.cols, terminal.rows, &runtime.term);
 }
 
 /// Bitmap-surface synchronization parameters.
@@ -649,6 +722,7 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
 pub(crate) struct SyncBitmapParams<'w, 's> {
     commands: Commands<'w, 's>,
     inline_objects: ResMut<'w, TerminalInlineObjects>,
+    runtime: Res<'w, TerminalRuntime>,
     terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
     camera_slots: Res<'w, TerminalCameraSlots>,
@@ -680,6 +754,7 @@ pub(crate) fn sync_bitmap_placements(mut params: SyncBitmapParams) {
     let SyncBitmapParams {
         commands,
         inline_objects,
+        runtime,
         terminal,
         viewport,
         camera_slots,
@@ -687,7 +762,8 @@ pub(crate) fn sync_bitmap_placements(mut params: SyncBitmapParams) {
         meshes,
         materials,
     } = &mut params;
-    if !inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows) {
+    inline_objects.reconcile_terminal_placements(&runtime.term);
+    if !inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows, &runtime.term) {
         return;
     }
 
@@ -750,14 +826,23 @@ pub(crate) fn sync_bitmap_placements(mut params: SyncBitmapParams) {
         sync_bitmap_image(bitmap_id, inline_objects, images);
     }
 
+    let geometries = runtime
+        .term
+        .external_placement_geometries()
+        .into_iter()
+        .map(|geometry| (geometry.id, geometry))
+        .collect::<HashMap<_, _>>();
     let placements = inline_objects
         .bitmap
         .placements()
-        .map(|(placement_id, placement)| (*placement_id, placement.clone()))
+        .filter_map(|(placement_id, placement)| {
+            let geometry = geometries.get(&bitmap_external_id(*placement_id))?;
+            Some((*placement_id, placement.clone(), *geometry))
+        })
         .collect::<Vec<_>>();
     let active_placement_generations = placements
         .iter()
-        .map(|(placement_id, placement)| (*placement_id, placement.generation()))
+        .map(|(placement_id, placement, _)| (*placement_id, placement.generation()))
         .collect::<HashMap<_, _>>();
     let removed_placement_ids = inline_objects
         .bitmap_render
@@ -784,7 +869,7 @@ pub(crate) fn sync_bitmap_placements(mut params: SyncBitmapParams) {
 
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
     let cell_height = viewport.size.y / terminal.rows.max(1) as f32;
-    for (placement_id, placement) in placements {
+    for (placement_id, placement, geometry) in placements {
         let Some(image) = inline_objects
             .bitmap_render
             .images
@@ -794,14 +879,16 @@ pub(crate) fn sync_bitmap_placements(mut params: SyncBitmapParams) {
             continue;
         };
         let destination = Vec2::new(
-            placement.columns() as f32 * cell_width,
-            placement.rows() as f32 * cell_height,
+            geometry.source_columns as f32 * cell_width,
+            geometry.source_rows as f32 * cell_height,
         );
+        let original_row = geometry.row - geometry.source_row as i64;
+        let original_col = geometry.col as i64 - geometry.source_col as i64;
         let center = Vec2::new(
             viewport.center.x - viewport.size.x * 0.5
-                + (placement.col() as f32 + placement.columns() as f32 * 0.5) * cell_width,
+                + (original_col as f32 + geometry.source_columns as f32 * 0.5) * cell_width,
             viewport.center.y + viewport.size.y * 0.5
-                - (placement.row() as f32 + placement.rows() as f32 * 0.5) * cell_height,
+                - (original_row as f32 + geometry.source_rows as f32 * 0.5) * cell_height,
         );
         let Some(bitmap) = inline_objects.bitmap.bitmap(placement.bitmap_id()) else {
             continue;
@@ -812,7 +899,7 @@ pub(crate) fn sync_bitmap_placements(mut params: SyncBitmapParams) {
             destination,
             placement.fit(),
         );
-        let uniform = bitmap_uniform(&placement, layout, terminal.cols, terminal.rows);
+        let uniform = bitmap_uniform(&placement, &geometry, layout, terminal.cols, terminal.rows);
         let transform = Transform::from_xyz(center.x, center.y, 5.0);
         let render_state = BitmapPlacementRenderState {
             image: image.clone(),
@@ -947,11 +1034,12 @@ fn sync_bitmap_image(
 
 fn bitmap_uniform(
     placement: &BitmapPlacementState,
+    geometry: &ExternalPlacementGeometry,
     layout: crate::bitmap_material::ResolvedBitmapLayout,
     terminal_cols: u16,
     terminal_rows: u16,
 ) -> BitmapSurfaceUniform {
-    let (clip_min, clip_max) = bitmap_clip_bounds(placement, terminal_cols, terminal_rows);
+    let (clip_min, clip_max) = bitmap_clip_bounds(geometry, terminal_cols, terminal_rows);
     BitmapSurfaceUniform {
         uv_min: layout.uv_min,
         uv_max: layout.uv_max,
@@ -968,27 +1056,35 @@ fn bitmap_uniform(
 }
 
 fn bitmap_clip_bounds(
-    placement: &BitmapPlacementState,
+    geometry: &ExternalPlacementGeometry,
     terminal_cols: u16,
     terminal_rows: u16,
 ) -> (Vec2, Vec2) {
-    let col = f64::from(placement.col());
-    let row = placement.row() as f64;
-    let columns = f64::from(placement.columns());
-    let rows = f64::from(placement.rows());
+    let columns = geometry.source_columns.max(1) as f64;
+    let rows = geometry.source_rows.max(1) as f64;
+    let col = geometry.col as f64 - geometry.source_col as f64;
+    let row = geometry.row as f64 - geometry.source_row as f64;
     let clip_min = Vec2::new(
-        (-col / columns).clamp(0.0, 1.0) as f32,
-        (-row / rows).clamp(0.0, 1.0) as f32,
+        (geometry.source_col as f64 / columns)
+            .max(-col / columns)
+            .clamp(0.0, 1.0) as f32,
+        (geometry.source_row as f64 / rows)
+            .max(-row / rows)
+            .clamp(0.0, 1.0) as f32,
     );
     let clip_max = Vec2::new(
-        ((f64::from(terminal_cols) - col) / columns).clamp(0.0, 1.0) as f32,
-        ((f64::from(terminal_rows) - row) / rows).clamp(0.0, 1.0) as f32,
+        ((geometry.source_col + geometry.columns) as f64 / columns)
+            .min((f64::from(terminal_cols) - col) / columns)
+            .clamp(0.0, 1.0) as f32,
+        ((geometry.source_row + geometry.rows) as f64 / rows)
+            .min((f64::from(terminal_rows) - row) / rows)
+            .clamp(0.0, 1.0) as f32,
     );
     (clip_min, clip_max)
 }
 
 fn inline_layout(
-    anchor: &crate::inline::InlineAnchor,
+    geometry: InlineGeometry,
     terminal: &TerminalSurface,
     viewport: &TerminalViewport,
     cell_width: f32,
@@ -997,70 +1093,164 @@ fn inline_layout(
     let cols = terminal.cols.max(1) as f32;
     let rows = terminal.rows.max(1) as f32;
     let center_x = viewport.center.x - viewport.size.x * 0.5
-        + (anchor.col as f32 + anchor.columns as f32 * 0.5) * cell_width;
+        + (geometry.col as f32 + geometry.columns as f32 * 0.5) * cell_width;
     let center_y = viewport.center.y + viewport.size.y * 0.5
-        - (anchor.row as f32 + anchor.rows as f32 * 0.5) * cell_height;
+        - (geometry.row as f32 + geometry.rows as f32 * 0.5) * cell_height;
 
     InlineLayout {
-        columns: anchor.columns,
-        rows: anchor.rows,
         center_x,
         center_y,
-        local_x: (anchor.col as f32 + anchor.columns as f32 * 0.5) / cols - 0.5,
-        local_y: 0.5 - (anchor.row as f32 + anchor.rows as f32 * 0.5) / rows,
-        local_width: anchor.columns as f32 / cols,
-        local_height: anchor.rows as f32 / rows,
-        pixel_width: anchor.columns as f32 * cell_width,
-        pixel_height: anchor.rows as f32 * cell_height,
+        local_x: (geometry.col as f32 + geometry.columns as f32 * 0.5) / cols - 0.5,
+        local_y: 0.5 - (geometry.row as f32 + geometry.rows as f32 * 0.5) / rows,
+        pixel_width: geometry.columns as f32 * cell_width,
+        pixel_height: geometry.rows as f32 * cell_height,
     }
 }
 
-fn sync_kitty_inline_image(
+fn sync_kitty_updates(cache: &mut KittyRenderCache, images: &mut Assets<Image>) {
+    let updates = std::mem::take(&mut cache.pending_updates);
+    for (image_id, update) in updates {
+        match update {
+            None => {
+                if let Some(image) = cache.images.remove(&image_id) {
+                    images.remove(&image.handle);
+                    cache.mark_dirty();
+                }
+            }
+            Some(graphic) => {
+                let Some((image, width, height)) = kitty_bevy_image(graphic) else {
+                    warn!(image_id, "rio-vt emitted invalid Kitty pixel data");
+                    continue;
+                };
+                if let Some(cached) = cache.images.get_mut(&image_id) {
+                    if let Some(mut asset) = images.get_mut(&cached.handle) {
+                        *asset = image;
+                        cached.width = width;
+                        cached.height = height;
+                    }
+                } else {
+                    let handle = images.add(image);
+                    cache.images.insert(
+                        image_id,
+                        crate::kitty::KittyImageAsset {
+                            handle,
+                            width,
+                            height,
+                        },
+                    );
+                }
+                cache.mark_dirty();
+            }
+        }
+    }
+}
+
+fn kitty_bevy_image(graphic: GraphicData) -> Option<(Image, u32, u32)> {
+    let GraphicData {
+        width,
+        height,
+        color_type,
+        pixels,
+        ..
+    } = graphic;
+    let image_width = u32::try_from(width).ok().filter(|width| *width > 0)?;
+    let image_height = u32::try_from(height).ok().filter(|height| *height > 0)?;
+    let pixel_count = width.checked_mul(height)?;
+    let rgba = match color_type {
+        RioColorType::Rgba => (pixels.len() == pixel_count.checked_mul(4)?).then_some(pixels)?,
+        RioColorType::Rgb => {
+            if pixels.len() != pixel_count.checked_mul(3)? {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixel_count.checked_mul(4)?);
+            for rgb in pixels.chunks_exact(3) {
+                rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            rgba
+        }
+    };
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: image_width,
+            height: image_height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::nearest();
+    image.data = Some(rgba);
+    Some((image, image_width, image_height))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_native_kitty_draw(
     commands: &mut Commands,
-    object: &mut crate::inline::KittyInlineObject,
-    layout: &InlineLayout,
+    draw: &KittyDraw,
+    image_handle: &Handle<Image>,
+    viewport: &TerminalViewport,
+    cell_width: f32,
+    cell_height: f32,
     ctx: &mut KittyRenderContext<'_>,
 ) {
-    let image_handle = if let Some(handle) = object.raster.handle.as_ref() {
-        handle.clone()
-    } else {
-        let mut image = Image::new_fill(
-            Extent3d {
-                width: object.raster.width,
-                height: object.raster.height,
-                depth_or_array_layers: 1,
-            },
-            TextureDimension::D2,
-            &[0, 0, 0, 0],
-            TextureFormat::Rgba8UnormSrgb,
-            bevy::asset::RenderAssetUsages::default(),
-        );
-        image.sampler = ImageSampler::nearest();
-        image.data = Some(std::mem::take(&mut object.raster.rgba));
-        let handle = ctx.images.add(image);
-        object.raster.handle = Some(handle.clone());
-        handle
-    };
-
-    let mut sprite = Sprite::from_image(image_handle.clone());
-    sprite.custom_size = Some(Vec2::new(layout.pixel_width, layout.pixel_height));
+    let mesh = ctx.meshes.add(Rectangle::new(draw.width, draw.height));
+    let material = ctx.sprite_materials.add(BitmapSurfaceMaterial {
+        image: image_handle.clone(),
+        params: BitmapSurfaceUniform {
+            uv_min: Vec2::new(draw.source_rect[0], draw.source_rect[1]),
+            uv_max: Vec2::new(draw.source_rect[2], draw.source_rect[3]),
+            opacity: 1.0,
+            filter_mode: 1,
+            content_min: Vec2::ZERO,
+            content_max: Vec2::ONE,
+            clip_min: Vec2::ZERO,
+            clip_max: Vec2::ONE,
+        },
+    });
+    let center_x = viewport.center.x - viewport.size.x * 0.5 + draw.x + draw.width * 0.5;
+    let center_y = viewport.center.y + viewport.size.y * 0.5 - draw.y - draw.height * 0.5;
     commands.spawn((
+        TerminalKittyPlacement,
         TerminalInlineObjectSprite,
-        sprite,
-        Transform::from_translation(Vec3::new(layout.center_x, layout.center_y, 5.0)),
+        Mesh2d(mesh.clone()),
+        MeshMaterial2d(material.clone()),
+        Transform::from_translation(Vec3::new(center_x, center_y, draw.depth)),
         if ctx.mode.is_3d() {
             Visibility::Hidden
         } else {
             Visibility::Visible
         },
     ));
+    ctx.cache.meshes.push(mesh);
+    ctx.cache.sprite_materials.push(material);
 
-    let plane_layout = inline_kitty_plane_layout(layout);
-    let (mesh_handle, material_handle) =
-        ensure_kitty_plane_assets(object, &plane_layout, &image_handle, ctx);
+    let plane_layout = InlineKittyPlaneLayout {
+        local_x: (draw.x + draw.width * 0.5) / viewport.size.x - 0.5,
+        local_y: 0.5 - (draw.y + draw.height * 0.5) / viewport.size.y,
+        local_width: draw.width / viewport.size.x,
+        local_height: draw.height / viewport.size.y,
+        depth_offset: draw.depth,
+        x_segments: ((draw.width / cell_width).ceil() as u32).clamp(2, 24),
+        y_segments: ((draw.height / cell_height).ceil() as u32).clamp(2, 24),
+    };
+    let plane_mesh = build_kitty_plane_mesh(
+        &plane_layout,
+        draw.source_rect,
+        ctx.mode,
+        ctx.warp_amount,
+        ctx.elapsed_secs,
+        ctx.mobius_progress,
+    );
+    let mesh_handle = ctx.meshes.add(plane_mesh);
+    let material_handle = ctx.materials.add(kitty_plane_material(image_handle));
+    ctx.cache.meshes.push(mesh_handle.clone());
+    ctx.cache.plane_materials.push(material_handle.clone());
     ctx.plane_children.push(
         commands
             .spawn((
+                TerminalKittyPlacement,
                 TerminalInlineObjectPlane,
                 plane_layout,
                 Mesh3d(mesh_handle),
@@ -1072,66 +1262,6 @@ fn sync_kitty_inline_image(
             ))
             .id(),
     );
-}
-
-fn inline_kitty_plane_layout(layout: &InlineLayout) -> InlineKittyPlaneLayout {
-    InlineKittyPlaneLayout {
-        local_x: layout.local_x,
-        local_y: layout.local_y,
-        local_width: layout.local_width,
-        local_height: layout.local_height,
-        x_segments: layout.columns.clamp(2, 24),
-        y_segments: layout.rows.clamp(2, 24),
-    }
-}
-
-fn ensure_kitty_plane_assets(
-    object: &mut crate::inline::KittyInlineObject,
-    layout: &InlineKittyPlaneLayout,
-    image_handle: &Handle<Image>,
-    ctx: &mut KittyRenderContext<'_>,
-) -> (Handle<Mesh>, Handle<StandardMaterial>) {
-    let needs_rebuild = object.plane.as_ref().is_none_or(|cache| {
-        cache.x_segments != layout.x_segments || cache.y_segments != layout.y_segments
-    });
-    if needs_rebuild {
-        if let Some(cache) = object.plane.take() {
-            ctx.meshes.remove(&cache.mesh);
-            ctx.materials.remove(&cache.material);
-        }
-        let mesh = build_kitty_plane_mesh(
-            layout,
-            ctx.mode,
-            ctx.warp_amount,
-            ctx.elapsed_secs,
-            ctx.mobius_progress,
-        );
-        let mesh_handle = ctx.meshes.add(mesh);
-        let material_handle = ctx.materials.add(kitty_plane_material(image_handle));
-        object.plane = Some(crate::inline::KittyPlaneCache {
-            x_segments: layout.x_segments,
-            y_segments: layout.y_segments,
-            mesh: mesh_handle.clone(),
-            material: material_handle.clone(),
-        });
-        return (mesh_handle, material_handle);
-    }
-
-    let cache = object.plane.as_mut().expect("plane cache should exist");
-    if let Some(mut mesh) = ctx.meshes.get_mut(&cache.mesh) {
-        write_kitty_plane_positions(
-            &mut mesh,
-            layout,
-            ctx.mode,
-            ctx.warp_amount,
-            ctx.elapsed_secs,
-            ctx.mobius_progress,
-        );
-    }
-    if let Some(mut material) = ctx.materials.get_mut(&cache.material) {
-        material.base_color_texture = Some(image_handle.clone());
-    }
-    (cache.mesh.clone(), cache.material.clone())
 }
 
 fn kitty_plane_material(image_handle: &Handle<Image>) -> StandardMaterial {
@@ -1147,6 +1277,7 @@ fn kitty_plane_material(image_handle: &Handle<Image>) -> StandardMaterial {
 
 fn build_kitty_plane_mesh(
     layout: &InlineKittyPlaneLayout,
+    source_rect: [f32; 4],
     mode: TerminalPresentationMode,
     warp_amount: f32,
     elapsed_secs: f32,
@@ -1165,7 +1296,10 @@ fn build_kitty_plane_mesh(
             let u = x as f32 / layout.x_segments as f32;
             let px = layout.local_x + (u - 0.5) * layout.local_width;
             positions.push([px, py, 0.0]);
-            uvs.push([u, v]);
+            uvs.push([
+                source_rect[0] + (source_rect[2] - source_rect[0]) * u,
+                source_rect[1] + (source_rect[3] - source_rect[1]) * v,
+            ]);
         }
     }
 
@@ -1228,7 +1362,7 @@ fn write_kitty_plane_positions(
                     py,
                     warp_amount,
                     elapsed_secs,
-                    1.5,
+                    layout.depth_offset,
                     mobius_progress,
                 );
                 positions[index] = point.to_array();
@@ -1469,6 +1603,7 @@ pub(crate) struct RgpSyncParams<'w, 's> {
     time: Res<'w, Time>,
     plane_query: PlaneTransformQuery<'w, 's>,
     inline_objects: Res<'w, TerminalInlineObjects>,
+    runtime: Res<'w, TerminalRuntime>,
     query: Query<
         'w,
         's,
@@ -1483,7 +1618,8 @@ pub(crate) struct RgpSyncParams<'w, 's> {
 /// Synchronizes RGP object entities.
 ///
 /// This runs after [`sync_inline_objects`]. It does not create registrations itself; instead, it
-/// positions existing [`TerminalRgpObject`] roots from [`TerminalInlineObjects`] anchor data.
+/// positions existing [`TerminalRgpObject`] roots from rio-vt placement geometry. Ratty's anchor
+/// record supplies only RGP-specific presentation style.
 ///
 /// In [`TerminalPresentationMode::Flat2d`] objects are placed in screen space above the terminal
 /// surface. In the 3D modes they are projected onto the active terminal surface using the current
@@ -1499,6 +1635,7 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
         time,
         plane_query,
         inline_objects,
+        runtime,
         query,
     } = &mut params;
     let cell_width = viewport.size.x / terminal.cols.max(1) as f32;
@@ -1512,7 +1649,32 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
             *visibility = Visibility::Hidden;
             continue;
         };
-        let layout = inline_layout(anchor, terminal, viewport, cell_width, cell_height);
+        let Some(geometry) = runtime
+            .term
+            .external_placement_geometries()
+            .into_iter()
+            .find(|geometry| geometry.id == rgp_external_id(object.object_id))
+        else {
+            *visibility = Visibility::Hidden;
+            continue;
+        };
+        // Position and scale from the full source placement. Using the
+        // clipped destination geometry here made a partially scrolled object
+        // shrink and stretch to fill the surviving rows. The terminal's
+        // source offsets identify the visible subsection without changing the
+        // original model transform.
+        let layout = inline_layout(
+            InlineGeometry {
+                row: geometry.row.saturating_sub(geometry.source_row as i64),
+                col: geometry.col.saturating_sub(geometry.source_col),
+                columns: geometry.source_columns as u32,
+                rows: geometry.source_rows as u32,
+            },
+            terminal,
+            viewport,
+            cell_width,
+            cell_height,
+        );
         let base_scale = layout.pixel_width.max(layout.pixel_height).max(1.0) * 0.9;
         let scale = base_scale * anchor.style.scale.max(0.001);
         let scale3 = Vec3::new(
@@ -2158,6 +2320,7 @@ mod tests {
     };
     use crate::runtime::TerminalRuntime;
     use crate::scene::MobiusEnterZoomFloor;
+    use rio_vt::ansi::graphics::UpdateQueues;
 
     const PNG_2X2: &[u8] = &[
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
@@ -2167,50 +2330,341 @@ mod tests {
         0xab, 0xb6, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
 
+    fn kitty_graphic(
+        width: usize,
+        height: usize,
+        color_type: RioColorType,
+        pixels: Vec<u8>,
+    ) -> GraphicData {
+        GraphicData {
+            id: rio_graphics::GraphicId::new(1),
+            width,
+            height,
+            color_type,
+            pixels,
+            is_opaque: false,
+            resize: None,
+            display_width: None,
+            display_height: None,
+            transmit_time: rio_vt::time::Instant::now(),
+        }
+    }
+
     #[derive(Resource, Default)]
     struct CameraChangedProbe(bool);
 
     #[derive(Resource, Default)]
     struct VisibilityChangedProbe(usize);
 
-    #[test]
-    fn scroll_tracking_ignores_unchanged_terminal_state() {
-        let runtime = TerminalRuntime::for_test(24, 80);
-        let previous = vt::scroll_snapshot(&runtime.term);
+    fn ingest(
+        objects: &mut TerminalInlineObjects,
+        runtime: &mut TerminalRuntime,
+        bytes: &[u8],
+    ) -> Vec<Vec<u8>> {
+        let mut camera_updates = Vec::new();
+        let mut terminal_output = false;
+        objects.consume_pty_output(bytes, runtime, &mut camera_updates, &mut terminal_output)
+    }
 
-        assert_eq!(vt::upward_scroll_since(previous, &runtime.term), 0);
+    fn reply_text(replies: &[Vec<u8>]) -> String {
+        replies
+            .iter()
+            .map(|reply| String::from_utf8_lossy(reply))
+            .collect::<String>()
     }
 
     #[test]
-    fn scroll_tracking_uses_the_vt_viewport_top() {
-        let mut runtime = TerminalRuntime::for_test(3, 10);
-        let previous = vt::scroll_snapshot(&runtime.term);
+    fn native_kitty_stream_creates_replaces_and_deletes_one_stable_bevy_image() {
+        let mut runtime = TerminalRuntime::for_test(10, 20);
+        let mut objects = TerminalInlineObjects::default();
+        let command = b"\x1b_Ga=T,t=d,f=32,s=2,v=1,i=31,c=2,r=1,x=1,y=0,w=1,h=1,X=3,Y=4,z=-2;/wAA/wD/AP8\x1b\\";
+        let mut replies = Vec::new();
+        for fragment in command.chunks(7) {
+            replies.extend(ingest(&mut objects, &mut runtime, fragment));
+        }
+        assert!(reply_text(&replies).contains(";OK"));
 
-        runtime.process(b"a\r\nb\r\nc\r\nd");
+        let mut images = Assets::<Image>::default();
+        sync_kitty_updates(&mut objects.kitty_render, &mut images);
+        let cached = objects
+            .kitty_render
+            .images
+            .get(&31)
+            .expect("native update should create a Bevy image");
+        let handle = cached.handle.clone();
+        assert_eq!((cached.width, cached.height), (2, 1));
+        assert_eq!(
+            images.get(&handle).and_then(|image| image.data.as_deref()),
+            Some(&[255, 0, 0, 255, 0, 255, 0, 255][..])
+        );
 
-        assert_eq!(vt::upward_scroll_since(previous, &runtime.term), 1);
+        let draws = collect_draws(
+            &runtime.term,
+            &objects.kitty_render,
+            10.0,
+            20.0,
+            200.0,
+            200.0,
+        );
+        assert_eq!(draws.len(), 1);
+        assert_eq!(
+            draws[0],
+            KittyDraw {
+                image_id: 31,
+                x: 3.0,
+                y: 4.0,
+                width: 20.0,
+                height: 20.0,
+                source_rect: [0.5, 0.0, 1.0, 1.0],
+                z_index: -2,
+                depth: -1.5,
+            }
+        );
+        assert!(draws[0].depth < 0.0);
+
+        let replies = ingest(
+            &mut objects,
+            &mut runtime,
+            b"\x1b_Ga=T,t=d,f=32,s=2,v=1,i=31;AAD///////8\x1b\\",
+        );
+        assert!(reply_text(&replies).contains(";OK"));
+        sync_kitty_updates(&mut objects.kitty_render, &mut images);
+        let replacement = objects
+            .kitty_render
+            .images
+            .get(&31)
+            .expect("retransmission must retain the cached image");
+        assert_eq!(replacement.handle, handle);
+        assert_eq!(
+            images.get(&handle).and_then(|image| image.data.as_deref()),
+            Some(&[0, 0, 255, 255, 255, 255, 255, 255][..])
+        );
+
+        ingest(&mut objects, &mut runtime, b"\x1b_Ga=d,d=I,i=31\x1b\\");
+        sync_kitty_updates(&mut objects.kitty_render, &mut images);
+        assert!(!objects.kitty_render.images.contains_key(&31));
+        assert!(images.get(&handle).is_none());
+        assert!(
+            collect_draws(
+                &runtime.term,
+                &objects.kitty_render,
+                10.0,
+                20.0,
+                200.0,
+                200.0
+            )
+            .is_empty()
+        );
     }
 
     #[test]
-    fn scroll_tracking_holds_content_while_viewing_scrollback() {
-        let mut runtime = TerminalRuntime::for_test(3, 10);
-        runtime.process(b"a\r\nb\r\nc\r\nd\r\ne\r\nf");
-        vt::set_scrollback(&mut runtime.term, 2);
-        let previous = vt::scroll_snapshot(&runtime.term);
+    fn native_kitty_query_policy_and_chunked_zlib_match_current_stream_clients() {
+        let mut runtime = TerminalRuntime::for_test(10, 20);
+        let mut objects = TerminalInlineObjects::default();
 
-        runtime.process(b"\r\ng");
+        let replies = ingest(
+            &mut objects,
+            &mut runtime,
+            b"\x1b_Ga=q,t=f,f=32,s=1,v=1,i=90;L3RtcC94\x1b\\",
+        );
+        assert!(reply_text(&replies).contains("unsupported medium"));
+        assert!(!runtime.term.graphics.kitty_images.contains_key(&90));
 
-        assert_eq!(vt::upward_scroll_since(previous, &runtime.term), 0);
+        assert!(
+            ingest(
+                &mut objects,
+                &mut runtime,
+                b"\x1b_Ga=T,t=d,f=32,s=2,v=1,i=41,o=z,m=1;eJz7z8Dw\x1b\\"
+            )
+            .is_empty()
+        );
+        // kitten 0.46.1 repeats `a=T,q=2` on the last APC and omits the
+        // default `m=0`, rather than emitting a minimal `Gm=0` header.
+        let replies = ingest(
+            &mut objects,
+            &mut runtime,
+            b"\x1b_Ga=T,q=2;HwQBEPcD/Q\x1b\\",
+        );
+        assert!(reply_text(&replies).contains(";OK"));
+
+        let mut images = Assets::<Image>::default();
+        sync_kitty_updates(&mut objects.kitty_render, &mut images);
+        let image = objects
+            .kitty_render
+            .images
+            .get(&41)
+            .expect("chunked zlib transmission must upload an image");
+        assert_eq!(
+            images
+                .get(&image.handle)
+                .and_then(|asset| asset.data.as_deref()),
+            Some(&[255, 0, 0, 255, 0, 255, 0, 255][..])
+        );
     }
 
     #[test]
-    fn scroll_tracking_does_not_cross_screen_buffers() {
-        let mut runtime = TerminalRuntime::for_test(3, 10);
-        let previous = vt::scroll_snapshot(&runtime.term);
+    fn native_kitty_upload_rejects_invalid_shapes_and_expands_rgb() {
+        assert!(kitty_bevy_image(kitty_graphic(0, 1, RioColorType::Rgba, vec![])).is_none());
+        assert!(
+            kitty_bevy_image(kitty_graphic(usize::MAX, 2, RioColorType::Rgba, vec![])).is_none()
+        );
+        assert!(kitty_bevy_image(kitty_graphic(1, 1, RioColorType::Rgb, vec![1, 2])).is_none());
+        assert!(kitty_bevy_image(kitty_graphic(1, 1, RioColorType::Rgba, vec![1, 2, 3])).is_none());
 
-        runtime.process(b"\x1b[?1049h");
+        let (image, width, height) = kitty_bevy_image(kitty_graphic(
+            2,
+            1,
+            RioColorType::Rgb,
+            vec![1, 2, 3, 4, 5, 6],
+        ))
+        .expect("valid RGB pixels should upload");
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(image.data, Some(vec![1, 2, 3, 255, 4, 5, 6, 255]));
+    }
 
-        assert_eq!(vt::upward_scroll_since(previous, &runtime.term), 0);
+    #[test]
+    fn native_kitty_retransmission_burst_keeps_only_final_pixel_buffer() {
+        let mut cache = KittyRenderCache::default();
+        let pixel_bytes = 256 * 1024 * 4;
+        cache.queue_updates((0u8..32).map(|byte| UpdateQueues {
+            pending: Vec::new(),
+            pending_images: vec![(
+                7,
+                kitty_graphic(256, 1024, RioColorType::Rgba, vec![byte; pixel_bytes]),
+            )],
+            remove_queue: Vec::new(),
+        }));
+
+        assert_eq!(cache.pending_updates.len(), 1);
+        let final_graphic = cache
+            .pending_updates
+            .get(&7)
+            .and_then(Option::as_ref)
+            .expect("final replacement retained");
+        assert_eq!(final_graphic.pixels.len(), pixel_bytes);
+        assert_eq!(final_graphic.pixels[0], 31);
+
+        let mut images = Assets::<Image>::default();
+        sync_kitty_updates(&mut cache, &mut images);
+        let cached = cache.images.get(&7).expect("final image uploaded");
+        assert_eq!(
+            images
+                .get(&cached.handle)
+                .and_then(|image| image.data.as_ref())
+                .and_then(|pixels| pixels.first()),
+            Some(&31)
+        );
+    }
+
+    #[test]
+    fn unicode_placeholder_draws_follow_cells_through_region_scroll_and_scrollback() {
+        use rio_vt::ansi::kitty_virtual::{DIACRITICS, PLACEHOLDER};
+
+        let mut runtime = TerminalRuntime::for_test(4, 10);
+        let mut objects = TerminalInlineObjects::default();
+        let image_id = 0x0201_0203u32;
+        let high = (image_id >> 24) as usize;
+        let r = (image_id >> 16) & 0xff;
+        let g = (image_id >> 8) & 0xff;
+        let b = image_id & 0xff;
+        let mut wire = format!(
+            "\x1b_Gf=32,a=t,i={image_id},s=1,v=1;/wAA/w\x1b\\\x1b_Ga=p,U=1,i={image_id},c=4,r=2,q=2\x1b\\\x1b[38:2:{r}:{g}:{b}m"
+        );
+        for (row, &row_diacritic) in DIACRITICS.iter().enumerate().take(2) {
+            for &column_diacritic in DIACRITICS.iter().take(4) {
+                wire.push(PLACEHOLDER);
+                wire.push(row_diacritic);
+                wire.push(column_diacritic);
+                wire.push(DIACRITICS[high]);
+            }
+            if row == 0 {
+                wire.push_str("\n\r");
+            }
+        }
+        wire.push_str("\x1b[39m");
+        let replies = ingest(&mut objects, &mut runtime, wire.as_bytes());
+        assert!(
+            reply_text(&replies).contains(";OK"),
+            "unexpected Kitty replies: {}",
+            reply_text(&replies)
+        );
+
+        let mut images = Assets::<Image>::default();
+        sync_kitty_updates(&mut objects.kitty_render, &mut images);
+        assert!(objects.kitty_render.images.contains_key(&image_id));
+        assert!(
+            runtime
+                .term
+                .graphics
+                .kitty_virtual_placements
+                .contains_key(&(image_id, 0))
+        );
+        assert!(vt::visible_row(&runtime.term, 0).is_some_and(|row| row.kitty_virtual_placeholder));
+        let draws = collect_draws(
+            &runtime.term,
+            &objects.kitty_render,
+            10.0,
+            20.0,
+            100.0,
+            80.0,
+        );
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].image_id, image_id);
+
+        ingest(&mut objects, &mut runtime, b"\x1b[1;3r\x1b[3;1H\n");
+        let draws = collect_draws(
+            &runtime.term,
+            &objects.kitty_render,
+            10.0,
+            20.0,
+            100.0,
+            80.0,
+        );
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].source_rect, [0.0, 0.5, 1.0, 1.0]);
+
+        ingest(&mut objects, &mut runtime, b"\x1b[r\x1b[4;1H\n");
+        assert!(
+            collect_draws(
+                &runtime.term,
+                &objects.kitty_render,
+                10.0,
+                20.0,
+                100.0,
+                80.0
+            )
+            .is_empty()
+        );
+        vt::set_scrollback(&mut runtime.term, 1);
+        assert_eq!(
+            collect_draws(
+                &runtime.term,
+                &objects.kitty_render,
+                10.0,
+                20.0,
+                100.0,
+                80.0
+            )
+            .len(),
+            1
+        );
+
+        runtime.resize(5, 4, 50, 80);
+        assert!(
+            !collect_draws(&runtime.term, &objects.kitty_render, 10.0, 20.0, 50.0, 80.0).is_empty()
+        );
+
+        ingest(&mut objects, &mut runtime, b"\x1b[2J");
+        assert_eq!(
+            collect_draws(&runtime.term, &objects.kitty_render, 10.0, 20.0, 50.0, 80.0).len(),
+            1,
+            "ED must not erase a placeholder cell retained in viewed history"
+        );
+        vt::set_scrollback(&mut runtime.term, 0);
+        assert!(
+            collect_draws(&runtime.term, &objects.kitty_render, 10.0, 20.0, 50.0, 80.0).is_empty(),
+            "erasing active placeholder cells must remove their rendered slices"
+        );
     }
 
     #[test]
@@ -2484,11 +2938,18 @@ mod tests {
             local_y: 0.0,
             local_width: 0.2,
             local_height: 0.2,
+            depth_offset: 1.5,
             x_segments: 2,
             y_segments: 2,
         };
-        let mesh =
-            build_kitty_plane_mesh(&layout, TerminalPresentationMode::Mobius3d, 0.0, 0.0, 0.0);
+        let mesh = build_kitty_plane_mesh(
+            &layout,
+            [0.0, 0.0, 1.0, 1.0],
+            TerminalPresentationMode::Mobius3d,
+            0.0,
+            0.0,
+            0.0,
+        );
 
         let mut slots = TerminalCameraSlots::default();
         slots.active_mut().mode = TerminalPresentationMode::Mobius3d;
@@ -2556,11 +3017,18 @@ mod tests {
             local_y: 0.0,
             local_width: 0.2,
             local_height: 0.2,
+            depth_offset: 1.5,
             x_segments: 2,
             y_segments: 2,
         };
-        let mesh =
-            build_kitty_plane_mesh(&layout, TerminalPresentationMode::Mobius3d, 0.0, 0.0, 1.0);
+        let mesh = build_kitty_plane_mesh(
+            &layout,
+            [0.0, 0.0, 1.0, 1.0],
+            TerminalPresentationMode::Mobius3d,
+            0.0,
+            0.0,
+            1.0,
+        );
         let Some(VertexAttributeValues::Float32x3(positions)) =
             mesh.attribute(Mesh::ATTRIBUTE_POSITION)
         else {
@@ -2684,7 +3152,7 @@ mod bitmap_sync_tests {
     use super::*;
     use crate::bitmap::{
         BitmapFilter, BitmapFit, BitmapFrameChunk, BitmapOperation, BitmapPlacement,
-        BitmapPlacementUpdate, BitmapRegisterChunk, SourceRect,
+        BitmapPlacementUpdate, BitmapProtocolError, BitmapRegisterChunk, SourceRect,
     };
     use crate::bitmap_material::BitmapSurfaceMaterial;
 
@@ -2761,6 +3229,7 @@ mod bitmap_sync_tests {
             .init_resource::<Assets<Image>>()
             .init_resource::<Assets<Mesh>>()
             .init_resource::<Assets<BitmapSurfaceMaterial>>()
+            .insert_resource(TerminalRuntime::for_test(24, 80))
             .insert_resource(
                 TerminalSurface::new(&AppConfig::default())
                     .expect("bitmap sync test fixture should satisfy this invariant"),
@@ -2774,23 +3243,39 @@ mod bitmap_sync_tests {
         app
     }
 
+    fn apply_operation(
+        app: &mut App,
+        operation: BitmapOperation,
+    ) -> Result<(), BitmapProtocolError> {
+        let terminal_operation = operation.clone();
+        app.world_mut()
+            .resource_scope(|world, mut objects: Mut<TerminalInlineObjects>| {
+                let result = objects.bitmap.apply(operation);
+                if result.is_ok() {
+                    let mut runtime = world.resource_mut::<TerminalRuntime>();
+                    objects.sync_bitmap_operation(&terminal_operation, &mut runtime.term);
+                }
+                result.map(|_| ())
+            })
+    }
+
     fn register_and_place(app: &mut App, placement_ids: &[u32]) {
-        let mut objects = app.world_mut().resource_mut::<TerminalInlineObjects>();
-        objects
-            .bitmap
-            .apply(BitmapOperation::Register(BitmapRegisterChunk {
+        apply_operation(
+            app,
+            BitmapOperation::Register(BitmapRegisterChunk {
                 bitmap_id: 42,
                 format: Some("png".into()),
                 source: Some("payload".into()),
                 name: None,
                 more: false,
                 data: PNG_2X2.to_vec(),
-            }))
-            .expect("bitmap sync test fixture should satisfy this invariant");
+            }),
+        )
+        .expect("bitmap sync test fixture should satisfy this invariant");
         for &placement_id in placement_ids {
-            objects
-                .bitmap
-                .apply(BitmapOperation::Place(BitmapPlacement {
+            apply_operation(
+                app,
+                BitmapOperation::Place(BitmapPlacement {
                     bitmap_id: 42,
                     placement_id,
                     row: placement_id as u16,
@@ -2801,8 +3286,9 @@ mod bitmap_sync_tests {
                     fit: BitmapFit::Contain,
                     filter: BitmapFilter::Linear,
                     opacity: 1.0,
-                }))
-                .expect("bitmap sync test fixture should satisfy this invariant");
+                }),
+            )
+            .expect("bitmap sync test fixture should satisfy this invariant");
         }
     }
 
@@ -2870,9 +3356,8 @@ mod bitmap_sync_tests {
             .expect("bitmap sync test fixture should satisfy this invariant");
 
         app.world_mut()
-            .resource_mut::<TerminalInlineObjects>()
-            .bitmap
-            .apply_scroll(2);
+            .resource_mut::<TerminalRuntime>()
+            .process(&b"x\r\n".repeat(25));
         app.update();
 
         let after = rendered_placements(&mut app)
@@ -2897,10 +3382,9 @@ mod bitmap_sync_tests {
             .remove(&7)
             .expect("bitmap sync test fixture should satisfy this invariant");
 
-        app.world_mut()
-            .resource_mut::<TerminalInlineObjects>()
-            .bitmap
-            .apply(BitmapOperation::Update {
+        apply_operation(
+            &mut app,
+            BitmapOperation::Update {
                 placement_id: 7,
                 update: BitmapPlacementUpdate {
                     row: Some(5),
@@ -2917,8 +3401,9 @@ mod bitmap_sync_tests {
                     filter: Some(BitmapFilter::Nearest),
                     opacity: Some(0.5),
                 },
-            })
-            .expect("bitmap sync test fixture should satisfy this invariant");
+            },
+        )
+        .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
 
         let after = rendered_placements(&mut app)
@@ -3074,10 +3559,7 @@ mod bitmap_sync_tests {
         app.update();
         let before = rendered_placements(&mut app);
 
-        app.world_mut()
-            .resource_mut::<TerminalInlineObjects>()
-            .bitmap
-            .apply(BitmapOperation::DeletePlacement(7))
+        apply_operation(&mut app, BitmapOperation::DeletePlacement(7))
             .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
         let after_placement_delete = rendered_placements(&mut app);
@@ -3085,10 +3567,7 @@ mod bitmap_sync_tests {
         assert_eq!(after_placement_delete[&8].0, before[&8].0);
         assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
 
-        app.world_mut()
-            .resource_mut::<TerminalInlineObjects>()
-            .bitmap
-            .apply(BitmapOperation::DeletePlacement(8))
+        apply_operation(&mut app, BitmapOperation::DeletePlacement(8))
             .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
         assert!(rendered_placements(&mut app).is_empty());
@@ -3099,10 +3578,7 @@ mod bitmap_sync_tests {
                 .is_empty()
         );
 
-        app.world_mut()
-            .resource_mut::<TerminalInlineObjects>()
-            .bitmap
-            .apply(BitmapOperation::DeleteBitmap(42))
+        apply_operation(&mut app, BitmapOperation::DeleteBitmap(42))
             .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
         assert!(rendered_placements(&mut app).is_empty());
@@ -3123,10 +3599,7 @@ mod bitmap_sync_tests {
             .remove(&7)
             .expect("bitmap sync test fixture should satisfy this invariant");
 
-        app.world_mut()
-            .resource_mut::<TerminalInlineObjects>()
-            .bitmap
-            .apply(BitmapOperation::DeleteBitmap(42))
+        apply_operation(&mut app, BitmapOperation::DeleteBitmap(42))
             .expect("bitmap sync test fixture should satisfy this invariant");
         register_and_place(&mut app, &[7]);
         app.update();
@@ -3148,28 +3621,24 @@ mod bitmap_sync_tests {
             .remove(&7)
             .expect("bitmap sync test fixture should satisfy this invariant");
 
-        {
-            let mut objects = app.world_mut().resource_mut::<TerminalInlineObjects>();
-            objects
-                .bitmap
-                .apply(BitmapOperation::DeletePlacement(7))
-                .expect("bitmap sync test fixture should satisfy this invariant");
-            objects
-                .bitmap
-                .apply(BitmapOperation::Place(BitmapPlacement {
-                    bitmap_id: 42,
-                    placement_id: 7,
-                    row: 9,
-                    col: 4,
-                    columns: 5,
-                    rows: 3,
-                    source: None,
-                    fit: BitmapFit::Fill,
-                    filter: BitmapFilter::Nearest,
-                    opacity: 0.75,
-                }))
-                .expect("bitmap sync test fixture should satisfy this invariant");
-        }
+        apply_operation(&mut app, BitmapOperation::DeletePlacement(7))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        apply_operation(
+            &mut app,
+            BitmapOperation::Place(BitmapPlacement {
+                bitmap_id: 42,
+                placement_id: 7,
+                row: 9,
+                col: 4,
+                columns: 5,
+                rows: 3,
+                source: None,
+                fit: BitmapFit::Fill,
+                filter: BitmapFilter::Nearest,
+                opacity: 0.75,
+            }),
+        )
+        .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
 
         let after = rendered_placements(&mut app)
@@ -3182,10 +3651,7 @@ mod bitmap_sync_tests {
         let marker = rendered_marker(&mut app, 7);
         assert_eq!(marker.bitmap_id, 42);
 
-        app.world_mut()
-            .resource_mut::<TerminalInlineObjects>()
-            .bitmap
-            .apply(BitmapOperation::DeletePlacement(7))
+        apply_operation(&mut app, BitmapOperation::DeletePlacement(7))
             .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
         assert!(rendered_placements(&mut app).is_empty());
@@ -3197,10 +3663,7 @@ mod bitmap_sync_tests {
         );
         assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
 
-        app.world_mut()
-            .resource_mut::<TerminalInlineObjects>()
-            .bitmap
-            .apply(BitmapOperation::DeleteBitmap(42))
+        apply_operation(&mut app, BitmapOperation::DeleteBitmap(42))
             .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
         assert!(app.world().resource::<Assets<Image>>().is_empty());
@@ -3227,28 +3690,24 @@ mod bitmap_sync_tests {
             .remove(&7)
             .expect("bitmap sync test fixture should satisfy this invariant");
 
-        {
-            let mut objects = app.world_mut().resource_mut::<TerminalInlineObjects>();
-            objects
-                .bitmap
-                .apply(BitmapOperation::DeletePlacement(7))
-                .expect("bitmap sync test fixture should satisfy this invariant");
-            objects
-                .bitmap
-                .apply(BitmapOperation::Place(BitmapPlacement {
-                    bitmap_id: 43,
-                    placement_id: 7,
-                    row: 2,
-                    col: 6,
-                    columns: 4,
-                    rows: 2,
-                    source: None,
-                    fit: BitmapFit::Contain,
-                    filter: BitmapFilter::Linear,
-                    opacity: 1.0,
-                }))
-                .expect("bitmap sync test fixture should satisfy this invariant");
-        }
+        apply_operation(&mut app, BitmapOperation::DeletePlacement(7))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        apply_operation(
+            &mut app,
+            BitmapOperation::Place(BitmapPlacement {
+                bitmap_id: 43,
+                placement_id: 7,
+                row: 2,
+                col: 6,
+                columns: 4,
+                rows: 2,
+                source: None,
+                fit: BitmapFit::Contain,
+                filter: BitmapFilter::Linear,
+                opacity: 1.0,
+            }),
+        )
+        .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
 
         let after = rendered_placements(&mut app)
@@ -3262,10 +3721,7 @@ mod bitmap_sync_tests {
         assert_eq!(marker.bitmap_id, 43);
         assert_eq!(app.world().resource::<Assets<Image>>().len(), 2);
 
-        app.world_mut()
-            .resource_mut::<TerminalInlineObjects>()
-            .bitmap
-            .apply(BitmapOperation::DeletePlacement(7))
+        apply_operation(&mut app, BitmapOperation::DeletePlacement(7))
             .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
         assert!(rendered_placements(&mut app).is_empty());
@@ -3277,17 +3733,10 @@ mod bitmap_sync_tests {
         );
         assert_eq!(app.world().resource::<Assets<Image>>().len(), 2);
 
-        {
-            let mut objects = app.world_mut().resource_mut::<TerminalInlineObjects>();
-            objects
-                .bitmap
-                .apply(BitmapOperation::DeleteBitmap(42))
-                .expect("bitmap sync test fixture should satisfy this invariant");
-            objects
-                .bitmap
-                .apply(BitmapOperation::DeleteBitmap(43))
-                .expect("bitmap sync test fixture should satisfy this invariant");
-        }
+        apply_operation(&mut app, BitmapOperation::DeleteBitmap(42))
+            .expect("bitmap sync test fixture should satisfy this invariant");
+        apply_operation(&mut app, BitmapOperation::DeleteBitmap(43))
+            .expect("bitmap sync test fixture should satisfy this invariant");
         app.update();
         assert!(app.world().resource::<Assets<Image>>().is_empty());
     }

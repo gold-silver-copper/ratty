@@ -74,6 +74,8 @@ fn encode_placement(
     columns: u32,
     rows: u32,
 ) -> Vec<u8> {
+    // row/col are visible coordinates now; Ratty attaches the resulting
+    // placement to this alternate-screen content for later scroll/reflow.
     encode_command(format!(
         "p;id={bitmap_id};pid={placement_id};row={row};col={col};w={columns};h={rows};fit=contain;filter=linear;opacity=1"
     ))

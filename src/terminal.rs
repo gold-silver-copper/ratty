@@ -338,7 +338,7 @@ pub fn texture_logical_size(texture_size: UVec2, render_scale: f32) -> Vec2 {
 fn build_terminal_renderer(
     font: &FontConfig,
     theme_config: &ThemeConfig,
-    window_opacity: f32,
+    _window_opacity: f32,
     render_scale: f32,
 ) -> TerminalRenderer {
     let palette = theme_config
@@ -350,11 +350,16 @@ fn build_terminal_renderer(
             theme_config.foreground[1],
             theme_config.foreground[2],
         ),
+        // The camera clear owns the default terminal background. Leaving
+        // default cells transparent creates the protocol-required layer for
+        // negative-z Kitty images: clear color, negative graphics, then this
+        // texture's non-default backgrounds and glyphs. Positive-z graphics
+        // are drawn above the texture. Window opacity remains on ClearColor.
         background: parley_ratatui::Rgba::rgba(
             theme_config.background[0],
             theme_config.background[1],
             theme_config.background[2],
-            (window_opacity.clamp(0.0, 1.0) * 255.0).round() as u8,
+            0,
         ),
         cursor: parley_ratatui::Rgba::rgb(
             theme_config.cursor[0],

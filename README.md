@@ -292,6 +292,38 @@ Current v1 boundaries:
 - no live-frame compression, delta updates, or dirty rectangles
 - no codec decoding, VP8 handling, capture, or networking in Ratty
 
+### Kitty graphics
+
+Kitty Graphics Protocol handling is native to `rio-vt`: Ratty forwards complete
+Kitty APC frames unchanged and owns only the Bevy image assets and draw
+entities created from rio-vt's graphics updates and placement geometry. This
+keeps Kitty parsing, replies, image lifetime, direct placement mutation,
+Unicode-placeholder cells, scrollback, reflow, and alternate-screen behavior
+in the terminal state machine.
+
+The renderer supports direct RGB/RGBA and PNG transfers, padded or unpadded
+standard base64, `o=z` zlib compression, multi-APC chunking, crop and cell
+spans, pixel offsets, z-index, retransmission, and deletion. Unicode
+placeholders remain ordinary terminal cells, so scrolling, resizing, reflow,
+and erasure naturally change which image slices are visible. Current `kitten
+icat --transfer-mode=stream` and its `--unicode-placeholder` mode use these
+paths.
+
+Ordinary negative Kitty z-index placements currently render below Ratty's
+combined terminal texture, so non-default cell backgrounds can obscure them.
+Extreme-negative/default-background placement and image-to-image z ordering
+remain supported.
+
+Ratty deliberately permits only Kitty's direct PTY-stream medium. File,
+temporary-file, and shared-memory media are disabled and capability queries for
+them fail. The `[bitmap]` limits also configure Kitty's encoded, decoded,
+decompressed, dimension, resident-byte, placement, and incomplete-transfer
+budgets. Incomplete transfers expire after ten seconds, malformed or
+interleaved transfers abort without replacing valid pixels, and an unterminated
+APC is discarded once it reaches its configured encoded bound. Ratty reports
+`OK` only after the configured parser, storage, placement, and render path can
+honor the request.
+
 ## Architecture
 
 ### Rendering pipeline

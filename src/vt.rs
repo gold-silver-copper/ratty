@@ -12,6 +12,7 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rio_vt::ansi::CursorShape;
+use rio_vt::ansi::graphics::UpdateQueues;
 use rio_vt::config::colors::{AnsiColor, NamedColor};
 use rio_vt::crosswords::grid::row::Row;
 use rio_vt::crosswords::grid::{Grid, Scroll};
@@ -23,35 +24,6 @@ use rio_vt::event::{EventListener, RioEvent, WindowId};
 
 /// The rio-vt state machine ratty drives.
 pub type VtTerminal = Crosswords<TerminalEventSink>;
-
-/// Scroll position snapshot tied to one terminal screen buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ScrollSnapshot {
-    alternate_screen: bool,
-    viewport_top: u64,
-}
-
-/// Captures the stable absolute row at the top of the visible viewport.
-pub(crate) fn scroll_snapshot(term: &VtTerminal) -> ScrollSnapshot {
-    let absolute_top = term
-        .lines_evicted()
-        .saturating_add(u64::try_from(term.history_size()).unwrap_or(u64::MAX));
-    ScrollSnapshot {
-        alternate_screen: term.mode().contains(Mode::ALT_SCREEN),
-        viewport_top: absolute_top
-            .saturating_sub(u64::try_from(term.display_offset()).unwrap_or(u64::MAX)),
-    }
-}
-
-/// Returns exact upward viewport movement since a snapshot.
-pub(crate) fn upward_scroll_since(previous: ScrollSnapshot, term: &VtTerminal) -> u16 {
-    let current = scroll_snapshot(term);
-    if current.alternate_screen != previous.alternate_screen {
-        return 0;
-    }
-
-    u16::try_from(current.viewport_top.saturating_sub(previous.viewport_top)).unwrap_or(u16::MAX)
-}
 
 /// Sink for the events rio-vt raises while parsing.
 ///
@@ -65,6 +37,7 @@ pub(crate) fn upward_scroll_since(previous: ScrollSnapshot, term: &VtTerminal) -
 #[derive(Clone, Default)]
 pub struct TerminalEventSink {
     replies: Arc<Mutex<Vec<Vec<u8>>>>,
+    graphics_updates: Arc<Mutex<Vec<UpdateQueues>>>,
 }
 
 impl TerminalEventSink {
@@ -72,6 +45,15 @@ impl TerminalEventSink {
     pub fn take_replies(&self) -> Vec<Vec<u8>> {
         let mut replies = self.replies.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut *replies)
+    }
+
+    /// Drains image uploads/removals emitted by rio-vt while parsing.
+    pub fn take_graphics_updates(&self) -> Vec<UpdateQueues> {
+        let mut updates = self
+            .graphics_updates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut *updates)
     }
 }
 
@@ -86,6 +68,13 @@ impl EventListener for TerminalEventSink {
                 let reply = rewrite_reply(&text).unwrap_or(text);
                 let mut replies = self.replies.lock().unwrap_or_else(PoisonError::into_inner);
                 replies.push(reply.into_bytes());
+            }
+            RioEvent::UpdateGraphics { queues, .. } => {
+                let mut updates = self
+                    .graphics_updates
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                updates.push(queues);
             }
 
             // Requests carrying a reply callback rio-vt expects the embedder to
@@ -127,10 +116,11 @@ impl EventListener for TerminalEventSink {
 ///
 /// rio-vt answers primary device attributes with a fixed list describing what
 /// the *engine* can parse, not what the embedder renders. `4` is sixel
-/// graphics — rio-vt's `graphics` feature is off here, so nothing decodes it —
-/// and `52` is OSC 52 clipboard access, whose events [`TerminalEventSink`]
-/// drops. Leaving either in makes applications feature-detect support that does
-/// not exist and emit payloads ratty silently swallows.
+/// graphics, whose native atlas updates Ratty does not render, and `52` is OSC
+/// 52 clipboard access, whose events [`TerminalEventSink`] drops. Leaving
+/// either in makes applications feature-detect support that does not exist and
+/// emit payloads Ratty silently swallows. Native Kitty graphics remains enabled
+/// independently through rio-vt's graphics event queue.
 const UNSUPPORTED_DA1_CAPABILITIES: &[&str] = &["4", "52"];
 
 /// Rewrites an engine reply that would misreport ratty's capabilities or

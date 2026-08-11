@@ -16,7 +16,8 @@ use rio_vt::crosswords::{Crosswords, CrosswordsSize};
 use rio_vt::event::WindowId;
 use rio_vt::performer::handler::Processor;
 
-use crate::config::AppConfig;
+use crate::bitmap::max_base64_encoded_bytes;
+use crate::config::{AppConfig, BitmapConfig};
 use crate::vt::{TerminalEventSink, VtTerminal};
 
 /// Command-line runtime overrides.
@@ -135,7 +136,7 @@ impl TerminalRuntime {
     pub(crate) fn for_test(rows: u16, cols: u16) -> Self {
         let (_tx, rx) = mpsc::channel::<Vec<u8>>();
         let sink = TerminalEventSink::default();
-        let term = Crosswords::new(
+        let mut term = Crosswords::new(
             CrosswordsSize::new_with_dimensions(
                 usize::from(cols.max(1)),
                 usize::from(rows.max(1)),
@@ -150,6 +151,7 @@ impl TerminalRuntime {
             0,
             1000,
         );
+        configure_kitty_graphics(&mut term, &BitmapConfig::default());
 
         Self {
             rx: SyncCell::new(rx),
@@ -248,7 +250,7 @@ impl TerminalRuntime {
         });
 
         let sink = TerminalEventSink::default();
-        let term = Crosswords::new(
+        let mut term = Crosswords::new(
             CrosswordsSize::new_with_dimensions(
                 usize::from(cols.max(1)),
                 usize::from(rows.max(1)),
@@ -265,6 +267,7 @@ impl TerminalRuntime {
             0,
             config.terminal.scrollback,
         );
+        configure_kitty_graphics(&mut term, &config.bitmap);
 
         Ok(Self {
             rx: SyncCell::new(rx),
@@ -288,6 +291,11 @@ impl TerminalRuntime {
     /// Drains the replies rio-vt has queued for write-back to the PTY.
     pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
         self.sink.take_replies()
+    }
+
+    /// Drains rio-vt graphics uploads and removals in parser order.
+    pub fn take_graphics_updates(&mut self) -> Vec<rio_vt::ansi::graphics::UpdateQueues> {
+        self.sink.take_graphics_updates()
     }
 
     /// Receives pending PTY output without blocking.
@@ -379,6 +387,33 @@ impl TerminalRuntime {
     }
 }
 
+fn configure_kitty_graphics(term: &mut VtTerminal, bitmap: &BitmapConfig) {
+    let max_bitmap_bytes = usize::try_from(bitmap.max_bitmap_bytes).unwrap_or(usize::MAX);
+    let max_total_bytes = usize::try_from(bitmap.max_total_bitmap_bytes).unwrap_or(usize::MAX);
+    let max_total_incomplete_bytes =
+        usize::try_from(bitmap.max_pending_bytes).unwrap_or(usize::MAX);
+    let max_encoded_bytes = max_base64_encoded_bytes(bitmap.max_bitmap_bytes);
+    term.set_kitty_graphics_config(rio_vt::ansi::kitty_graphics_protocol::KittyGraphicsConfig {
+        max_encoded_bytes,
+        max_decoded_bytes: max_bitmap_bytes,
+        max_decompressed_bytes: max_bitmap_bytes,
+        max_width: bitmap.max_image_width,
+        max_height: bitmap.max_image_height,
+        max_total_bytes,
+        max_placements: bitmap.max_placements,
+        max_incomplete_transfers: bitmap.max_pending_transfers,
+        max_total_incomplete_bytes,
+        incomplete_timeout: rio_vt::time::Duration::from_secs(10),
+        // Ratty only trusts bytes carried by the PTY stream itself. File,
+        // temp-file, and shared-memory media would let an untrusted child
+        // make the terminal process read or unlink out-of-band resources.
+        allow_direct: true,
+        allow_file: false,
+        allow_temp_file: false,
+        allow_shared_memory: false,
+    });
+}
+
 impl Drop for TerminalRuntime {
     fn drop(&mut self) {
         self.shutdown();
@@ -412,5 +447,41 @@ mod tests {
         runtime.process(b"\x1b[16t");
 
         assert_eq!(runtime.take_replies(), [b"\x1b[6;1;1t".to_vec()]);
+    }
+
+    #[test]
+    fn kitty_limits_and_media_policy_follow_bitmap_configuration() {
+        let mut runtime = TerminalRuntime::for_test(24, 80);
+        let bitmap = BitmapConfig {
+            max_bitmaps: 7,
+            max_placements: 11,
+            max_image_width: 101,
+            max_image_height: 202,
+            max_bitmap_bytes: 303,
+            max_total_bitmap_bytes: 404,
+            max_pending_bytes: 505,
+            max_pending_transfers: 6,
+        };
+
+        configure_kitty_graphics(&mut runtime.term, &bitmap);
+        let config = runtime.term.graphics.kitty_chunking_state.config();
+
+        assert_eq!(config.max_encoded_bytes, 404);
+        assert_eq!(config.max_decoded_bytes, 303);
+        assert_eq!(config.max_decompressed_bytes, 303);
+        assert_eq!(config.max_width, 101);
+        assert_eq!(config.max_height, 202);
+        assert_eq!(config.max_total_bytes, 404);
+        assert_eq!(config.max_placements, 11);
+        assert_eq!(config.max_incomplete_transfers, 6);
+        assert_eq!(config.max_total_incomplete_bytes, 505);
+        assert_eq!(
+            config.incomplete_timeout,
+            rio_vt::time::Duration::from_secs(10)
+        );
+        assert!(config.allow_direct);
+        assert!(!config.allow_file);
+        assert!(!config.allow_temp_file);
+        assert!(!config.allow_shared_memory);
     }
 }
