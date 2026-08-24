@@ -1,13 +1,15 @@
 //! Bevy plugin wiring for the terminal application.
 
 use bevy::prelude::*;
+use bevy_terminal_ratatui::prelude::{
+    TerminalPlugin as BevyTerminalPlugin, TerminalSystems as BevyTerminalSystems,
+};
 
 use crate::camera::{
     ActivateTerminalCameraPreset, TerminalCameraSlots, TerminalCameraSystemSet,
     TerminalCameraUpdate, activate_terminal_camera_presets, apply_terminal_camera_updates,
 };
 use crate::config::AppConfig;
-use crate::direct_render::DirectTerminalRenderPlugin;
 use crate::inline::{
     TerminalInlineObjectPlane, TerminalInlineObjectSprite, TerminalInlineObjects, TerminalRgpObject,
 };
@@ -23,6 +25,7 @@ use crate::systems::{
     finish_terminal_model_load, handle_window_resize, pump_pty_output, render_terminal_widget,
     request_exit_on_primary_window_close, shutdown_terminal_runtime_on_exit,
     sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects, sync_terminal_materials,
+    sync_terminal_render_output, sync_terminal_renderer_config,
 };
 use crate::terminal::TerminalRedrawState;
 
@@ -117,17 +120,30 @@ impl Plugin for TerminalPlugin {
                         },
                     ),
             )
+            .add_systems(
+                Update,
+                render_terminal_widget
+                    .after(TerminalCameraSystemSet::MouseInput)
+                    .after(handle_window_resize)
+                    .after(pump_pty_output)
+                    .before(BevyTerminalSystems::Sync),
+            )
+            .add_systems(
+                Update,
+                sync_terminal_renderer_config
+                    .after(render_terminal_widget)
+                    .before(BevyTerminalSystems::Sync),
+            )
             .configure_sets(
                 Update,
                 TerminalRedrawSet
-                    .after(TerminalCameraSystemSet::MouseInput)
-                    .after(handle_window_resize)
-                    .after(pump_pty_output),
+                    .after(BevyTerminalSystems::Sync)
+                    .after(sync_terminal_renderer_config),
             )
             .add_systems(
                 Update,
                 (
-                    render_terminal_widget,
+                    sync_terminal_render_output,
                     sync_terminal_materials,
                     finish_terminal_model_load,
                 )
@@ -173,7 +189,7 @@ impl Plugin for TerminalPlugin {
                     .run_if(|config: Res<AppConfig>| config.cursor.model.visible),
             )
             .add_systems(Last, shutdown_terminal_runtime_on_exit)
-            .add_plugins(DirectTerminalRenderPlugin)
+            .add_plugins(BevyTerminalPlugin)
             .add_plugins(TerminalPresentPlugin);
     }
 }

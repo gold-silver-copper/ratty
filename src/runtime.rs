@@ -54,6 +54,8 @@ pub struct TerminalRuntime {
     /// Indicates PTY shutdown.
     pub pty_disconnected: bool,
     shutdown_started: bool,
+    /// Last dimensions sent to both the PTY and the VT parser.
+    last_pty_size: (u16, u16, u16, u16),
 }
 
 /// Returns the default shell for the current platform.
@@ -229,6 +231,7 @@ impl TerminalRuntime {
             sink,
             pty_disconnected: false,
             shutdown_started: false,
+            last_pty_size: (cols, rows, 0, 0),
         })
     }
 
@@ -266,6 +269,11 @@ impl TerminalRuntime {
         if cols == 0 || rows == 0 {
             return;
         }
+        let size = (cols, rows, pw, ph);
+        if self.last_pty_size == size {
+            return;
+        }
+        self.last_pty_size = size;
 
         if let Some(master) = self.master.get().as_ref() {
             let _ = master.resize(PtySize {

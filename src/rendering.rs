@@ -52,11 +52,10 @@ pub fn sync_terminal_debug_image(
 /// Synchronizes an image handle across plane materials.
 ///
 /// Re-binds the texture on every call rather than only when the handle changes.
-/// The terminal plane textures are rebuilt on the GPU as the terminal updates:
-/// the back debug texture is re-uploaded each redraw, and the front present
-/// texture's GPU image is recreated whenever the terminal resizes. Either rebuild
-/// leaves a material's cached bind group pointing at a stale texture, so the plane
-/// freezes (front) or blanks (back) until the material is re-prepared.
+/// The back debug texture is re-uploaded each redraw, and the front terminal
+/// texture's GPU image is reallocated in place whenever the renderer remeasures
+/// the grid. Either rebuild can leave a material's cached bind group pointing at
+/// a stale texture until the material is re-prepared.
 /// Unconditionally re-binding re-prepares the bind group so the planes always
 /// sample the current texture. The caller only runs this on redraw frames (gated
 /// by the frame-dirty flag), so it is not per-frame churn.

@@ -15,10 +15,6 @@ use crate::paths::expand_path;
 pub const APP_NAME: &str = "ratty";
 /// Local fallback config path.
 pub const CONFIG_PATH: &str = "config/ratty.toml";
-/// Label used for the terminal present texture (sampled by the materials).
-pub const TERMINAL_TEXTURE_LABEL: &str = "ratty.parley_ratatui";
-/// Label used for the terminal render target (Vello's storage texture).
-pub const TERMINAL_RENDER_TEXTURE_LABEL: &str = "ratty.parley_ratatui.render";
 /// Z depth used for the cursor model root.
 pub const CURSOR_DEPTH: f32 = 10.0;
 

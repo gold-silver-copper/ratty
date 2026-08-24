@@ -13,6 +13,7 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 use bevy::window::PrimaryWindow;
+use bevy_terminal_ratatui::TerminalRenderer;
 
 use bevy::camera::visibility::NoFrustumCulling;
 
@@ -20,10 +21,11 @@ use crate::camera::{
     MIN_ORTHOGRAPHIC_SCALE, TerminalCameraInteraction, TerminalCameraPreset, TerminalCameraSlots,
 };
 use crate::config::AppConfig;
-use crate::direct_render::{new_terminal_image, new_terminal_render_image};
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
 use crate::runtime::TerminalRuntime;
-use crate::terminal::{TerminalLayout, TerminalSurface, render_scale_for_window};
+use crate::terminal::{
+    TerminalLayout, TerminalRenderTarget, TerminalSurface, render_scale_for_window,
+};
 
 const TERMINAL_PERSPECTIVE_NEAR: f32 = 0.1;
 const TERMINAL_PERSPECTIVE_FAR: f32 = 10_000.0;
@@ -242,6 +244,12 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     );
 
     commands.spawn((
+        TerminalRenderTarget,
+        TerminalRenderer::new(terminal.tui.surface()),
+        terminal.render_config().clone(),
+    ));
+
+    commands.spawn((
         Camera2d,
         Camera {
             order: 0,
@@ -283,20 +291,6 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     ));
 
     let terminal_alpha = (terminal_opacity * 255.0).round() as u8;
-    let render_image_handle = images.add(new_terminal_render_image(
-        layout.texture_size.x,
-        layout.texture_size.y,
-        crate::config::TERMINAL_RENDER_TEXTURE_LABEL,
-    ));
-    terminal.render_image_handle = Some(render_image_handle);
-
-    let image_handle = images.add(new_terminal_image(
-        layout.texture_size.x,
-        layout.texture_size.y,
-        crate::config::TERMINAL_TEXTURE_LABEL,
-    ));
-    terminal.image_handle = Some(image_handle.clone());
-
     let [r, g, b] = app_config.theme.background;
     let back_image = create_terminal_image(
         layout.texture_size.x,
@@ -325,7 +319,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         TerminalSprite,
         Mesh2d(meshes.add(fullscreen_quad())),
         MeshMaterial2d(present_materials.add(TerminalPresentMaterial {
-            texture: image_handle,
+            texture: Handle::default(),
         })),
         Transform::default(),
         Visibility::Visible,
@@ -345,7 +339,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         Mesh3d(front_mesh),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgba(1.0, 1.0, 1.0, terminal_opacity),
-            base_color_texture: terminal.image_handle.clone(),
+            base_color_texture: None,
             alpha_mode: AlphaMode::Blend,
             unlit: true,
             ..default()

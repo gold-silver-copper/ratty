@@ -3,7 +3,7 @@
 // A fullscreen (clip-space) quad covers the viewport; each fragment samples the
 // terminal texture by its own physical pixel coordinate via `textureLoad`, so
 // every texel maps to exactly one screen pixel with no resampling — the crisp
-// presentation pattern from linebender/bevy_vello, specialized to a centered,
+// render-target presentation pattern specialized to a centered,
 // pixel-aligned sub-rect (the terminal grid does not always fill the window).
 #import bevy_render::view::View
 #import bevy_sprite::mesh2d_vertex_output::VertexOutput
