@@ -351,13 +351,12 @@ pub struct FontConfig {
     /// Without `cell_size` this is a point size (1pt = 4/3 logical pixels).
     /// With a fixed cell it is the proportional zoom baseline for Ctrl +/-.
     pub size: i32,
-    /// Line height multiplier used when deriving cells from the font.
-    pub line_height: f32,
     /// Optional `[width, height]` cell in logical pixels.
     ///
     /// When set, the renderer fits the font to the cell width like the
     /// `bevy_terminal_ratatui` examples. Otherwise it derives the cell from
-    /// `size` and `line_height`, like a conventional terminal emulator.
+    /// the font's measured advance and line box at `size`, like a conventional
+    /// terminal emulator.
     pub cell_size: Option<[f32; 2]>,
 }
 
@@ -371,7 +370,6 @@ impl Default for FontConfig {
             bold_italic: None,
             style: FontStyleConfig::Regular,
             size: 18,
-            line_height: 1.2,
             cell_size: None,
         }
     }
@@ -656,7 +654,6 @@ regular = "fonts/Regular.ttf"
 bold = "fonts/Bold.ttf"
 italic = "/absolute/Italic.ttf"
 cell_size = [11.0, 20.0]
-line_height = 1.4
 "#,
         )
         .expect("font config");
@@ -676,6 +673,5 @@ line_height = 1.4
             Some(Path::new("/absolute/Italic.ttf"))
         );
         assert_eq!(config.font.cell_size, Some([11.0, 20.0]));
-        assert_eq!(config.font.line_height, 1.4);
     }
 }

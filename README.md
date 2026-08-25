@@ -109,15 +109,15 @@ bold = "/path/to/IosevkaFixed-Bold.ttf"
 italic = "/path/to/IosevkaFixed-Italic.ttf"
 bold_italic = "/path/to/IosevkaFixed-BoldItalic.ttf"
 size = 12
-line_height = 1.2
 ```
 
-Without `cell_size`, `size` is interpreted in points and the cell is measured
-from the font. Set `cell_size = [11.0, 20.0]` to request the same fixed logical
-width and minimum-height, fit-to-width mode as the `bevy_terminal_ratatui`
-examples; the renderer may grow the height to fit the font line box. In that
-mode `size` is only the proportional Ctrl +/- zoom baseline. In either mode
-Ratty measures the actual rendered cell before sizing the PTY. Leave
+Without `cell_size`, `size` is interpreted in points and both cell dimensions,
+including line height, are measured automatically from the loaded font. Set
+`cell_size = [11.0, 20.0]` to request the same fixed logical width and
+minimum-height, fit-to-width mode as the `bevy_terminal_ratatui` examples; the
+renderer may grow the height to fit the font line box. In that mode `size` is
+only the proportional Ctrl +/- zoom baseline. In either mode Ratty measures the
+actual rendered cell before sizing the PTY. Leave
 `window.scale_factor` unset for automatic framebuffer/DPI scaling; set it only
 as an explicit override.
 

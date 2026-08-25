@@ -374,9 +374,9 @@ fn build_terminal_render_config(
     let (cell_size, font_size) = font.cell_size.map_or_else(
         || {
             (
-                CellSizing::FromFont {
-                    line_height: valid_line_height(font.line_height),
-                },
+                // The em is only the provisional minimum. bevy_terminal measures
+                // the loaded face and grows this to its actual line box.
+                CellSizing::FromFont { line_height: 1.0 },
                 FontSizing::Px(font_size_pixels(font.size)),
             )
         },
@@ -434,14 +434,6 @@ fn valid_cell_dimension(value: f32) -> f32 {
         value
     } else {
         1.0
-    }
-}
-
-fn valid_line_height(line_height: f32) -> f32 {
-    if line_height.is_finite() && line_height > 0.0 {
-        line_height
-    } else {
-        1.2
     }
 }
 
@@ -1011,7 +1003,7 @@ mod tests {
         let measured = TerminalSurface::new(&AppConfig::default()).expect("measured terminal");
         assert_eq!(
             measured.render_config().cell_size,
-            CellSizing::FromFont { line_height: 1.2 }
+            CellSizing::FromFont { line_height: 1.0 }
         );
         assert_eq!(
             measured.render_config().font_size,
