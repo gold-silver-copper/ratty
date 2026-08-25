@@ -407,11 +407,14 @@ fn square_style(
     theme_fg: TuiColor,
     font_style: FontStyleConfig,
 ) -> Style {
-    let (fg, bg, flags) = vt::cell_attributes(styles, square);
+    let (fg, bg, underline, flags) = vt::cell_attributes(styles, square);
 
     let mut style = Style::default().fg(cell_color_to_tui(fg, theme_palette).unwrap_or(theme_fg));
     if let Some(bg) = cell_color_to_tui(bg, theme_palette) {
         style = style.bg(bg);
+    }
+    if let Some(underline) = underline.and_then(|color| cell_color_to_tui(color, theme_palette)) {
+        style = style.underline_color(underline);
     }
 
     let mut modifiers = match font_style {
@@ -437,6 +440,12 @@ fn square_style(
     }
     if flags.contains(StyleFlags::INVERSE) {
         modifiers |= Modifier::REVERSED;
+    }
+    if flags.contains(StyleFlags::HIDDEN) {
+        modifiers |= Modifier::HIDDEN;
+    }
+    if flags.contains(StyleFlags::STRIKEOUT) {
+        modifiers |= Modifier::CROSSED_OUT;
     }
 
     style = style.add_modifier(modifiers);
@@ -655,6 +664,17 @@ mod tests {
             TuiColor::Reset,
             "the pad cell must not carry the active background"
         );
+    }
+
+    #[test]
+    fn widget_preserves_hidden_strikeout_and_underline_color() {
+        let rendered = render_cells(1, 3, b"\x1b[4;8;9;58;2;1;2;3mX");
+        let cell = &rendered[0];
+
+        assert!(cell.modifier.contains(Modifier::UNDERLINED));
+        assert!(cell.modifier.contains(Modifier::HIDDEN));
+        assert!(cell.modifier.contains(Modifier::CROSSED_OUT));
+        assert_eq!(cell.underline_color, TuiColor::Rgb(1, 2, 3));
     }
 
     /// Ratatui skips a wide glyph's second cell when sending a diff to a real

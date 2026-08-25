@@ -127,7 +127,7 @@ impl<'a> CellDebugImageRenderer<'a> {
                 }
                 let square = grid_row[Column(col as usize)];
 
-                let (fg, bg, flags) = vt::cell_attributes(styles, square);
+                let (fg, bg, _, flags) = vt::cell_attributes(styles, square);
                 let bg = debug_color(bg).unwrap_or(DEBUG_BG_FALLBACK);
                 let fg = debug_color(fg).unwrap_or(DEBUG_FG_FALLBACK);
 
