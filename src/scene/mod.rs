@@ -22,7 +22,6 @@ use crate::camera::{
 };
 use crate::config::AppConfig;
 use crate::present::{TerminalPresentMaterial, fullscreen_quad};
-use crate::runtime::TerminalRuntime;
 use crate::terminal::{
     TerminalLayout, TerminalRenderTarget, TerminalSurface, render_scale_for_window,
 };
@@ -210,7 +209,6 @@ pub(crate) struct SetupSceneParams<'w, 's> {
     images: ResMut<'w, Assets<Image>>,
     present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
     primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
 }
 
@@ -227,27 +225,17 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         images,
         present_materials,
         primary_window,
-        runtime,
         terminal,
     } = &mut params;
     let terminal_opacity = app_config.window.opacity.clamp(0.0, 1.0);
     let window = primary_window.single().expect("primary window");
-    let window_size = window.resolution.size().max(Vec2::ONE);
     let render_scale = render_scale_for_window(window);
-    let layout = terminal.resize_to_fit(window_size, render_scale);
-    let pty_pixels = layout.pty_pixels();
-    runtime.resize(
-        layout.cols,
-        layout.rows,
-        pty_pixels.x as u16,
-        pty_pixels.y as u16,
-    );
-
-    commands.spawn((
-        TerminalRenderTarget,
-        TerminalRenderer::new(terminal.tui.surface()),
-        terminal.render_config().clone(),
-    ));
+    // Seed the renderer with the window's actual framebuffer scale, but keep
+    // the configured PTY grid until the renderer reports authoritative font
+    // metrics. Resizing from estimates here causes a visible double reflow and
+    // can start applications with the wrong geometry.
+    terminal.set_render_scale(render_scale);
+    let layout = terminal.layout();
 
     commands.spawn((
         Camera2d,
@@ -401,6 +389,23 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
         loaded: false,
         first_frame_uploaded: false,
     });
+}
+
+/// Creates the renderer after Bevy has registered font assets in its font collection.
+pub(crate) fn spawn_terminal_renderer(
+    mut commands: Commands,
+    terminal: Res<TerminalSurface>,
+    renderer: Query<(), With<TerminalRenderTarget>>,
+) {
+    if !renderer.is_empty() {
+        return;
+    }
+
+    commands.spawn((
+        TerminalRenderTarget,
+        TerminalRenderer::new(terminal.tui.surface()),
+        terminal.render_config().clone(),
+    ));
 }
 
 /// Synchronizes Bevy presentation entities to the terminal texture layout.

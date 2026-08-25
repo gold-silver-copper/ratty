@@ -99,6 +99,17 @@ impl AppConfig {
         if let Some(program) = self.shell.program.as_mut() {
             *program = resolve_config_path(config_dir, program);
         }
+        for face in [
+            &mut self.font.regular,
+            &mut self.font.bold,
+            &mut self.font.italic,
+            &mut self.font.bold_italic,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *face = resolve_config_path(config_dir, face);
+        }
     }
 }
 
@@ -325,18 +336,43 @@ impl BindingAction {
 pub struct FontConfig {
     /// Font family name.
     pub family: String,
+    /// Optional regular font file. When set, this takes precedence over `family`.
+    pub regular: Option<PathBuf>,
+    /// Optional bold font file used with `regular`.
+    pub bold: Option<PathBuf>,
+    /// Optional italic font file used with `regular`.
+    pub italic: Option<PathBuf>,
+    /// Optional bold-italic font file used with `regular`.
+    pub bold_italic: Option<PathBuf>,
     /// Font style override.
     pub style: FontStyleConfig,
-    /// Font size in points (1pt = 4/3 logical pixels).
+    /// Font zoom size.
+    ///
+    /// Without `cell_size` this is a point size (1pt = 4/3 logical pixels).
+    /// With a fixed cell it is the proportional zoom baseline for Ctrl +/-.
     pub size: i32,
+    /// Line height multiplier used when deriving cells from the font.
+    pub line_height: f32,
+    /// Optional `[width, height]` cell in logical pixels.
+    ///
+    /// When set, the renderer fits the font to the cell width like the
+    /// `bevy_terminal_ratatui` examples. Otherwise it derives the cell from
+    /// `size` and `line_height`, like a conventional terminal emulator.
+    pub cell_size: Option<[f32; 2]>,
 }
 
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
             family: "DejaVu Sans Mono".to_string(),
+            regular: None,
+            bold: None,
+            italic: None,
+            bold_italic: None,
             style: FontStyleConfig::Regular,
             size: 18,
+            line_height: 1.2,
+            cell_size: None,
         }
     }
 }
@@ -609,5 +645,37 @@ action = "Toggle3DMode"
             .collect::<Vec<_>>();
         slots.sort_unstable();
         assert_eq!(slots, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn resolves_explicit_font_faces_relative_to_the_config() {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+[font]
+regular = "fonts/Regular.ttf"
+bold = "fonts/Bold.ttf"
+italic = "/absolute/Italic.ttf"
+cell_size = [11.0, 20.0]
+line_height = 1.4
+"#,
+        )
+        .expect("font config");
+
+        config.resolve_relative_paths(Path::new("/config/ratty.toml"));
+
+        assert_eq!(
+            config.font.regular.as_deref(),
+            Some(Path::new("/config/fonts/Regular.ttf"))
+        );
+        assert_eq!(
+            config.font.bold.as_deref(),
+            Some(Path::new("/config/fonts/Bold.ttf"))
+        );
+        assert_eq!(
+            config.font.italic.as_deref(),
+            Some(Path::new("/absolute/Italic.ttf"))
+        );
+        assert_eq!(config.font.cell_size, Some([11.0, 20.0]));
+        assert_eq!(config.font.line_height, 1.4);
     }
 }

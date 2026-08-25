@@ -18,6 +18,7 @@ use crate::mouse::{TerminalSelection, handle_mouse_input};
 use crate::present::TerminalPresentPlugin;
 use crate::scene::{
     MobiusTransition, TerminalPresentationMode, apply_terminal_presentation, setup_scene,
+    spawn_terminal_renderer,
 };
 use crate::systems::{
     TerminalFrameDirty, TerminalRedrawSet, animate_inline_kitty_planes, animate_mobius_transition,
@@ -54,6 +55,10 @@ impl Plugin for TerminalPlugin {
             .add_message::<TerminalCameraUpdate>()
             .add_message::<ActivateTerminalCameraPreset>()
             .add_systems(Startup, setup_scene)
+            .add_systems(
+                PostUpdate,
+                spawn_terminal_renderer.after(bevy::text::load_font_assets_into_font_collection),
+            )
             .add_systems(Update, request_exit_on_primary_window_close)
             .add_systems(Update, pump_pty_output)
             .configure_sets(

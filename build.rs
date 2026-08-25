@@ -1,6 +1,18 @@
 fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=assets/ratty.ico");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rustc-check-cfg=cfg(rio_vt_sgr_blink)");
+
+    // Cargo removes git sources from dependencies when it creates a crates.io
+    // package. Enable blink propagation only when this checkout is actually
+    // using the rio-vt fork that preserves SGR 5/6/25.
+    let manifest = std::fs::read_to_string("Cargo.toml")?;
+    if manifest.contains("https://github.com/gold-silver-copper/rio.git")
+        && manifest.contains("f36b84c6e55cad97be300414774d47fa99c1790d")
+    {
+        println!("cargo:rustc-cfg=rio_vt_sgr_blink");
+    }
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return Ok(());

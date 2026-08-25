@@ -45,7 +45,10 @@ image = { version = "0.25", default-features = false, features = ["png", "ico"] 
 bevy_terminal_ratatui = { version = "0.7.0", default-features = false, features = ["system_fonts"] }
 portable-pty = "0.8"
 ratatui = "0.30"
-rio-vt = { version = "0.5.19", default-features = false }
+# The fork preserves SGR blink flags. Cargo replaces the git source with the
+# exact, source-compatible registry release when packaging; build.rs detects
+# that fallback so Ratty does not advertise blink flags the parser discarded.
+rio-vt = { version = "=0.5.19", git = "https://github.com/gold-silver-copper/rio.git", rev = "f36b84c6e55cad97be300414774d47fa99c1790d", default-features = false }
 rust-embed = "8.5"
 serde = { version = "1.0", features = ["derive"] }
 shellexpand = "3.1"

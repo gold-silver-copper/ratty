@@ -42,8 +42,8 @@ use crate::scene::{
     TerminalPresentationMode, TerminalViewport, sync_terminal_layout,
 };
 use crate::terminal::{
-    TerminalRedrawState, TerminalRenderTarget, TerminalSurface, TerminalWidget,
-    render_scale_for_window,
+    ConfiguredFontFaces, TerminalRedrawState, TerminalRenderTarget, TerminalSurface,
+    TerminalWidget, render_scale_for_window,
 };
 use crate::vt;
 use bevy::app::AppExit;
@@ -279,8 +279,21 @@ pub(crate) fn handle_window_resize(
         return;
     }
 
+    // Before the first TerminalTexture arrives, cell dimensions are only an
+    // estimate. The first measured-output sync uses the current window size.
+    if !terminal.is_measured() {
+        return;
+    }
+
     let window_size = window_size.max(Vec2::ONE);
-    let layout = terminal.resize_to_fit(window_size, render_scale_for_window(window));
+    let render_scale = render_scale_for_window(window);
+    if terminal.set_render_scale(render_scale) {
+        // A DPI transition can change snapped logical cell metrics. Let the
+        // renderer remeasure first; the output sync below owns the single PTY
+        // reflow using those authoritative metrics and the current window.
+        return;
+    }
+    let layout = terminal.resize_to_fit(window_size, render_scale);
     let pty_pixels = layout.pty_pixels();
     runtime.resize(
         layout.cols,
@@ -397,6 +410,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
 pub(crate) fn sync_terminal_renderer_config(
     app_config: Res<AppConfig>,
     terminal: Res<TerminalSurface>,
+    configured_faces: Option<Res<ConfiguredFontFaces>>,
     mut fonts: TerminalFonts,
     mut configs: Query<&mut TerminalRenderConfig, With<TerminalRenderTarget>>,
 ) {
@@ -404,10 +418,20 @@ pub(crate) fn sync_terminal_renderer_config(
         return;
     };
     let mut desired = terminal.render_config().clone();
-    if !fonts.has_family(&app_config.font.family) {
+    if let Some(ref configured_faces) = configured_faces {
+        desired.font = configured_faces.faces.clone();
+    }
+    let system_family = configured_faces
+        .as_deref()
+        .and_then(|configured| configured.system_family.as_deref())
+        .unwrap_or(&app_config.font.family);
+    let needs_system_font = configured_faces
+        .as_deref()
+        .is_none_or(|configured| configured.system_family.is_some());
+    if needs_system_font && !fonts.has_family(system_family) {
         warn_once!(
             "configured font family {:?} is unavailable; using the generic monospace family",
-            app_config.font.family
+            system_family
         );
         desired.font = FontFaces::regular(FontSource::Monospace);
     }
@@ -418,7 +442,7 @@ pub(crate) fn sync_terminal_renderer_config(
 
 #[derive(SystemParam)]
 pub(crate) struct SyncRenderOutputParams<'w, 's> {
-    primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
+    primary_window: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
     textures: Query<'w, 's, &'static TerminalTexture, With<TerminalRenderTarget>>,
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
@@ -443,7 +467,7 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
         plane_back_query,
         frame_dirty,
     } = &mut params;
-    let (Ok(texture), Ok(window)) = (textures.single(), primary_window.single()) else {
+    let (Ok(texture), Ok(mut window)) = (textures.single(), primary_window.single_mut()) else {
         return;
     };
     if !terminal.update_render_output(texture) {
@@ -465,6 +489,12 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     frame_dirty.0 = true;
     if previous_grid != (layout.cols, layout.rows) {
         redraw.request();
+    }
+    // The first measured texture may still represent the configured startup
+    // grid. If measurement changes the fitted grid, keep the native window
+    // hidden until the renderer has produced the correctly sized texture.
+    if !window.visible && texture.size == terminal.pixmap_dimensions() {
+        window.visible = true;
     }
 }
 

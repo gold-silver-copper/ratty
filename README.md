@@ -54,6 +54,10 @@ Requirements:
 cargo install ratty
 ```
 
+The crates.io build uses the published `rio-vt` parser, which currently ignores
+SGR blink attributes. Git and binary-release builds use Ratty's pinned parser
+fork and retain slow/rapid blink styling.
+
 ### [Arch Linux](https://archlinux.org/packages/extra/x86_64/ratty/)
 
 ```bash
@@ -90,6 +94,32 @@ cargo install --git https://github.com/orhun/ratty
 The default configuration file is available in [`config/ratty.toml`](config/ratty.toml).
 
 You can copy this file to `$HOME/.config/ratty/ratty.toml` and customize it.
+
+### Font rendering
+
+Ratty can resolve a system font by family name or load exact font files. Explicit
+faces are the most predictable choice for box drawing, Braille, CJK, emoji-width,
+bold, and italic rendering because the renderer does not have to guess which
+installed face belongs to each style:
+
+```toml
+[font]
+regular = "/path/to/IosevkaFixed-Regular.ttf"
+bold = "/path/to/IosevkaFixed-Bold.ttf"
+italic = "/path/to/IosevkaFixed-Italic.ttf"
+bold_italic = "/path/to/IosevkaFixed-BoldItalic.ttf"
+size = 12
+line_height = 1.2
+```
+
+Without `cell_size`, `size` is interpreted in points and the cell is measured
+from the font. Set `cell_size = [11.0, 20.0]` to request the same fixed logical
+width and minimum-height, fit-to-width mode as the `bevy_terminal_ratatui`
+examples; the renderer may grow the height to fit the font line box. In that
+mode `size` is only the proportional Ctrl +/- zoom baseline. In either mode
+Ratty measures the actual rendered cell before sizing the PTY. Leave
+`window.scale_factor` unset for automatic framebuffer/DPI scaling; set it only
+as an explicit override.
 
 ### Changing the cursor
 

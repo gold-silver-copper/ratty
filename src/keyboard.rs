@@ -5,7 +5,6 @@ use bevy::ecs::world::FromWorld;
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
-use bevy::window::{PrimaryWindow, Window};
 
 use arboard::Clipboard;
 
@@ -13,14 +12,13 @@ use crate::camera::{
     ActivateTerminalCameraPreset, TerminalCameraInteraction, TerminalCameraSlots,
     TerminalMobiusSource,
 };
-use crate::config::{AppConfig, BindingAction, FontConfig, KeyBindingConfig};
+use crate::config::{AppConfig, BindingAction, KeyBindingConfig};
 use crate::mouse::{TerminalSelection, encode_mouse_wheel};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
-    MobiusEnterZoomFloor, MobiusTransition, TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery,
-    TerminalPlaneWarp, TerminalPresentationMode, TerminalViewport, sync_terminal_layout,
+    MobiusEnterZoomFloor, MobiusTransition, TerminalPlaneWarp, TerminalPresentationMode,
 };
-use crate::terminal::{TerminalRedrawState, TerminalSurface, render_scale_for_window};
+use crate::terminal::{TerminalRedrawState, TerminalSurface};
 use crate::vt::{self, MouseProtocolMode};
 
 /// Clipboard bridge for terminal copy and paste.
@@ -381,10 +379,7 @@ pub struct KeyboardSystemParams<'w, 's> {
     clipboard: NonSendMut<'w, TerminalClipboard>,
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
-    primary_window: Query<'w, 's, &'static Window, With<PrimaryWindow>>,
-    viewport: ResMut<'w, TerminalViewport>,
-    plane_query: TerminalPlaneLayoutQuery<'w, 's>,
-    plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
+    app_config: Res<'w, AppConfig>,
     bindings: Res<'w, TerminalKeyBindings>,
     redraw: ResMut<'w, TerminalRedrawState>,
     _marker: std::marker::PhantomData<&'s ()>,
@@ -549,33 +544,16 @@ pub fn handle_keyboard_input(
                         BindingAction::IncreaseFontSize => params.terminal.adjust_font_size(1),
                         BindingAction::DecreaseFontSize => params.terminal.adjust_font_size(-1),
                         BindingAction::ResetFontSize => {
-                            let target = FontConfig::default().size;
+                            let target = params.app_config.font.size.max(1);
                             let delta = target - params.terminal.font_size();
                             delta != 0 && params.terminal.adjust_font_size(delta)
                         }
                         _ => false,
                     };
                     if resized {
-                        let Ok(window) = params.primary_window.single() else {
-                            continue;
-                        };
-                        let layout = params.terminal.resize_to_fit(
-                            window.resolution.size().max(Vec2::ONE),
-                            render_scale_for_window(window),
-                        );
-                        let pty_pixels = layout.pty_pixels();
-                        params.runtime.resize(
-                            layout.cols,
-                            layout.rows,
-                            pty_pixels.x as u16,
-                            pty_pixels.y as u16,
-                        );
-                        sync_terminal_layout(
-                            layout,
-                            &mut params.viewport,
-                            &mut params.plane_query,
-                            &mut params.plane_back_query,
-                        );
+                        // The renderer reports the new authoritative cell
+                        // metrics later in this frame; that sync owns the PTY
+                        // reflow so zoom never resizes from an estimate first.
                         params.redraw.request();
                     }
                     continue;
