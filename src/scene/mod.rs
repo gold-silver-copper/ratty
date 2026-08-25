@@ -232,7 +232,7 @@ pub(crate) fn setup_scene(mut params: SetupSceneParams) {
     let render_scale = render_scale_for_window(window);
     // Seed the renderer with the window's actual framebuffer scale, but keep
     // the configured PTY grid until the renderer reports authoritative font
-    // metrics. Resizing from estimates here causes a visible double reflow and
+    // metrics. Resizing before measurement causes a visible double reflow and
     // can start applications with the wrong geometry.
     terminal.set_render_scale(render_scale);
     let layout = terminal.layout();

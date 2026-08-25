@@ -346,18 +346,8 @@ pub struct FontConfig {
     pub bold_italic: Option<PathBuf>,
     /// Font style override.
     pub style: FontStyleConfig,
-    /// Font zoom size.
-    ///
-    /// Without `cell_size` this is a point size (1pt = 4/3 logical pixels).
-    /// With a fixed cell it is the proportional zoom baseline for Ctrl +/-.
+    /// Font size in points (1pt = 4/3 logical pixels).
     pub size: i32,
-    /// Optional `[width, height]` cell in logical pixels.
-    ///
-    /// When set, the renderer fits the font to the cell width like the
-    /// `bevy_terminal_ratatui` examples. Otherwise it derives the cell from
-    /// the font's measured advance and line box at `size`, like a conventional
-    /// terminal emulator.
-    pub cell_size: Option<[f32; 2]>,
 }
 
 impl Default for FontConfig {
@@ -370,7 +360,6 @@ impl Default for FontConfig {
             bold_italic: None,
             style: FontStyleConfig::Regular,
             size: 18,
-            cell_size: None,
         }
     }
 }
@@ -653,7 +642,6 @@ action = "Toggle3DMode"
 regular = "fonts/Regular.ttf"
 bold = "fonts/Bold.ttf"
 italic = "/absolute/Italic.ttf"
-cell_size = [11.0, 20.0]
 "#,
         )
         .expect("font config");
@@ -672,6 +660,5 @@ cell_size = [11.0, 20.0]
             config.font.italic.as_deref(),
             Some(Path::new("/absolute/Italic.ttf"))
         );
-        assert_eq!(config.font.cell_size, Some([11.0, 20.0]));
     }
 }

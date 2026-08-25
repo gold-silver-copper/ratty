@@ -184,7 +184,6 @@ impl TerminalSurface {
         // The real scale arrives with the first `resize_to_fit` once the
         // window exists; an explicit override seeds it early.
         let render_scale = config.window.scale_factor.unwrap_or(1.0).max(1.0);
-        let cell_size = initial_cell_dimensions(&config.font);
         let render_config = build_terminal_render_config(
             &config.font,
             &config.theme,
@@ -202,7 +201,8 @@ impl TerminalSurface {
             font: config.font.clone(),
             render_config,
             render_scale,
-            cell_size,
+            // No geometry is inferred before the renderer measures the loaded font.
+            cell_size: Vec2::ONE,
             rendered_texture_size: None,
         })
     }
@@ -214,16 +214,7 @@ impl TerminalSurface {
             return false;
         }
 
-        match self.render_config.cell_size {
-            CellSizing::Logical(cell) => {
-                let ratio = new_size as f32 / self.font.size.max(1) as f32;
-                let cell = (cell * ratio).max(Vec2::ONE);
-                self.render_config.cell_size = CellSizing::Logical(cell);
-            }
-            CellSizing::FromFont { .. } => {
-                self.render_config.font_size = FontSizing::Px(font_size_pixels(new_size));
-            }
-        }
+        self.render_config.font_size = FontSizing::Px(points_to_logical_pixels(new_size));
         self.font.size = new_size;
         true
     }
@@ -371,27 +362,12 @@ fn build_terminal_render_config(
             .map(|[r, g, b]| Color::srgb_u8(r, g, b)),
     };
 
-    let (cell_size, font_size) = font.cell_size.map_or_else(
-        || {
-            (
-                // The em is only the provisional minimum. bevy_terminal measures
-                // the loaded face and grows this to its actual line box.
-                CellSizing::FromFont { line_height: 1.0 },
-                FontSizing::Px(font_size_pixels(font.size)),
-            )
-        },
-        |[width, height]| {
-            (
-                CellSizing::Logical(valid_cell_size(width, height)),
-                FontSizing::FitCellWidth,
-            )
-        },
-    );
-
     TerminalRenderConfig {
-        cell_size,
+        // Cell width and height come from the loaded face's measured advance
+        // and line box; Ratty supplies no independent geometry estimate.
+        cell_size: CellSizing::FROM_FONT,
         font: FontFaces::regular(font_family(&font.family)),
-        font_size,
+        font_size: FontSizing::Px(points_to_logical_pixels(font.size)),
         theme,
         cursor: CursorConfig {
             style: CursorStyle::Block,
@@ -409,32 +385,13 @@ fn build_terminal_render_config(
     }
 }
 
-fn font_size_pixels(points: i32) -> f32 {
-    const PT_TO_PX: f32 = 96.0 / 72.0;
-    (points as f32 * PT_TO_PX).max(1.0)
-}
-
-fn estimated_cell_dimensions(points: i32) -> Vec2 {
-    let font_size = font_size_pixels(points);
-    Vec2::new(font_size * 0.6, font_size).max(Vec2::ONE)
-}
-
-fn initial_cell_dimensions(font: &FontConfig) -> Vec2 {
-    font.cell_size
-        .map(|[width, height]| valid_cell_size(width, height))
-        .unwrap_or_else(|| estimated_cell_dimensions(font.size))
-}
-
-fn valid_cell_size(width: f32, height: f32) -> Vec2 {
-    Vec2::new(valid_cell_dimension(width), valid_cell_dimension(height))
-}
-
-fn valid_cell_dimension(value: f32) -> f32 {
-    if value.is_finite() && value > 0.0 {
-        value
-    } else {
-        1.0
-    }
+fn points_to_logical_pixels(points: i32) -> f32 {
+    // A typographic point is defined as 1/72 inch, while a logical/CSS pixel
+    // is defined as 1/96 inch. These constants convert units; they do not
+    // estimate any property of the selected font.
+    const POINTS_PER_INCH: f32 = 72.0;
+    const LOGICAL_PIXELS_PER_INCH: f32 = 96.0;
+    (points as f32 * LOGICAL_PIXELS_PER_INCH / POINTS_PER_INCH).max(1.0)
 }
 
 /// Ratatui widget backed by the rio-vt grid.
@@ -948,6 +905,7 @@ mod tests {
                 .get::<TerminalTexture>(entity)
                 .expect("initial measured texture")
                 .cell_size;
+            let initial = previous;
             for size in 9..=24 {
                 assert!(
                     app.world_mut()
@@ -955,22 +913,35 @@ mod tests {
                         .adjust_font_size(1)
                 );
                 app.update();
-                let measured = app
+                let texture = app
                     .world()
                     .get::<TerminalTexture>(entity)
                     .expect("remeasured texture")
-                    .cell_size;
+                    .clone();
+                assert!(
+                    (texture.font_size - points_to_logical_pixels(size)).abs() < f32::EPSILON,
+                    "renderer changed the requested font size at size {size} (scale \
+                     {render_scale}): {}",
+                    texture.font_size
+                );
+                let measured = texture.cell_size;
                 assert!(
                     measured.cmpge(previous).all(),
                     "cell shrank at size {size} (scale {render_scale}): \
                      {previous:?} -> {measured:?}"
                 );
+                #[cfg(bevy_terminal_automatic_metrics)]
                 assert_ne!(
                     measured, previous,
                     "zoom did not change either axis at size {size} (scale {render_scale})"
                 );
                 previous = measured;
             }
+            assert!(
+                previous.cmpgt(initial).all(),
+                "zoom range did not grow both axes at scale {render_scale}: \
+                 {initial:?} -> {previous:?}"
+            );
         }
     }
 
@@ -983,13 +954,30 @@ mod tests {
             .get::<TerminalRenderConfig>(entity)
             .expect("render config");
         assert_eq!(render_config.font.regular, FontSource::Monospace);
+        #[cfg(bevy_terminal_automatic_metrics)]
+        {
+            assert_eq!(render_config.cell_size, CellSizing::FROM_FONT);
+            assert!(matches!(render_config.font_size, FontSizing::Px(_)));
+        }
+        #[cfg(not(bevy_terminal_automatic_metrics))]
+        {
+            let CellSizing::Logical(cell) = render_config.cell_size else {
+                panic!("packaged-source cells must use the measured-cell adapter");
+            };
+            assert!(cell.x > 1.0);
+            assert!(cell.y > 1.0);
+            assert_eq!(
+                render_config.font_size,
+                FontSizing::Px(points_to_logical_pixels(12))
+            );
+        }
         let texture = app
             .world()
             .get::<TerminalTexture>(entity)
             .expect("measured terminal texture")
             .clone();
         assert!(texture.cell_size.cmpgt(Vec2::ONE).all());
-        assert!(texture.cell_size.y >= font_size_pixels(12));
+        assert!(texture.cell_size.y >= points_to_logical_pixels(12));
 
         let cell_size = texture.cell_size;
         let mut terminal = app.world_mut().resource_mut::<TerminalSurface>();
@@ -999,25 +987,10 @@ mod tests {
     }
 
     #[test]
-    fn font_config_supports_measured_and_fixed_cell_modes() {
-        let measured = TerminalSurface::new(&AppConfig::default()).expect("measured terminal");
-        assert_eq!(
-            measured.render_config().cell_size,
-            CellSizing::FromFont { line_height: 1.0 }
-        );
-        assert_eq!(
-            measured.render_config().font_size,
-            FontSizing::Px(font_size_pixels(FontConfig::default().size))
-        );
-        assert_eq!(
-            measured.render_config().raster.scale,
-            TerminalRenderScale::Fixed(1.0)
-        );
-
+    fn font_config_always_uses_measured_cell_metrics() {
         let config = AppConfig {
             font: FontConfig {
                 size: 20,
-                cell_size: Some([11.0, 20.0]),
                 ..default()
             },
             window: crate::config::WindowConfig {
@@ -1026,27 +999,27 @@ mod tests {
             },
             ..default()
         };
-        let mut fixed = TerminalSurface::new(&config).expect("fixed-cell terminal");
+        let mut terminal = TerminalSurface::new(&config).expect("measured terminal");
+        assert_eq!(terminal.render_config().cell_size, CellSizing::FROM_FONT);
         assert_eq!(
-            fixed.render_config().cell_size,
-            CellSizing::Logical(Vec2::new(11.0, 20.0))
+            terminal.render_config().font_size,
+            FontSizing::Px(points_to_logical_pixels(20))
         );
-        assert_eq!(fixed.render_config().font_size, FontSizing::FitCellWidth);
         assert_eq!(
-            fixed.render_config().raster.scale,
+            terminal.render_config().raster.scale,
             TerminalRenderScale::Fixed(2.0)
         );
 
-        let measured_cell = fixed.char_dimensions();
-        assert!(fixed.adjust_font_size(2));
+        let unmeasured_cell = terminal.char_dimensions();
+        assert!(terminal.adjust_font_size(2));
+        assert_eq!(terminal.render_config().cell_size, CellSizing::FROM_FONT);
         assert_eq!(
-            fixed.render_config().cell_size,
-            CellSizing::Logical(Vec2::new(12.1, 22.0))
+            terminal.render_config().font_size,
+            FontSizing::Px(points_to_logical_pixels(22))
         );
-        assert_eq!(fixed.render_config().font_size, FontSizing::FitCellWidth);
         assert_eq!(
-            fixed.char_dimensions(),
-            measured_cell,
+            terminal.char_dimensions(),
+            unmeasured_cell,
             "zoom must retain the last authoritative metrics until remeasurement"
         );
     }

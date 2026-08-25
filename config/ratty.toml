@@ -29,10 +29,6 @@ family = "DejaVu Sans Mono"
 # bold_italic = "fonts/IosevkaFixed-BoldItalic.ttf"
 style = "Regular"
 size = 12
-# For example-style cells, uncomment this logical-pixel width and minimum
-# height. The font is fitted to the width and may grow the height to fit its
-# line box; Ctrl +/- scales the requested cell proportionally.
-# cell_size = [11.0, 20.0]
 
 [cursor.model]
 path = "CairoSpinyMouse.obj"

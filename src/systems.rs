@@ -57,9 +57,17 @@ use bevy::mesh::{Indices, VertexAttributeValues};
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::text::FontCx;
+#[cfg(not(bevy_terminal_automatic_metrics))]
+use bevy::text::{
+    ComputedTextBlock, Font, FontAtlasSet, FontHinting, LayoutCx, LetterSpacing, LineHeight,
+    ScaleCx, TextBounds, TextFont, TextLayout, TextLayoutInfo, TextPipeline,
+};
 use bevy::window::{PrimaryWindow, Window, WindowCloseRequested, WindowResized};
+#[cfg(not(bevy_terminal_automatic_metrics))]
+use bevy_terminal_ratatui::prelude::{CellSizing, FontSizing, TerminalRenderScale};
 use bevy_terminal_ratatui::prelude::{
-    FontFaces, FontSource, TerminalFonts, TerminalRenderConfig, TerminalTexture,
+    FontFaces, FontSource, TerminalRenderConfig, TerminalTexture,
 };
 
 struct InlineLayout {
@@ -279,8 +287,8 @@ pub(crate) fn handle_window_resize(
         return;
     }
 
-    // Before the first TerminalTexture arrives, cell dimensions are only an
-    // estimate. The first measured-output sync uses the current window size.
+    // Before the first TerminalTexture arrives, no authoritative cell
+    // dimensions exist. The first measured-output sync uses the current window.
     if !terminal.is_measured() {
         return;
     }
@@ -407,11 +415,19 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
 }
 
 /// Applies Ratty's live font, theme, and DPI settings to the renderer entity.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_terminal_renderer_config(
     app_config: Res<AppConfig>,
     terminal: Res<TerminalSurface>,
     configured_faces: Option<Res<ConfiguredFontFaces>>,
-    mut fonts: TerminalFonts,
+    #[cfg(not(bevy_terminal_automatic_metrics))] font_assets: Res<Assets<Font>>,
+    mut font_cx: ResMut<FontCx>,
+    #[cfg(not(bevy_terminal_automatic_metrics))] mut layout_cx: ResMut<LayoutCx>,
+    #[cfg(not(bevy_terminal_automatic_metrics))] mut text_pipeline: ResMut<TextPipeline>,
+    #[cfg(not(bevy_terminal_automatic_metrics))] mut images: ResMut<Assets<Image>>,
+    #[cfg(not(bevy_terminal_automatic_metrics))] mut font_atlas_set: ResMut<FontAtlasSet>,
+    #[cfg(not(bevy_terminal_automatic_metrics))] mut scale_cx: ResMut<ScaleCx>,
+    #[cfg(not(bevy_terminal_automatic_metrics))] mut measured: Local<Option<FontCellMeasurement>>,
     mut configs: Query<&mut TerminalRenderConfig, With<TerminalRenderTarget>>,
 ) {
     let Ok(mut config) = configs.single_mut() else {
@@ -428,16 +444,289 @@ pub(crate) fn sync_terminal_renderer_config(
     let needs_system_font = configured_faces
         .as_deref()
         .is_none_or(|configured| configured.system_family.is_some());
-    if needs_system_font && !fonts.has_family(system_family) {
+    if needs_system_font && font_cx.collection.family_by_name(system_family).is_none() {
         warn_once!(
             "configured font family {:?} is unavailable; using the generic monospace family",
             system_family
         );
         desired.font = FontFaces::regular(FontSource::Monospace);
     }
+
+    #[cfg(not(bevy_terminal_automatic_metrics))]
+    {
+        let FontSizing::Px(font_size) = desired.font_size else {
+            return;
+        };
+        let TerminalRenderScale::Fixed(raster_scale) = desired.raster.scale else {
+            return;
+        };
+        let raster_scale = raster_scale.clamp(1.0, 8.0);
+        if font_assets.is_changed() {
+            *measured = None;
+        }
+        let cell_size = measured
+            .as_ref()
+            .filter(|measurement| {
+                measurement.faces == desired.font
+                    && measurement.font_size == font_size
+                    && measurement.raster_scale == raster_scale
+                    && measurement.hinting == desired.raster.hinting
+            })
+            .map(|measurement| measurement.cell_size)
+            .or_else(|| {
+                let cell_size = measure_font_cell(
+                    &desired.font,
+                    font_size,
+                    raster_scale,
+                    desired.raster.hinting,
+                    &font_assets,
+                    &mut images,
+                    &mut text_pipeline,
+                    &mut font_atlas_set,
+                    &mut font_cx,
+                    &mut layout_cx,
+                    &mut scale_cx,
+                )?;
+                *measured = Some(FontCellMeasurement {
+                    faces: desired.font.clone(),
+                    font_size,
+                    raster_scale,
+                    hinting: desired.raster.hinting,
+                    cell_size,
+                });
+                Some(cell_size)
+            });
+        let Some(cell_size) = cell_size else {
+            return;
+        };
+
+        // Registry 0.7 cannot derive both dimensions without changing the
+        // requested font size, so supply the same measured cell explicitly.
+        desired.cell_size = CellSizing::Logical(cell_size);
+    }
     if *config != desired {
         config.clone_from(&desired);
     }
+}
+
+#[cfg(not(bevy_terminal_automatic_metrics))]
+pub(crate) struct FontCellMeasurement {
+    faces: FontFaces,
+    font_size: f32,
+    raster_scale: f32,
+    hinting: FontHinting,
+    cell_size: Vec2,
+}
+
+#[cfg(not(bevy_terminal_automatic_metrics))]
+#[allow(clippy::too_many_arguments)]
+fn measure_font_cell(
+    faces: &FontFaces,
+    font_size: f32,
+    raster_scale: f32,
+    hinting: FontHinting,
+    fonts: &Assets<Font>,
+    images: &mut Assets<Image>,
+    text_pipeline: &mut TextPipeline,
+    font_atlas_set: &mut FontAtlasSet,
+    font_cx: &mut FontCx,
+    layout_cx: &mut LayoutCx,
+    scale_cx: &mut ScaleCx,
+) -> Option<Vec2> {
+    // A handle is not shapeable until Bevy registers its family alias. Waiting
+    // avoids measuring an unrelated fallback face during font loading.
+    if let FontSource::Handle(handle) = &faces.regular
+        && fonts
+            .get(handle.id())
+            .is_none_or(|font| font.alias.is_empty())
+    {
+        return None;
+    }
+
+    let font = TextFont {
+        font: faces.regular.clone(),
+        font_size: ADVANCE_PROBE_FONT_SIZE.into(),
+        ..default()
+    };
+    let probe = "0".repeat(ADVANCE_PROBE_GLYPHS);
+    let mut computed = ComputedTextBlock::default();
+    let measure = text_pipeline
+        .create_text_measure(
+            Entity::PLACEHOLDER,
+            fonts,
+            std::iter::once((
+                Entity::PLACEHOLDER,
+                0,
+                probe.as_str(),
+                &font,
+                Color::WHITE,
+                LineHeight::Px(ADVANCE_PROBE_FONT_SIZE),
+                LetterSpacing::default(),
+            )),
+            1.0,
+            &TextLayout::new(Justify::Left, LineBreak::NoWrap),
+            &mut computed,
+            font_cx,
+            layout_cx,
+            Vec2::splat(f32::MAX),
+            ADVANCE_PROBE_FONT_SIZE,
+        )
+        .ok()?;
+    let advance = measure.max.x / ADVANCE_PROBE_GLYPHS as f32;
+    if !advance.is_finite() || advance <= 0.0 {
+        return None;
+    }
+    let cell_width = advance * font_size / ADVANCE_PROBE_FONT_SIZE;
+    let physical_font_size = font_size * raster_scale;
+    let cell_height = measure_block_line_box(
+        faces,
+        physical_font_size,
+        hinting,
+        fonts,
+        images,
+        text_pipeline,
+        font_atlas_set,
+        font_cx,
+        layout_cx,
+        scale_cx,
+    )? / raster_scale;
+    Some(Vec2::new(cell_width, cell_height))
+}
+
+#[cfg(not(bevy_terminal_automatic_metrics))]
+const ADVANCE_PROBE_FONT_SIZE: f32 = 64.0;
+#[cfg(not(bevy_terminal_automatic_metrics))]
+const ADVANCE_PROBE_GLYPHS: usize = 100;
+
+#[cfg(not(bevy_terminal_automatic_metrics))]
+#[derive(Clone, Copy)]
+struct VerticalGlyphBox {
+    top: f32,
+    bottom: f32,
+}
+
+#[cfg(not(bevy_terminal_automatic_metrics))]
+impl VerticalGlyphBox {
+    fn union(self, other: Self) -> Self {
+        Self {
+            top: self.top.min(other.top),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    fn height(self) -> f32 {
+        self.bottom - self.top
+    }
+}
+
+#[cfg(not(bevy_terminal_automatic_metrics))]
+#[allow(clippy::too_many_arguments)]
+fn measure_block_line_box(
+    faces: &FontFaces,
+    font_size: f32,
+    hinting: FontHinting,
+    fonts: &Assets<Font>,
+    images: &mut Assets<Image>,
+    text_pipeline: &mut TextPipeline,
+    font_atlas_set: &mut FontAtlasSet,
+    font_cx: &mut FontCx,
+    layout_cx: &mut LayoutCx,
+    scale_cx: &mut ScaleCx,
+) -> Option<f32> {
+    let font = TextFont {
+        font: faces.regular.clone(),
+        font_size: font_size.into(),
+        ..default()
+    };
+    let mut computed = ComputedTextBlock::default();
+    text_pipeline
+        .update_buffer(
+            fonts,
+            std::iter::once((
+                Entity::PLACEHOLDER,
+                0,
+                "\u{2588}",
+                &font,
+                Color::WHITE,
+                LineHeight::Px(font_size),
+                LetterSpacing::default(),
+            )),
+            LineBreak::NoWrap,
+            Justify::Left,
+            TextBounds::UNBOUNDED,
+            1.0,
+            &mut computed,
+            font_cx,
+            layout_cx,
+            Vec2::splat(f32::MAX),
+            font_size,
+        )
+        .ok()?;
+    let mut layout = TextLayoutInfo::default();
+    text_pipeline
+        .update_text_layout_info(
+            &mut layout,
+            font_atlas_set,
+            images,
+            &mut computed,
+            scale_cx,
+            TextBounds::UNBOUNDED,
+            Justify::Left,
+            hinting,
+        )
+        .ok()?;
+
+    let mut bitmap: Option<VerticalGlyphBox> = None;
+    let mut opaque: Option<VerticalGlyphBox> = None;
+    for glyph in &layout.glyphs {
+        let rect = glyph.atlas_info.rect;
+        let height = rect.size().y;
+        let top = (glyph.position.y - height * 0.5 + 0.5).floor();
+        let glyph_box = VerticalGlyphBox {
+            top,
+            bottom: top + height,
+        };
+        bitmap = Some(bitmap.map_or(glyph_box, |bounds| bounds.union(glyph_box)));
+        if let Some((first, last)) = opaque_rows(images, glyph.atlas_info.texture, rect) {
+            let rows = VerticalGlyphBox {
+                top: top + first as f32,
+                bottom: top + last as f32,
+            };
+            opaque = Some(opaque.map_or(rows, |bounds| bounds.union(rows)));
+        }
+    }
+    let block = opaque.or_else(|| {
+        bitmap.map(|bounds| VerticalGlyphBox {
+            top: bounds.top + 1.0,
+            bottom: (bounds.bottom - 1.0).max(bounds.top + 1.0),
+        })
+    })?;
+    Some(block.height().ceil().max(1.0))
+}
+
+#[cfg(not(bevy_terminal_automatic_metrics))]
+fn opaque_rows(images: &Assets<Image>, texture: AssetId<Image>, rect: Rect) -> Option<(u32, u32)> {
+    const RGBA_CHANNELS: usize = 4;
+    const ALPHA_CHANNEL: usize = 3;
+    const OPAQUE_TOLERANCE: u8 = 5;
+
+    let image = images.get(texture)?;
+    let data = image.data.as_ref()?;
+    let width = image.texture_descriptor.size.width as usize;
+    let (x0, x1) = (rect.min.x as usize, rect.max.x as usize);
+    let (y0, y1) = (rect.min.y as usize, rect.max.y as usize);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let row_opaque = |y: usize| {
+        (x0..x1).all(|x| {
+            data.get((y * width + x) * RGBA_CHANNELS + ALPHA_CHANNEL)
+                .is_some_and(|alpha| *alpha >= u8::MAX - OPAQUE_TOLERANCE)
+        })
+    };
+    let first = (y0..y1).find(|y| row_opaque(*y))?;
+    let last = (first..y1).take_while(|y| row_opaque(*y)).last()?;
+    Some(((first - y0) as u32, (last + 1 - y0) as u32))
 }
 
 #[derive(SystemParam)]

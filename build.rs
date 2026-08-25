@@ -3,6 +3,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rustc-check-cfg=cfg(rio_vt_sgr_blink)");
+    println!("cargo:rustc-check-cfg=cfg(bevy_terminal_automatic_metrics)");
 
     // Cargo removes git sources from dependencies when it creates a crates.io
     // package. Enable blink propagation only when this checkout is actually
@@ -12,6 +13,15 @@ fn main() -> std::io::Result<()> {
         && manifest.contains("f36b84c6e55cad97be300414774d47fa99c1790d")
     {
         println!("cargo:rustc-cfg=rio_vt_sgr_blink");
+    }
+
+    // Cargo removes git sources from dependencies when it creates a crates.io
+    // package. The git renderer derives cells directly; packaged-source builds
+    // use Ratty's measured-advance adapter for the source-compatible 0.7 crate.
+    if manifest.contains("https://github.com/gold-silver-copper/bevy_terminal.git")
+        && manifest.contains("1c6c978ca58904310ed49d4d8f5f19d256aa1bec")
+    {
+        println!("cargo:rustc-cfg=bevy_terminal_automatic_metrics");
     }
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
