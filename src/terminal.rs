@@ -893,9 +893,9 @@ mod tests {
         assert_eq!(rendered[0], "你 好 e\u{0301}z");
     }
 
-    /// Bevy snaps cell dimensions to whole physical pixels. A one-point zoom
-    /// may therefore change only one axis at 1x DPI, but it must change the
-    /// measured cell and may never shrink either axis.
+    /// Bevy snaps cell dimensions to whole physical pixels. Adjacent requested
+    /// sizes can therefore share one effective font/cell at low DPI, but the
+    /// sequence may never shrink and the full zoom range must grow both axes.
     #[test]
     fn font_size_steps_change_measured_cells_without_shrinking() {
         for render_scale in [1.0, 2.0] {
@@ -918,22 +918,20 @@ mod tests {
                     .get::<TerminalTexture>(entity)
                     .expect("remeasured texture")
                     .clone();
-                assert!(
-                    (texture.font_size - points_to_logical_pixels(size)).abs() < f32::EPSILON,
-                    "renderer changed the requested font size at size {size} (scale \
-                     {render_scale}): {}",
-                    texture.font_size
+                let requested = points_to_logical_pixels(size);
+                assert_eq!(
+                    app.world()
+                        .resource::<TerminalSurface>()
+                        .render_config()
+                        .font_size,
+                    FontSizing::Px(requested)
                 );
+                assert!(texture.font_size.is_finite() && texture.font_size >= 1.0);
                 let measured = texture.cell_size;
                 assert!(
                     measured.cmpge(previous).all(),
                     "cell shrank at size {size} (scale {render_scale}): \
                      {previous:?} -> {measured:?}"
-                );
-                #[cfg(bevy_terminal_automatic_metrics)]
-                assert_ne!(
-                    measured, previous,
-                    "zoom did not change either axis at size {size} (scale {render_scale})"
                 );
                 previous = measured;
             }
@@ -966,10 +964,10 @@ mod tests {
             };
             assert!(cell.x > 1.0);
             assert!(cell.y > 1.0);
-            assert_eq!(
-                render_config.font_size,
-                FontSizing::Px(points_to_logical_pixels(12))
-            );
+            let FontSizing::Px(font_size) = render_config.font_size else {
+                panic!("packaged-source font size must be measured in pixels");
+            };
+            assert!(font_size.is_finite() && font_size >= 1.0);
         }
         let texture = app
             .world()

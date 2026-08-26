@@ -19,7 +19,7 @@ fn main() -> std::io::Result<()> {
     // package. The git renderer derives cells directly; packaged-source builds
     // use Ratty's measured-advance adapter for the source-compatible 0.7 crate.
     if manifest.contains("https://github.com/gold-silver-copper/bevy_terminal.git")
-        && manifest.contains("1c6c978ca58904310ed49d4d8f5f19d256aa1bec")
+        && manifest.contains("2192e8a93b54e09119bd790a1263373db8fec4fa")
     {
         println!("cargo:rustc-cfg=bevy_terminal_automatic_metrics");
     }

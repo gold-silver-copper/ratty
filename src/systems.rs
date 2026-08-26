@@ -464,17 +464,17 @@ pub(crate) fn sync_terminal_renderer_config(
         if font_assets.is_changed() {
             *measured = None;
         }
-        let cell_size = measured
+        let metrics = measured
             .as_ref()
             .filter(|measurement| {
                 measurement.faces == desired.font
-                    && measurement.font_size == font_size
+                    && measurement.requested_font_size == font_size
                     && measurement.raster_scale == raster_scale
                     && measurement.hinting == desired.raster.hinting
             })
-            .map(|measurement| measurement.cell_size)
+            .map(|measurement| (measurement.font_size, measurement.cell_size))
             .or_else(|| {
-                let cell_size = measure_font_cell(
+                let (effective_font_size, cell_size) = measure_font_cell(
                     &desired.font,
                     font_size,
                     raster_scale,
@@ -489,20 +489,22 @@ pub(crate) fn sync_terminal_renderer_config(
                 )?;
                 *measured = Some(FontCellMeasurement {
                     faces: desired.font.clone(),
-                    font_size,
+                    requested_font_size: font_size,
+                    font_size: effective_font_size,
                     raster_scale,
                     hinting: desired.raster.hinting,
                     cell_size,
                 });
-                Some(cell_size)
+                Some((effective_font_size, cell_size))
             });
-        let Some(cell_size) = cell_size else {
+        let Some((font_size, cell_size)) = metrics else {
             return;
         };
 
-        // Registry 0.7 cannot derive both dimensions without changing the
-        // requested font size, so supply the same measured cell explicitly.
+        // Registry 0.7 cannot derive both dimensions itself, so supply the
+        // measured cell and the font size fitted to its physical-pixel width.
         desired.cell_size = CellSizing::Logical(cell_size);
+        desired.font_size = FontSizing::Px(font_size);
     }
     if *config != desired {
         config.clone_from(&desired);
@@ -512,6 +514,7 @@ pub(crate) fn sync_terminal_renderer_config(
 #[cfg(not(bevy_terminal_automatic_metrics))]
 pub(crate) struct FontCellMeasurement {
     faces: FontFaces,
+    requested_font_size: f32,
     font_size: f32,
     raster_scale: f32,
     hinting: FontHinting,
@@ -532,7 +535,7 @@ fn measure_font_cell(
     font_cx: &mut FontCx,
     layout_cx: &mut LayoutCx,
     scale_cx: &mut ScaleCx,
-) -> Option<Vec2> {
+) -> Option<(f32, Vec2)> {
     // A handle is not shapeable until Bevy registers its family alias. Waiting
     // avoids measuring an unrelated fallback face during font loading.
     if let FontSource::Handle(handle) = &faces.regular
@@ -576,8 +579,11 @@ fn measure_font_cell(
     if !advance.is_finite() || advance <= 0.0 {
         return None;
     }
-    let cell_width = advance * font_size / ADVANCE_PROBE_FONT_SIZE;
-    let physical_font_size = font_size * raster_scale;
+    let physical_cell_width = (advance * font_size / ADVANCE_PROBE_FONT_SIZE * raster_scale)
+        .round()
+        .max(1.0);
+    let physical_font_size = physical_cell_width * ADVANCE_PROBE_FONT_SIZE / advance;
+    let effective_font_size = physical_font_size / raster_scale;
     let cell_height = measure_block_line_box(
         faces,
         physical_font_size,
@@ -590,7 +596,10 @@ fn measure_font_cell(
         layout_cx,
         scale_cx,
     )? / raster_scale;
-    Some(Vec2::new(cell_width, cell_height))
+    Some((
+        effective_font_size,
+        Vec2::new(physical_cell_width / raster_scale, cell_height),
+    ))
 }
 
 #[cfg(not(bevy_terminal_automatic_metrics))]

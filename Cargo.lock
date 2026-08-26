@@ -1440,7 +1440,7 @@ dependencies = [
 [[package]]
 name = "bevy_terminal"
 version = "0.7.0"
-source = "git+https://github.com/gold-silver-copper/bevy_terminal.git?rev=1c6c978ca58904310ed49d4d8f5f19d256aa1bec#1c6c978ca58904310ed49d4d8f5f19d256aa1bec"
+source = "git+https://github.com/gold-silver-copper/bevy_terminal.git?rev=2192e8a93b54e09119bd790a1263373db8fec4fa#2192e8a93b54e09119bd790a1263373db8fec4fa"
 dependencies = [
  "bevy",
  "smol_str",
@@ -1449,7 +1449,7 @@ dependencies = [
 [[package]]
 name = "bevy_terminal_ratatui"
 version = "0.7.0"
-source = "git+https://github.com/gold-silver-copper/bevy_terminal.git?rev=1c6c978ca58904310ed49d4d8f5f19d256aa1bec#1c6c978ca58904310ed49d4d8f5f19d256aa1bec"
+source = "git+https://github.com/gold-silver-copper/bevy_terminal.git?rev=2192e8a93b54e09119bd790a1263373db8fec4fa#2192e8a93b54e09119bd790a1263373db8fec4fa"
 dependencies = [
  "bevy",
  "bevy_terminal",
