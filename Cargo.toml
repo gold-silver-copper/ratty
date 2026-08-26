@@ -48,6 +48,7 @@ image = { version = "0.25", default-features = false, features = ["png", "ico"] 
 bevy_terminal_ratatui = { version = "0.7.0", git = "https://github.com/gold-silver-copper/bevy_terminal.git", rev = "2192e8a93b54e09119bd790a1263373db8fec4fa", default-features = false, features = ["system_fonts"] }
 portable-pty = "0.8"
 ratatui = "0.30"
+read-fonts = "0.39.2"
 # The fork preserves SGR blink flags. Cargo replaces the git source with the
 # exact, source-compatible registry release when packaging; build.rs detects
 # that fallback so Ratty does not advertise blink flags the parser discarded.

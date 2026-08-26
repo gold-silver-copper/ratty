@@ -4688,6 +4688,7 @@ dependencies = [
  "image",
  "portable-pty",
  "ratatui",
+ "read-fonts",
  "rio-vt",
  "rust-embed",
  "serde",

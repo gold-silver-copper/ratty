@@ -108,8 +108,17 @@ impl AppConfig {
         .into_iter()
         .flatten()
         {
-            *face = resolve_config_path(config_dir, face);
+            *face = resolve_relative_to(config_dir, face);
         }
+    }
+}
+
+fn resolve_relative_to(base: &Path, path: &Path) -> PathBuf {
+    let expanded = expand_path(path);
+    if expanded.is_relative() {
+        base.join(expanded)
+    } else {
+        expanded
     }
 }
 
@@ -639,7 +648,7 @@ action = "Toggle3DMode"
         let mut config: AppConfig = toml::from_str(
             r#"
 [font]
-regular = "fonts/Regular.ttf"
+regular = "Regular.ttf"
 bold = "fonts/Bold.ttf"
 italic = "/absolute/Italic.ttf"
 "#,
@@ -650,7 +659,7 @@ italic = "/absolute/Italic.ttf"
 
         assert_eq!(
             config.font.regular.as_deref(),
-            Some(Path::new("/config/fonts/Regular.ttf"))
+            Some(Path::new("/config/Regular.ttf"))
         );
         assert_eq!(
             config.font.bold.as_deref(),

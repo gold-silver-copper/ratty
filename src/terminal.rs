@@ -16,6 +16,7 @@ use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Color as TuiColor, Modifier, Style};
 use ratatui::widgets::Widget;
+use read_fonts::{FileRef, TableProvider};
 use rio_vt::crosswords::pos::Column;
 use rio_vt::crosswords::square::{Square, Wide};
 use rio_vt::crosswords::style::{Style as VtStyle, StyleFlags};
@@ -103,16 +104,20 @@ pub fn load_configured_font_faces(
         .regular
         .as_deref()
         .context("font.regular is required when explicit font files are configured")?;
+    let regular = read_font_face(regular)?;
+    let bold = font.bold.as_deref().map(read_font_face).transpose()?;
+    let italic = font.italic.as_deref().map(read_font_face).transpose()?;
+    let bold_italic = font
+        .bold_italic
+        .as_deref()
+        .map(read_font_face)
+        .transpose()?;
+
     let mut fonts = app.world_mut().resource_mut::<Assets<Font>>();
-    let mut load = |path: &Path| -> anyhow::Result<Handle<Font>> {
-        let bytes = fs::read(path)
-            .with_context(|| format!("failed to read font face {}", path.display()))?;
-        Ok(fonts.add(Font::from_bytes(bytes)))
-    };
-    let regular = load(regular)?;
-    let bold = font.bold.as_deref().map(&mut load).transpose()?;
-    let italic = font.italic.as_deref().map(&mut load).transpose()?;
-    let bold_italic = font.bold_italic.as_deref().map(&mut load).transpose()?;
+    let regular = fonts.add(regular);
+    let bold = bold.map(|font| fonts.add(font));
+    let italic = italic.map(|font| fonts.add(font));
+    let bold_italic = bold_italic.map(|font| fonts.add(font));
 
     Ok(ConfiguredFontFaces {
         faces: FontFaces {
@@ -124,6 +129,29 @@ pub fn load_configured_font_faces(
         },
         system_family: None,
     })
+}
+
+fn read_font_face(path: &Path) -> anyhow::Result<Font> {
+    let bytes =
+        fs::read(path).with_context(|| format!("failed to read font face {}", path.display()))?;
+    validate_font_face(path, &bytes)?;
+    Ok(Font::from_bytes(bytes))
+}
+
+fn validate_font_face(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let file = FileRef::new(bytes)
+        .with_context(|| format!("failed to parse font face {}", path.display()))?;
+    let has_character_map = file.fonts().any(|font| {
+        font.ok()
+            .and_then(|font| font.cmap().ok())
+            .is_some_and(|cmap| cmap.best_subtable().is_some())
+    });
+    anyhow::ensure!(
+        has_character_map,
+        "font face {} contains no usable character map",
+        path.display()
+    );
+    Ok(())
 }
 
 impl Default for TerminalRedrawState {
@@ -1033,6 +1061,34 @@ mod tests {
         };
 
         assert!(error.to_string().contains("font.regular is required"));
+    }
+
+    #[test]
+    fn invalid_explicit_font_data_is_rejected_before_asset_loading() {
+        let font = FontConfig {
+            regular: Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")),
+            ..default()
+        };
+        let Err(error) = load_configured_font_faces(&mut App::new(), &font) else {
+            panic!("non-font data must fail");
+        };
+
+        assert!(error.to_string().contains("failed to parse font face"));
+    }
+
+    #[test]
+    fn explicit_font_without_a_character_map_is_rejected() {
+        let empty_sfnt = [
+            0x00, 0x01, 0x00, 0x00, // TrueType scaler type
+            0x00, 0x00, // no tables
+            0x00, 0x00, // search range
+            0x00, 0x00, // entry selector
+            0x00, 0x00, // range shift
+        ];
+        let error = validate_font_face(Path::new("empty.ttf"), &empty_sfnt)
+            .expect_err("a font without a character map must fail");
+
+        assert!(error.to_string().contains("no usable character map"));
     }
 
     #[test]
