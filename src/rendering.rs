@@ -57,8 +57,8 @@ pub fn sync_terminal_debug_image(
 /// the grid. Either rebuild can leave a material's cached bind group pointing at
 /// a stale texture until the material is re-prepared.
 /// Unconditionally re-binding re-prepares the bind group so the planes always
-/// sample the current texture. The caller only runs this on redraw frames (gated
-/// by the frame-dirty flag), so it is not per-frame churn.
+/// sample the current texture. The caller runs this on redraw frames or when
+/// entering 3-D, so it is not per-frame churn.
 pub fn sync_plane_texture<'a>(
     image_handle: Option<&Handle<Image>>,
     material_handles: impl IntoIterator<Item = &'a MeshMaterial3d<StandardMaterial>>,

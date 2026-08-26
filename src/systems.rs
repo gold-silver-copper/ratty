@@ -809,9 +809,10 @@ pub(crate) struct SyncMaterialsParams<'w, 's> {
     present_materials: ResMut<'w, Assets<TerminalPresentMaterial>>,
     present_query: Query<'w, 's, &'static MeshMaterial2d<TerminalPresentMaterial>>,
     frame_dirty: Res<'w, TerminalFrameDirty>,
+    was_in_3d: Local<'s, bool>,
 }
 
-/// Refreshes the debug back texture and plane materials after a redraw.
+/// Refreshes terminal presentation materials after a redraw or on entering 3-D.
 pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
     let SyncMaterialsParams {
         runtime,
@@ -824,8 +825,10 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
         present_materials,
         present_query,
         frame_dirty,
+        was_in_3d,
     } = &mut params;
-    if !frame_dirty.0 {
+    let in_3d = camera_slots.active().mode.is_3d();
+    if !terminal_material_sync_needed(frame_dirty.0, in_3d, was_in_3d) {
         return;
     }
 
@@ -840,7 +843,6 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
         }
     }
 
-    let in_3d = camera_slots.active().mode.is_3d();
     if in_3d {
         sync_terminal_debug_image(terminal, images, &runtime.term);
     }
@@ -853,6 +855,17 @@ pub(crate) fn sync_terminal_materials(mut params: SyncMaterialsParams) {
             materials,
         );
     }
+}
+
+/// Returns whether terminal materials need refreshing and tracks 3-D transitions.
+///
+/// Camera changes do not make the terminal frame dirty, but entering 3-D exposes
+/// the separately rendered back texture. Refresh it on that transition so it is
+/// generated from the renderer's current measured cell geometry.
+fn terminal_material_sync_needed(frame_dirty: bool, in_3d: bool, was_in_3d: &mut bool) -> bool {
+    let entering_3d = in_3d && !*was_in_3d;
+    *was_in_3d = in_3d;
+    frame_dirty || entering_3d
 }
 
 #[derive(SystemParam)]
@@ -2224,6 +2237,18 @@ mod tests {
         mut probe: ResMut<VisibilityChangedProbe>,
     ) {
         probe.0 = visibility.iter().count();
+    }
+
+    #[test]
+    fn material_sync_runs_when_entering_3d_without_a_terminal_redraw() {
+        let mut was_in_3d = false;
+
+        assert!(!terminal_material_sync_needed(false, false, &mut was_in_3d));
+        assert!(terminal_material_sync_needed(false, true, &mut was_in_3d));
+        assert!(!terminal_material_sync_needed(false, true, &mut was_in_3d));
+        assert!(!terminal_material_sync_needed(false, false, &mut was_in_3d));
+        assert!(terminal_material_sync_needed(false, true, &mut was_in_3d));
+        assert!(terminal_material_sync_needed(true, false, &mut was_in_3d));
     }
 
     #[test]
