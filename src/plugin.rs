@@ -24,9 +24,10 @@ use crate::systems::{
     TerminalFrameDirty, TerminalRedrawSet, animate_inline_kitty_planes, animate_mobius_transition,
     animate_terminal_plane_warp, apply_inline_objects, apply_instance_brightness,
     finish_terminal_model_load, handle_window_resize, pump_pty_output, render_terminal_widget,
-    request_exit_on_primary_window_close, shutdown_terminal_runtime_on_exit,
-    sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects, sync_terminal_materials,
-    sync_terminal_render_output, sync_terminal_renderer_config,
+    request_exit_on_primary_window_close, retry_pending_terminal_resize,
+    shutdown_terminal_runtime_on_exit, sync_asset_to_terminal_cursor, sync_inline_objects,
+    sync_rgp_objects, sync_terminal_materials, sync_terminal_render_output,
+    sync_terminal_renderer_config,
 };
 use crate::terminal::TerminalRedrawState;
 
@@ -106,6 +107,10 @@ impl Plugin for TerminalPlugin {
             .add_systems(Update, handle_window_resize)
             .add_systems(
                 Update,
+                retry_pending_terminal_resize.after(handle_window_resize),
+            )
+            .add_systems(
+                Update,
                 apply_terminal_presentation
                     .run_if(
                         |camera_slots: Res<TerminalCameraSlots>,
@@ -131,6 +136,7 @@ impl Plugin for TerminalPlugin {
                     .after(TerminalCameraSystemSet::MouseInput)
                     .after(handle_window_resize)
                     .after(pump_pty_output)
+                    .after(retry_pending_terminal_resize)
                     .before(BevyTerminalSystems::Sync),
             )
             .add_systems(

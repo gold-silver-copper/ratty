@@ -303,14 +303,26 @@ pub(crate) fn handle_window_resize(
     }
     let layout = terminal.resize_to_fit(window_size, render_scale);
     let pty_pixels = layout.pty_pixels();
-    runtime.resize(
+    if let Err(error) = runtime.resize(
         layout.cols,
         layout.rows,
         pty_pixels.x as u16,
         pty_pixels.y as u16,
-    );
+    ) {
+        warn!("terminal resize remains pending: {error:#}");
+    }
     sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
     redraw.request();
+}
+
+/// Retries an operating-system PTY resize that failed when it was requested.
+///
+/// The request site emits the warning. Later attempts run quietly at normal
+/// log levels so a persistent platform error cannot flood the log every frame.
+pub(crate) fn retry_pending_terminal_resize(mut runtime: ResMut<TerminalRuntime>) {
+    if let Err(error) = runtime.retry_pending_resize() {
+        trace!("terminal resize retry remains pending: {error:#}");
+    }
 }
 
 /// Applies inline object visibility for the current presentation mode.
@@ -777,12 +789,14 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
         texture.raster_scale,
     );
     let pty_pixels = layout.pty_pixels();
-    runtime.resize(
+    if let Err(error) = runtime.resize(
         layout.cols,
         layout.rows,
         pty_pixels.x as u16,
         pty_pixels.y as u16,
-    );
+    ) {
+        warn!("terminal resize remains pending: {error:#}");
+    }
     sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
     frame_dirty.0 = true;
     if previous_grid != (layout.cols, layout.rows) {
