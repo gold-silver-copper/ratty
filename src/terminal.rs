@@ -79,7 +79,9 @@ pub(crate) struct TerminalRenderTarget;
 #[derive(Resource, Clone)]
 pub struct ConfiguredFontFaces {
     pub(crate) faces: FontFaces,
-    pub(crate) system_family: Option<String>,
+    /// Whether `faces` names the configured system family (as opposed to
+    /// explicit font files), so the family's availability must be checked.
+    pub(crate) uses_system_family: bool,
 }
 
 /// Loads explicit font files into Bevy, or retains the configured system family.
@@ -96,7 +98,7 @@ pub fn load_configured_font_faces(
     if explicit.iter().all(Option::is_none) {
         return Ok(ConfiguredFontFaces {
             faces: FontFaces::regular(font_family(&font.family)),
-            system_family: Some(font.family.clone()),
+            uses_system_family: true,
         });
     }
 
@@ -127,7 +129,7 @@ pub fn load_configured_font_faces(
             bold_italic: bold_italic.map(FontSource::Handle),
             synthesize: true,
         },
-        system_family: None,
+        uses_system_family: false,
     })
 }
 
@@ -186,7 +188,7 @@ pub struct TerminalSurface {
     /// Terminal row count.
     pub rows: u16,
     cursor_model_visible: bool,
-    font: FontConfig,
+    font_size: i32,
     render_config: TerminalRenderConfig,
     render_scale: f32,
     cell_size: Vec2,
@@ -226,7 +228,7 @@ impl TerminalSurface {
             cols,
             rows,
             cursor_model_visible: config.cursor.model.visible,
-            font: config.font.clone(),
+            font_size: config.font.size,
             render_config,
             render_scale,
             // No geometry is inferred before the renderer measures the loaded font.
@@ -237,19 +239,19 @@ impl TerminalSurface {
 
     /// Adjusts the font size.
     pub fn adjust_font_size(&mut self, delta: i32) -> bool {
-        let new_size = self.font.size.saturating_add(delta).max(1);
-        if new_size == self.font.size {
+        let new_size = self.font_size.saturating_add(delta).max(1);
+        if new_size == self.font_size {
             return false;
         }
 
         self.render_config.font_size = FontSizing::Px(points_to_logical_pixels(new_size));
-        self.font.size = new_size;
+        self.font_size = new_size;
         true
     }
 
     /// Returns the current font size.
     pub fn font_size(&self) -> i32 {
-        self.font.size
+        self.font_size
     }
 
     /// Updates the physical render scale.
@@ -268,14 +270,11 @@ impl TerminalSurface {
     pub fn resize_to_fit(&mut self, logical_size: Vec2, render_scale: f32) -> TerminalLayout {
         self.set_render_scale(render_scale);
 
-        let logical_size = logical_size.max(Vec2::ONE);
-        let cols = (logical_size.x / self.cell_size.x)
-            .floor()
-            .clamp(1.0, u16::MAX as f32) as u16;
-        let rows = (logical_size.y / self.cell_size.y)
-            .floor()
-            .clamp(1.0, u16::MAX as f32) as u16;
-
+        // The renderer sizes its texture with the same exported helper, so
+        // the PTY grid and the rendered grid cannot disagree by a cell.
+        let grid =
+            bevy_terminal_ratatui::render::grid_for(logical_size.max(Vec2::ONE), self.cell_size);
+        let (cols, rows) = (grid.width, grid.height);
         if cols != self.cols || rows != self.rows {
             self.resize(cols, rows);
         }
@@ -337,38 +336,45 @@ impl TerminalSurface {
 
     /// Adopts the metrics and stable image handle produced by the Bevy renderer.
     pub(crate) fn update_render_output(&mut self, texture: &TerminalTexture) -> bool {
-        // This is the single adoption boundary for renderer metrics: floor
-        // them here once, and compare the clamped values that are stored, so a
-        // sub-1.0 input cannot latch `changed` permanently.
-        let cell_size = texture.cell_size.max(Vec2::ONE);
-        let render_scale = texture.raster_scale.max(1.0);
-        let changed = self.image_handle.as_ref() != Some(&texture.image)
-            || self.rendered_texture_size != Some(texture.size)
-            || self.cell_size != cell_size
-            || self.render_scale != render_scale;
+        if !self.render_output_changed(texture) {
+            return false;
+        }
+        let (cell_size, render_scale) = clamped_render_metrics(texture);
         self.image_handle = Some(texture.image.clone());
         self.rendered_texture_size = Some(texture.size);
         self.cell_size = cell_size;
         self.render_scale = render_scale;
-        changed
+        true
+    }
+
+    /// Whether adopting `texture` would change the stored presentation
+    /// metrics. Read-only so callers holding a `ResMut` can probe without
+    /// tripping change detection or cloning handles every frame.
+    pub(crate) fn render_output_changed(&self, texture: &TerminalTexture) -> bool {
+        let (cell_size, render_scale) = clamped_render_metrics(texture);
+        self.image_handle.as_ref() != Some(&texture.image)
+            || self.rendered_texture_size != Some(texture.size)
+            || self.cell_size != cell_size
+            || self.render_scale != render_scale
     }
 }
 
+/// Floors renderer metrics to the >=1.0 invariant at the single adoption
+/// boundary, so a sub-1.0 input can neither be stored nor latch change
+/// detection.
+fn clamped_render_metrics(texture: &TerminalTexture) -> (Vec2, f32) {
+    (
+        texture.cell_size.max(Vec2::ONE),
+        texture.raster_scale.max(1.0),
+    )
+}
+
 /// Computes the physical render scale for a Bevy window.
+///
+/// Delegates to the renderer's exported helper so the scale the PTY layout
+/// uses is the exact scale the renderer rasterizes with.
 pub fn render_scale_for_window(window: &Window) -> f32 {
-    // The presenting window's *actual* framebuffer ratio (physical / logical), so the
-    // terminal texture is rasterized at exactly the framebuffer resolution and can be
-    // presented 1:1 with physical pixels. Deriving it from the real physical size —
-    // rather than the reported scale factor — keeps it correct when they disagree.
-    //
-    // The previous version took the max with the backend's base scale factor; on a
-    // mixed-DPI multi-monitor setup that leaked a higher-DPI monitor's scale, over-sizing
-    // the texture so it had to be resampled onto the low-DPI window.
-    let logical = window.resolution.size().max(Vec2::ONE);
-    let physical = window.resolution.physical_size().as_vec2();
-    (physical.x / logical.x)
-        .min(physical.y / logical.y)
-        .max(1.0)
+    bevy_terminal_ratatui::render::raster_scale_for_window(window)
 }
 
 /// Returns the logical size for a physical terminal texture.
@@ -465,15 +471,14 @@ impl Widget for TerminalWidget<'_> {
                 let square = grid_row[Column(usize::from(col))];
                 let cell = &mut buf[(area.x + col, area.y + row)];
 
-                // Ratatui skips the trailing cell of a width-2 symbol in its
-                // backend diff. RatatuiBackend reconstructs that continuation
-                // from the wide anchor while retaining this cell's style.
+                // Ratatui's backend diff skips the trailing cell of a width-2
+                // symbol unconditionally, and the renderer reconstructs the
+                // continuation from the wide anchor's style — a style written
+                // here can never render, so the anchor branch below owns the
+                // selection highlight for both columns.
                 if matches!(square.wide(), Wide::Spacer) {
-                    let mut style =
+                    let style =
                         square_style(styles, square, &theme_palette, theme_fg, self.font_style);
-                    if selection.is_some_and(|bounds| bounds.contains(row, col)) {
-                        style = style.add_modifier(Modifier::REVERSED);
-                    }
                     cell.set_symbol(" ")
                         .set_style(style)
                         .set_diff_option(forced_width(1));
@@ -498,15 +503,18 @@ impl Widget for TerminalWidget<'_> {
 
                 let mut style =
                     square_style(styles, square, &theme_palette, theme_fg, self.font_style);
-                if selection.is_some_and(|bounds| bounds.contains(row, col)) {
+                let is_wide = matches!(square.wide(), Wide::Wide);
+                // A wide glyph renders as one unit: a selection touching
+                // either of its columns highlights the whole glyph, since the
+                // trailing spacer cannot carry its own style (see above).
+                if selection.is_some_and(|bounds| {
+                    bounds.contains(row, col)
+                        || (is_wide && col + 1 < cols && bounds.contains(row, col + 1))
+                }) {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
 
-                let width = if matches!(square.wide(), Wide::Wide) {
-                    2
-                } else {
-                    1
-                };
+                let width = if is_wide { 2 } else { 1 };
                 cell.set_symbol(if symbol.is_empty() { " " } else { &symbol })
                     .set_style(style)
                     .set_diff_option(forced_width(width));

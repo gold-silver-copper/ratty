@@ -67,7 +67,7 @@ use bevy::window::{PrimaryWindow, Window, WindowCloseRequested, WindowResized};
 #[cfg(not(bevy_terminal_automatic_metrics))]
 use bevy_terminal_ratatui::prelude::{CellSizing, FontSizing, TerminalRenderScale};
 use bevy_terminal_ratatui::prelude::{
-    FontFaces, FontSource, TerminalRenderConfig, TerminalTexture,
+    FontFaces, FontSource, TerminalReady, TerminalRenderConfig, TerminalTexture,
 };
 
 struct InlineLayout {
@@ -288,8 +288,15 @@ pub(crate) fn handle_window_resize(
     }
 
     // Before the first TerminalTexture arrives, no authoritative cell
-    // dimensions exist. The first measured-output sync uses the current window.
+    // dimensions exist. The first measured-output sync uses the current
+    // window, so dropping the event loses nothing — unless measurement never
+    // succeeds, in which case say so once instead of swallowing resizes
+    // silently for the life of the degraded session.
     if !terminal.is_measured() {
+        warn_once!(
+            "window resized before any font was measured; the terminal keeps its \
+             configured grid until measurement succeeds"
+        );
         return;
     }
 
@@ -301,6 +308,33 @@ pub(crate) fn handle_window_resize(
         // reflow using those authoritative metrics and the current window.
         return;
     }
+    let layout = reflow_terminal(terminal, runtime, window_size, render_scale);
+    sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
+    redraw.request();
+}
+
+/// Set once the renderer signals `TerminalReady`: its texture carries
+/// measured font geometry and may drive PTY layout.
+#[derive(Resource, Default)]
+pub(crate) struct TerminalRendererReady(pub(crate) bool);
+
+/// Marks the renderer's measured texture as authoritative for layout.
+pub(crate) fn on_terminal_ready(
+    _ready: On<TerminalReady>,
+    mut renderer_ready: ResMut<TerminalRendererReady>,
+) {
+    renderer_ready.0 = true;
+}
+
+/// Fits the grid to the window, pushes the result to the PTY, and returns the
+/// layout. The single reflow implementation shared by the resize handler and
+/// the render-output sync.
+fn reflow_terminal(
+    terminal: &mut TerminalSurface,
+    runtime: &mut TerminalRuntime,
+    window_size: Vec2,
+    render_scale: f32,
+) -> crate::terminal::TerminalLayout {
     let layout = terminal.resize_to_fit(window_size, render_scale);
     let pty_pixels = layout.pty_pixels();
     if let Err(error) = runtime.resize(
@@ -311,8 +345,7 @@ pub(crate) fn handle_window_resize(
     ) {
         warn!("terminal resize remains pending: {error:#}");
     }
-    sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
-    redraw.request();
+    layout
 }
 
 /// Retries an operating-system PTY resize that failed when it was requested.
@@ -456,13 +489,10 @@ pub(crate) fn sync_terminal_renderer_config(
     if let Some(ref configured_faces) = configured_faces {
         desired.font = configured_faces.faces.clone();
     }
-    let system_family = configured_faces
-        .as_deref()
-        .and_then(|configured| configured.system_family.as_deref())
-        .unwrap_or(&app_config.font.family);
+    let system_family = &app_config.font.family;
     let needs_system_font = configured_faces
         .as_deref()
-        .is_none_or(|configured| configured.system_family.is_some());
+        .is_none_or(|configured| configured.uses_system_family);
     if needs_system_font && font_cx.collection.family_by_name(system_family).is_none() {
         warn_once!(
             "configured font family {:?} is unavailable; using the generic monospace family",
@@ -724,6 +754,15 @@ fn measure_block_line_box(
         }
     }
     let block = opaque.or_else(|| {
+        // No fully opaque row survived the probe: the font's full block glyph
+        // has soft (anti-aliased) edges, or a fallback face with a different
+        // line box substituted for a missing U+2588. The inset guess below
+        // can be off by a few physical pixels, so leave a trace for the
+        // "gaps between block characters" bug report.
+        warn_once!(
+            "full-block glyph probe found no opaque rows; estimating the cell line box \
+             from bitmap bounds — block characters may show seams"
+        );
         bitmap.map(|bounds| VerticalGlyphBox {
             top: bounds.top + 1.0,
             bottom: (bounds.bottom - 1.0).max(bounds.top + 1.0),
@@ -768,6 +807,7 @@ pub(crate) struct SyncRenderOutputParams<'w, 's> {
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
     frame_dirty: ResMut<'w, TerminalFrameDirty>,
+    renderer_ready: Res<'w, TerminalRendererReady>,
 }
 
 /// Adopts the renderer-owned texture and reflows the PTY when measured font
@@ -783,16 +823,33 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
         plane_query,
         plane_back_query,
         frame_dirty,
+        renderer_ready,
     } = &mut params;
     let (Ok(texture), Ok(mut window)) = (textures.single(), primary_window.single_mut()) else {
         return;
     };
-    // The renderer inserts a provisional texture with a 1x1 logical cell
-    // before the font face has shaped. Adopting it would divide the window by
-    // that placeholder cell and reflow the PTY to one cell per pixel, so wait
-    // for measured geometry before treating the texture as authoritative.
-    if !texture.cell_size.cmpgt(Vec2::ONE).all() {
+    // The renderer inserts a provisional texture with estimated cell metrics
+    // before the font face has shaped. Adopting it would reflow the PTY to a
+    // wrong grid, so wait for TerminalReady — the renderer's own signal that
+    // the texture carries measured geometry — before treating the texture as
+    // authoritative. (An exact-size heuristic would misclassify legitimately
+    // tiny measured cells, wedging the terminal at a 1pt font.)
+    if !renderer_ready.0 {
         return;
+    }
+    // The packaged (registry) renderer cannot measure cells itself: Ratty's
+    // adapter pushes a measured CellSizing::Logical config, and until the
+    // renderer has re-rastered with exactly that cell, the texture still
+    // carries the estimate — adopting it would cause the visible double
+    // reflow the hidden-window startup exists to prevent.
+    #[cfg(not(bevy_terminal_automatic_metrics))]
+    {
+        let CellSizing::Logical(cell) = terminal.render_config().cell_size else {
+            return;
+        };
+        if texture.cell_size != cell {
+            return;
+        }
     }
     // Minimizing the window reports a 0x0 size. Skip the reflow (mirroring
     // `handle_window_resize`) so a texture change landing on that frame does
@@ -801,20 +858,14 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     if window_size.x < 1.0 || window_size.y < 1.0 {
         return;
     }
-    if !terminal.update_render_output(texture) {
+    // Probe read-only first so an unchanged frame does not mark the surface
+    // resource changed or clone the image handle.
+    if !terminal.render_output_changed(texture) {
         return;
     }
+    terminal.update_render_output(texture);
     let previous_grid = (terminal.cols, terminal.rows);
-    let layout = terminal.resize_to_fit(window_size, texture.raster_scale);
-    let pty_pixels = layout.pty_pixels();
-    if let Err(error) = runtime.resize(
-        layout.cols,
-        layout.rows,
-        pty_pixels.x as u16,
-        pty_pixels.y as u16,
-    ) {
-        warn!("terminal resize remains pending: {error:#}");
-    }
+    let layout = reflow_terminal(terminal, runtime, window_size, texture.raster_scale);
     sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
     frame_dirty.0 = true;
     if previous_grid != (layout.cols, layout.rows) {
@@ -849,7 +900,6 @@ const WINDOW_REVEAL_FALLBACK_SECS: f32 = 10.0;
 pub(crate) fn reveal_window_fallback(
     time: Res<Time<Real>>,
     mut primary_window: Query<&mut Window, With<PrimaryWindow>>,
-    mut hidden_for: Local<f32>,
     mut disarmed: Local<bool>,
 ) {
     if *disarmed {
@@ -862,10 +912,10 @@ pub(crate) fn reveal_window_fallback(
         *disarmed = true;
         return;
     }
-    // Real (wall-clock) time: virtual time clamps long blocking frames to
-    // `max_delta`, which would stretch the deadline past its meaning.
-    *hidden_for += time.delta_secs();
-    if *hidden_for < WINDOW_REVEAL_FALLBACK_SECS {
+    // The window is hidden from startup, so wall-clock elapsed time IS the
+    // hidden duration — no accumulator needed. Real time, because virtual
+    // time clamps long blocking frames to `max_delta`.
+    if time.elapsed_secs() < WINDOW_REVEAL_FALLBACK_SECS {
         return;
     }
     warn!(

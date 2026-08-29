@@ -21,15 +21,30 @@ use crate::scene::{
     spawn_terminal_renderer,
 };
 use crate::systems::{
-    TerminalFrameDirty, TerminalRedrawSet, animate_inline_kitty_planes, animate_mobius_transition,
-    animate_terminal_plane_warp, apply_inline_objects, apply_instance_brightness,
-    finish_terminal_model_load, handle_window_resize, pump_pty_output, render_terminal_widget,
-    request_exit_on_primary_window_close, retry_pending_terminal_resize, reveal_window_fallback,
-    shutdown_terminal_runtime_on_exit, sync_asset_to_terminal_cursor, sync_inline_objects,
-    sync_rgp_objects, sync_terminal_materials, sync_terminal_render_output,
-    sync_terminal_renderer_config,
+    TerminalFrameDirty, TerminalRedrawSet, TerminalRendererReady, animate_inline_kitty_planes,
+    animate_mobius_transition, animate_terminal_plane_warp, apply_inline_objects,
+    apply_instance_brightness, finish_terminal_model_load, handle_window_resize, on_terminal_ready,
+    pump_pty_output, render_terminal_widget, request_exit_on_primary_window_close,
+    retry_pending_terminal_resize, reveal_window_fallback, shutdown_terminal_runtime_on_exit,
+    sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects, sync_terminal_materials,
+    sync_terminal_render_output, sync_terminal_renderer_config,
 };
-use crate::terminal::TerminalRedrawState;
+use crate::terminal::{ConfiguredFontFaces, TerminalRedrawState, TerminalSurface};
+
+/// Whether any input of `sync_terminal_renderer_config` changed this frame,
+/// so the per-frame config clone and font-collection lookup only run when
+/// they can produce a different result.
+fn renderer_config_inputs_changed(
+    app_config: Res<AppConfig>,
+    terminal: Res<TerminalSurface>,
+    configured_faces: Option<Res<ConfiguredFontFaces>>,
+    font_assets: Res<Assets<bevy::text::Font>>,
+) -> bool {
+    app_config.is_changed()
+        || terminal.is_changed()
+        || configured_faces.is_some_and(|faces| faces.is_changed())
+        || font_assets.is_changed()
+}
 
 /// Inline object entities spawned since the visibility pass last ran.
 type AddedInlineObjects<'w, 's> = Query<
@@ -60,6 +75,8 @@ impl Plugin for TerminalPlugin {
                 PostUpdate,
                 spawn_terminal_renderer.after(bevy::text::load_font_assets_into_font_collection),
             )
+            .init_resource::<TerminalRendererReady>()
+            .add_observer(on_terminal_ready)
             .add_systems(Update, request_exit_on_primary_window_close)
             .add_systems(Update, reveal_window_fallback)
             .add_systems(Update, pump_pty_output)
@@ -143,6 +160,7 @@ impl Plugin for TerminalPlugin {
             .add_systems(
                 Update,
                 sync_terminal_renderer_config
+                    .run_if(renderer_config_inputs_changed)
                     .after(render_terminal_widget)
                     .before(BevyTerminalSystems::Sync),
             )
