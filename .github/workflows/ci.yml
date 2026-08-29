@@ -105,7 +105,7 @@ jobs:
       # the nested dir cargo package wipes each run.
       - name: Test the packaged crate against registry dependencies
         run: |
-          version="$(cargo pkgid | sed -E 's/.*#(.*@)?//')"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           CARGO_TARGET_DIR="$PWD/target" \
             cargo test --lib --manifest-path "target/package/ratty-$version/Cargo.toml"
 

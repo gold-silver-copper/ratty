@@ -219,16 +219,27 @@ impl TerminalSelection {
                     }
                     let pos = vt::visible_pos(term, row, col);
                     if vt::is_wide_spacer(&term.grid, pos) {
-                        // The highlight renders a wide glyph as one unit, so a
-                        // selection starting on its trailing spacer includes
-                        // the glyph in the copied text too; spacers inside the
-                        // range are covered by their anchor and skipped.
-                        if col == row_start && col > 0 {
-                            vt::push_cell_text(
-                                &mut out,
-                                &term.grid,
-                                vt::visible_pos(term, row, col - 1),
-                            );
+                        let anchor = (col > 0)
+                            .then(|| vt::visible_pos(term, row, col - 1))
+                            .filter(|anchor| vt::is_wide_anchor(&term.grid, *anchor));
+                        match anchor {
+                            // The highlight renders a wide glyph as one unit,
+                            // so a selection starting on its trailing spacer
+                            // includes the glyph in the copied text too.
+                            Some(anchor) if col == row_start => {
+                                let before = out.len();
+                                vt::push_cell_text(&mut out, &term.grid, anchor);
+                                if out.len() == before {
+                                    out.push(' ');
+                                }
+                            }
+                            // Inside the range the anchor already emitted the
+                            // glyph; the spacer is padding, not a column.
+                            Some(_) => {}
+                            // An orphaned spacer (e.g. left behind by ESC[1K)
+                            // renders — and highlights — as a blank column, so
+                            // it copies as one too.
+                            None => out.push(' '),
                         }
                         continue;
                     }

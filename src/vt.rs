@@ -217,6 +217,11 @@ pub fn is_wide_spacer(grid: &Grid<Square>, pos: Pos) -> bool {
     matches!(grid[pos].wide(), Wide::Spacer)
 }
 
+/// Whether a cell is the leading anchor of a width-2 glyph.
+pub fn is_wide_anchor(grid: &Grid<Square>, pos: Pos) -> bool {
+    matches!(grid[pos].wide(), Wide::Wide)
+}
+
 /// Returns the grid position of a visible `(row, col)`.
 pub fn visible_pos(term: &VtTerminal, row: u16, col: u16) -> Pos {
     let offset = i32::try_from(term.display_offset()).unwrap_or(i32::MAX);

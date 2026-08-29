@@ -310,17 +310,20 @@ pub(crate) fn handle_window_resize(
     redraw.request();
 }
 
-/// Set once the renderer signals `TerminalReady`: its texture carries
+/// The renderer entity whose `TerminalReady` has fired: its texture carries
 /// measured font geometry and may drive PTY layout.
+///
+/// Entity-scoped rather than a process-wide bool, so a despawned-and-respawned
+/// renderer target starts ungated again instead of riding a stale flag.
 #[derive(Resource, Default)]
-pub(crate) struct TerminalRendererReady(pub(crate) bool);
+pub(crate) struct TerminalRendererReady(pub(crate) Option<Entity>);
 
 /// Marks the renderer's measured texture as authoritative for layout.
 pub(crate) fn on_terminal_ready(
-    _ready: On<TerminalReady>,
+    ready: On<TerminalReady>,
     mut renderer_ready: ResMut<TerminalRendererReady>,
 ) {
-    renderer_ready.0 = true;
+    renderer_ready.0 = Some(ready.entity);
 }
 
 /// Fits the grid to the window, pushes the result to the PTY, and returns the
@@ -486,10 +489,13 @@ pub(crate) fn sync_terminal_renderer_config(
     if let Some(ref configured_faces) = configured_faces {
         desired.font = configured_faces.faces.clone();
     }
-    let system_family = &app_config.font.family;
+    let system_family = configured_faces
+        .as_deref()
+        .and_then(|configured| configured.system_family.as_deref())
+        .unwrap_or(&app_config.font.family);
     let needs_system_font = configured_faces
         .as_deref()
-        .is_none_or(|configured| configured.uses_system_family);
+        .is_none_or(|configured| configured.system_family.is_some());
     let family_available = font_cx
         .bypass_change_detection()
         .collection
@@ -801,7 +807,7 @@ fn opaque_rows(images: &Assets<Image>, texture: AssetId<Image>, rect: Rect) -> O
 #[derive(SystemParam)]
 pub(crate) struct SyncRenderOutputParams<'w, 's> {
     primary_window: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
-    textures: Query<'w, 's, &'static TerminalTexture, With<TerminalRenderTarget>>,
+    textures: Query<'w, 's, (Entity, &'static TerminalTexture), With<TerminalRenderTarget>>,
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
@@ -831,7 +837,9 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
         #[cfg(not(bevy_terminal_automatic_metrics))]
         render_configs,
     } = &mut params;
-    let (Ok(texture), Ok(mut window)) = (textures.single(), primary_window.single_mut()) else {
+    let (Ok((texture_entity, texture)), Ok(mut window)) =
+        (textures.single(), primary_window.single_mut())
+    else {
         return;
     };
     // The renderer inserts a provisional texture with estimated cell metrics
@@ -840,7 +848,7 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     // the texture carries measured geometry — before treating the texture as
     // authoritative. (An exact-size heuristic would misclassify legitimately
     // tiny measured cells, wedging the terminal at a 1pt font.)
-    if !renderer_ready.0 {
+    if renderer_ready.0 != Some(texture_entity) {
         return;
     }
     // The packaged (registry) renderer cannot measure cells itself: Ratty's
@@ -872,12 +880,9 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     if window_size.x < 1.0 || window_size.y < 1.0 {
         return;
     }
-    // Probe read-only first so an unchanged frame does not mark the surface
-    // resource changed or clone the image handle.
-    if !terminal.render_output_changed(texture) {
+    if !terminal.update_render_output(texture) {
         return;
     }
-    terminal.apply_render_output(texture);
     let previous_grid = (terminal.cols, terminal.rows);
     let layout = reflow_terminal(terminal, runtime, window_size, texture.raster_scale);
     sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
@@ -914,6 +919,7 @@ const WINDOW_REVEAL_FALLBACK_SECS: f32 = 10.0;
 pub(crate) fn reveal_window_fallback(
     time: Res<Time<Real>>,
     mut primary_window: Query<&mut Window, With<PrimaryWindow>>,
+    mut hidden_for: Local<f32>,
     mut disarmed: Local<bool>,
 ) {
     if *disarmed {
@@ -926,10 +932,12 @@ pub(crate) fn reveal_window_fallback(
         *disarmed = true;
         return;
     }
-    // The window is hidden from startup, so wall-clock elapsed time IS the
-    // hidden duration — no accumulator needed. Real time, because virtual
-    // time clamps long blocking frames to `max_delta`.
-    if time.elapsed_secs() < WINDOW_REVEAL_FALLBACK_SECS {
+    // Accumulate the observed hidden time rather than reading elapsed_secs():
+    // an embedder may add this plugin long after app startup, and app-elapsed
+    // time would fire the fallback instantly. Real time, because virtual time
+    // clamps long blocking frames to `max_delta`.
+    *hidden_for += time.delta_secs();
+    if *hidden_for < WINDOW_REVEAL_FALLBACK_SECS {
         return;
     }
     warn!(

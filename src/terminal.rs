@@ -79,9 +79,11 @@ pub(crate) struct TerminalRenderTarget;
 #[derive(Resource, Clone)]
 pub struct ConfiguredFontFaces {
     pub(crate) faces: FontFaces,
-    /// Whether `faces` names the configured system family (as opposed to
-    /// explicit font files), so the family's availability must be checked.
-    pub(crate) uses_system_family: bool,
+    /// The system family `faces` names (`None` for explicit font files).
+    /// Retained so the availability check validates the family actually
+    /// pushed to the renderer, which an embedder may build from a different
+    /// `FontConfig` than the inserted `AppConfig`.
+    pub(crate) system_family: Option<String>,
 }
 
 /// Loads explicit font files into Bevy, or retains the configured system family.
@@ -98,7 +100,7 @@ pub fn load_configured_font_faces(
     if explicit.iter().all(Option::is_none) {
         return Ok(ConfiguredFontFaces {
             faces: FontFaces::regular(font_family(&font.family)),
-            uses_system_family: true,
+            system_family: Some(font.family.clone()),
         });
     }
 
@@ -129,7 +131,7 @@ pub fn load_configured_font_faces(
             bold_italic: bold_italic.map(FontSource::Handle),
             synthesize: true,
         },
-        uses_system_family: false,
+        system_family: None,
     })
 }
 
@@ -189,7 +191,6 @@ pub struct TerminalSurface {
     pub rows: u16,
     cursor_model_visible: bool,
     font_size: i32,
-    render_config_revision: u32,
     render_config: TerminalRenderConfig,
     render_scale: f32,
     cell_size: Vec2,
@@ -230,7 +231,6 @@ impl TerminalSurface {
             rows,
             cursor_model_visible: config.cursor.model.visible,
             font_size: config.font.size,
-            render_config_revision: 0,
             render_config,
             render_scale,
             // No geometry is inferred before the renderer measures the loaded font.
@@ -248,7 +248,6 @@ impl TerminalSurface {
 
         self.render_config.font_size = FontSizing::Px(points_to_logical_pixels(new_size));
         self.font_size = new_size;
-        self.render_config_revision = self.render_config_revision.wrapping_add(1);
         true
     }
 
@@ -266,7 +265,6 @@ impl TerminalSurface {
 
         self.render_scale = render_scale;
         self.render_config.raster.scale = TerminalRenderScale::Fixed(render_scale);
-        self.render_config_revision = self.render_config_revision.wrapping_add(1);
         true
     }
 
@@ -305,7 +303,7 @@ impl TerminalSurface {
     /// Returns the rendered cell size in logical pixels.
     ///
     /// Always at least 1x1: every writer of `cell_size` (the constructor and
-    /// `apply_render_output`) floors it, so consumers need no re-clamp.
+    /// `update_render_output`) floors it, so consumers need no re-clamp.
     pub fn char_dimensions(&self) -> Vec2 {
         self.cell_size
     }
@@ -338,34 +336,24 @@ impl TerminalSurface {
         &self.render_config
     }
 
-    /// Monotonic counter bumped whenever [`Self::render_config`] mutates.
-    ///
-    /// A narrower change signal than resource-level `is_changed`, which also
-    /// trips on every widget redraw through the same `ResMut`.
-    pub(crate) const fn render_config_revision(&self) -> u32 {
-        self.render_config_revision
-    }
-
     /// Adopts the metrics and stable image handle produced by the Bevy
-    /// renderer. Callers gate on [`Self::render_output_changed`] first, so
-    /// the change contract lives in exactly one comparator.
-    pub(crate) fn apply_render_output(&mut self, texture: &TerminalTexture) {
+    /// renderer, comparing first and writing only on change; returns whether
+    /// anything changed. One comparator, no call-site protocol — nothing in
+    /// the crate reads `TerminalSurface` change ticks, so an occasional
+    /// no-op write would only cost the comparison this method already does.
+    pub(crate) fn update_render_output(&mut self, texture: &TerminalTexture) -> bool {
         let (cell_size, render_scale) = clamped_render_metrics(texture);
-        self.image_handle = Some(texture.image.clone());
-        self.rendered_texture_size = Some(texture.size);
-        self.cell_size = cell_size;
-        self.render_scale = render_scale;
-    }
-
-    /// Whether adopting `texture` would change the stored presentation
-    /// metrics. Read-only so callers holding a `ResMut` can probe without
-    /// tripping change detection or cloning handles every frame.
-    pub(crate) fn render_output_changed(&self, texture: &TerminalTexture) -> bool {
-        let (cell_size, render_scale) = clamped_render_metrics(texture);
-        self.image_handle.as_ref() != Some(&texture.image)
+        let changed = self.image_handle.as_ref() != Some(&texture.image)
             || self.rendered_texture_size != Some(texture.size)
             || self.cell_size != cell_size
-            || self.render_scale != render_scale
+            || self.render_scale != render_scale;
+        if changed {
+            self.image_handle = Some(texture.image.clone());
+            self.rendered_texture_size = Some(texture.size);
+            self.cell_size = cell_size;
+            self.render_scale = render_scale;
+        }
+        changed
     }
 }
 
@@ -1038,8 +1026,7 @@ mod tests {
 
         let cell_size = texture.cell_size;
         let mut terminal = app.world_mut().resource_mut::<TerminalSurface>();
-        assert!(terminal.render_output_changed(&texture));
-        terminal.apply_render_output(&texture);
+        assert!(terminal.update_render_output(&texture));
         let layout = terminal.resize_to_fit(cell_size * Vec2::new(4.9, 3.9), 1.0);
         assert_eq!((layout.cols, layout.rows), (4, 3));
     }
@@ -1135,13 +1122,11 @@ mod tests {
             font_size: 20.0,
         };
 
-        assert!(terminal.render_output_changed(&texture));
-        terminal.apply_render_output(&texture);
-        assert!(!terminal.render_output_changed(&texture));
+        assert!(terminal.update_render_output(&texture));
+        assert!(!terminal.update_render_output(&texture));
 
         texture.size.x += 12;
-        assert!(terminal.render_output_changed(&texture));
-        terminal.apply_render_output(&texture);
+        assert!(terminal.update_render_output(&texture));
     }
 
     #[test]
@@ -1156,10 +1141,9 @@ mod tests {
             font_size: 1.0,
         };
 
-        assert!(terminal.render_output_changed(&texture));
-        terminal.apply_render_output(&texture);
+        assert!(terminal.update_render_output(&texture));
         assert!(
-            !terminal.render_output_changed(&texture),
+            !terminal.update_render_output(&texture),
             "clamped metrics must compare equal on the second adoption"
         );
     }
@@ -1175,8 +1159,7 @@ mod tests {
             cell_size: Vec2::new(12.0, 24.0),
             font_size: 20.0,
         };
-        assert!(terminal.render_output_changed(&texture));
-        terminal.apply_render_output(&texture);
+        assert!(terminal.update_render_output(&texture));
 
         assert!(terminal.set_render_scale(2.0));
         assert_eq!(terminal.char_dimensions(), Vec2::new(12.0, 24.0));
