@@ -24,7 +24,7 @@ use crate::systems::{
     TerminalFrameDirty, TerminalRedrawSet, animate_inline_kitty_planes, animate_mobius_transition,
     animate_terminal_plane_warp, apply_inline_objects, apply_instance_brightness,
     finish_terminal_model_load, handle_window_resize, pump_pty_output, render_terminal_widget,
-    request_exit_on_primary_window_close, retry_pending_terminal_resize,
+    request_exit_on_primary_window_close, retry_pending_terminal_resize, reveal_window_fallback,
     shutdown_terminal_runtime_on_exit, sync_asset_to_terminal_cursor, sync_inline_objects,
     sync_rgp_objects, sync_terminal_materials, sync_terminal_render_output,
     sync_terminal_renderer_config,
@@ -61,6 +61,7 @@ impl Plugin for TerminalPlugin {
                 spawn_terminal_renderer.after(bevy::text::load_font_assets_into_font_collection),
             )
             .add_systems(Update, request_exit_on_primary_window_close)
+            .add_systems(Update, reveal_window_fallback)
             .add_systems(Update, pump_pty_output)
             .configure_sets(
                 Update,
