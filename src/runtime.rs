@@ -300,6 +300,21 @@ impl TerminalRuntime {
             return Ok(false);
         };
 
+        // The caller has already committed the surface, viewport, and mouse
+        // mapping to the new grid, so the local parser must follow even when
+        // the OS notification below fails — otherwise a persistent PTY error
+        // renders old-grid content against new-grid layout indefinitely. Only
+        // the child-facing ioctl is retried.
+        let parser_size = (cols, rows);
+        if self.last_parser_size != parser_size {
+            // rio-vt reflows content and resets the scrolling region natively,
+            // so the grid resize is the whole operation — no snapshot and
+            // replay.
+            self.term
+                .resize(CrosswordsSize::new(usize::from(cols), usize::from(rows)));
+            self.last_parser_size = parser_size;
+        }
+
         if self.last_pty_size != pty_size {
             if let Some(master) = self.master.get().as_ref() {
                 master
@@ -312,16 +327,6 @@ impl TerminalRuntime {
                     .context("failed to resize PTY")?;
             }
             self.last_pty_size = pty_size;
-        }
-
-        let parser_size = (cols, rows);
-        if self.last_parser_size != parser_size {
-            // rio-vt reflows content and resets the scrolling region natively,
-            // so the grid resize is the whole operation — no snapshot and
-            // replay.
-            self.term
-                .resize(CrosswordsSize::new(usize::from(cols), usize::from(rows)));
-            self.last_parser_size = parser_size;
         }
 
         self.pending_resize = None;
@@ -453,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_retry_applies_a_retained_resize_without_advancing_the_parser_early() {
+    fn scheduled_retry_applies_a_retained_resize_after_the_parser_reflowed() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let applied_size = Arc::new(Mutex::new(None));
         let master = FailOnceMaster {
@@ -464,10 +469,12 @@ mod tests {
 
         let first = runtime.resize(100, 30, 800, 600);
         assert!(first.is_err());
+        // The parser follows the committed layout immediately; only the
+        // child-facing PTY notification is retried.
         assert_eq!(runtime.last_pty_size, (80, 24, 0, 0));
-        assert_eq!(runtime.last_parser_size, (80, 24));
-        assert_eq!(runtime.term.columns(), 80);
-        assert_eq!(runtime.term.screen_lines(), 24);
+        assert_eq!(runtime.last_parser_size, (100, 30));
+        assert_eq!(runtime.term.columns(), 100);
+        assert_eq!(runtime.term.screen_lines(), 30);
         assert_eq!(runtime.pending_resize, Some((100, 30, 800, 600)));
 
         let mut app = bevy::prelude::App::new();
