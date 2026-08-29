@@ -300,8 +300,11 @@ impl TerminalSurface {
     }
 
     /// Returns the rendered cell size in logical pixels.
+    ///
+    /// Always at least 1x1: every writer of `cell_size` (the constructor and
+    /// `update_render_output`) floors it, so consumers need no re-clamp.
     pub fn char_dimensions(&self) -> Vec2 {
-        self.cell_size.max(Vec2::ONE)
+        self.cell_size
     }
 
     /// Whether the renderer has supplied authoritative font and cell metrics.
@@ -334,8 +337,9 @@ impl TerminalSurface {
 
     /// Adopts the metrics and stable image handle produced by the Bevy renderer.
     pub(crate) fn update_render_output(&mut self, texture: &TerminalTexture) -> bool {
-        // Compare the clamped values that are stored, so a sub-1.0 input
-        // cannot latch `changed` permanently.
+        // This is the single adoption boundary for renderer metrics: floor
+        // them here once, and compare the clamped values that are stored, so a
+        // sub-1.0 input cannot latch `changed` permanently.
         let cell_size = texture.cell_size.max(Vec2::ONE);
         let render_scale = texture.raster_scale.max(1.0);
         let changed = self.image_handle.as_ref() != Some(&texture.image)

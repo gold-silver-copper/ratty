@@ -830,7 +830,11 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
 
 /// Seconds to wait for a measured, correctly sized terminal texture before
 /// showing the window anyway.
-const WINDOW_REVEAL_FALLBACK_SECS: f32 = 2.0;
+///
+/// Generous enough that a slow-but-healthy startup (debug build, large font
+/// collection) reveals through the normal measured path first; the fallback
+/// only exists so a font that never shapes cannot leave a headless process.
+const WINDOW_REVEAL_FALLBACK_SECS: f32 = 10.0;
 
 /// Reveals the primary window if the renderer never produces a matching
 /// measured texture.
@@ -839,17 +843,27 @@ const WINDOW_REVEAL_FALLBACK_SECS: f32 = 2.0;
 /// it once the first correctly sized texture exists. If font measurement
 /// fails (for example, no usable system fonts), that never happens; degrade
 /// to a visible window instead of a silent headless process.
+///
+/// One-shot: once the window has been visible — through either path — the
+/// system disarms permanently, so a later intentional hide is never reverted.
 pub(crate) fn reveal_window_fallback(
-    time: Res<Time>,
+    time: Res<Time<Real>>,
     mut primary_window: Query<&mut Window, With<PrimaryWindow>>,
     mut hidden_for: Local<f32>,
+    mut disarmed: Local<bool>,
 ) {
+    if *disarmed {
+        return;
+    }
     let Ok(mut window) = primary_window.single_mut() else {
         return;
     };
     if window.visible {
+        *disarmed = true;
         return;
     }
+    // Real (wall-clock) time: virtual time clamps long blocking frames to
+    // `max_delta`, which would stretch the deadline past its meaning.
     *hidden_for += time.delta_secs();
     if *hidden_for < WINDOW_REVEAL_FALLBACK_SECS {
         return;
@@ -858,6 +872,7 @@ pub(crate) fn reveal_window_fallback(
         "no measured terminal texture after {WINDOW_REVEAL_FALLBACK_SECS}s; showing the window anyway"
     );
     window.visible = true;
+    *disarmed = true;
 }
 
 #[derive(SystemParam)]
