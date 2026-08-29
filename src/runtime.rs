@@ -289,13 +289,15 @@ impl TerminalRuntime {
         }
 
         self.pending_resize = Some((cols, rows, pw, ph));
-        self.retry_pending_resize()
+        self.retry_pending_resize().map(drop)
     }
 
     /// Retries the most recently requested resize, if one remains pending.
-    pub(crate) fn retry_pending_resize(&mut self) -> anyhow::Result<()> {
+    ///
+    /// Returns `true` when a pending resize was applied.
+    pub(crate) fn retry_pending_resize(&mut self) -> anyhow::Result<bool> {
         let Some(pty_size @ (cols, rows, pw, ph)) = self.pending_resize else {
-            return Ok(());
+            return Ok(false);
         };
 
         if self.last_pty_size != pty_size {
@@ -323,7 +325,7 @@ impl TerminalRuntime {
         }
 
         self.pending_resize = None;
-        Ok(())
+        Ok(true)
     }
 
     /// Returns the active kitty keyboard enhancement flags.
@@ -469,6 +471,7 @@ mod tests {
         assert_eq!(runtime.pending_resize, Some((100, 30, 800, 600)));
 
         let mut app = bevy::prelude::App::new();
+        app.init_resource::<crate::terminal::TerminalRedrawState>();
         app.insert_resource(runtime).add_systems(
             bevy::prelude::Update,
             crate::systems::retry_pending_terminal_resize,

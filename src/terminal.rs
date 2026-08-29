@@ -334,14 +334,18 @@ impl TerminalSurface {
 
     /// Adopts the metrics and stable image handle produced by the Bevy renderer.
     pub(crate) fn update_render_output(&mut self, texture: &TerminalTexture) -> bool {
+        // Compare the clamped values that are stored, so a sub-1.0 input
+        // cannot latch `changed` permanently.
+        let cell_size = texture.cell_size.max(Vec2::ONE);
+        let render_scale = texture.raster_scale.max(1.0);
         let changed = self.image_handle.as_ref() != Some(&texture.image)
             || self.rendered_texture_size != Some(texture.size)
-            || self.cell_size != texture.cell_size
-            || self.render_scale != texture.raster_scale;
+            || self.cell_size != cell_size
+            || self.render_scale != render_scale;
         self.image_handle = Some(texture.image.clone());
         self.rendered_texture_size = Some(texture.size);
-        self.cell_size = texture.cell_size.max(Vec2::ONE);
-        self.render_scale = texture.raster_scale.max(1.0);
+        self.cell_size = cell_size;
+        self.render_scale = render_scale;
         changed
     }
 }
@@ -1108,6 +1112,25 @@ mod tests {
 
         texture.size.x += 12;
         assert!(terminal.update_render_output(&texture));
+    }
+
+    #[test]
+    fn sub_pixel_cell_metrics_do_not_latch_renderer_output_changes() {
+        let mut terminal = TerminalSurface::new(&AppConfig::default()).expect("terminal");
+        let texture = TerminalTexture {
+            image: Handle::default(),
+            size: UVec2::new(800, 600),
+            logical_size: Vec2::new(800.0, 600.0),
+            raster_scale: 0.5,
+            cell_size: Vec2::new(0.5, 0.75),
+            font_size: 1.0,
+        };
+
+        assert!(terminal.update_render_output(&texture));
+        assert!(
+            !terminal.update_render_output(&texture),
+            "clamped metrics must compare equal on the second adoption"
+        );
     }
 
     #[test]
