@@ -46,7 +46,7 @@ image = { version = "0.25", default-features = false, features = ["png", "ico"] 
 # Git and binary builds use the renderer's automatic cell-metric fix. Cargo
 # replaces git sources with the compatible registry version when packaging;
 # build.rs enables Ratty's own measured-advance adapter for that source only.
-bevy_terminal_ratatui = { version = "0.7.0", git = "https://github.com/gold-silver-copper/bevy_terminal.git", rev = "2192e8a93b54e09119bd790a1263373db8fec4fa", default-features = false, features = ["system_fonts"] }
+bevy_terminal_ratatui = { version = "=0.7.0", git = "https://github.com/gold-silver-copper/bevy_terminal.git", rev = "2192e8a93b54e09119bd790a1263373db8fec4fa", default-features = false, features = ["system_fonts"] }
 portable-pty = "0.8"
 ratatui = "0.30"
 read-fonts = "0.39.2"
