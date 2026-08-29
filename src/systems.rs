@@ -319,9 +319,16 @@ pub(crate) fn handle_window_resize(
 ///
 /// The request site emits the warning. Later attempts run quietly at normal
 /// log levels so a persistent platform error cannot flood the log every frame.
-pub(crate) fn retry_pending_terminal_resize(mut runtime: ResMut<TerminalRuntime>) {
-    if let Err(error) = runtime.retry_pending_resize() {
-        trace!("terminal resize retry remains pending: {error:#}");
+pub(crate) fn retry_pending_terminal_resize(
+    mut runtime: ResMut<TerminalRuntime>,
+    mut redraw: ResMut<TerminalRedrawState>,
+) {
+    match runtime.retry_pending_resize() {
+        // The parser grid only reflowed now, so the retry owns the redraw the
+        // original request could not deliver.
+        Ok(true) => redraw.request(),
+        Ok(false) => {}
+        Err(error) => trace!("terminal resize retry remains pending: {error:#}"),
     }
 }
 
@@ -780,14 +787,25 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     let (Ok(texture), Ok(mut window)) = (textures.single(), primary_window.single_mut()) else {
         return;
     };
+    // The renderer inserts a provisional texture with a 1x1 logical cell
+    // before the font face has shaped. Adopting it would divide the window by
+    // that placeholder cell and reflow the PTY to one cell per pixel, so wait
+    // for measured geometry before treating the texture as authoritative.
+    if !texture.cell_size.cmpgt(Vec2::ONE).all() {
+        return;
+    }
+    // Minimizing the window reports a 0x0 size. Skip the reflow (mirroring
+    // `handle_window_resize`) so a texture change landing on that frame does
+    // not collapse the terminal to a degenerate grid.
+    let window_size = window.resolution.size();
+    if window_size.x < 1.0 || window_size.y < 1.0 {
+        return;
+    }
     if !terminal.update_render_output(texture) {
         return;
     }
     let previous_grid = (terminal.cols, terminal.rows);
-    let layout = terminal.resize_to_fit(
-        window.resolution.size().max(Vec2::ONE),
-        texture.raster_scale,
-    );
+    let layout = terminal.resize_to_fit(window_size, texture.raster_scale);
     let pty_pixels = layout.pty_pixels();
     if let Err(error) = runtime.resize(
         layout.cols,
@@ -808,6 +826,38 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     if !window.visible && texture.size == terminal.pixmap_dimensions() {
         window.visible = true;
     }
+}
+
+/// Seconds to wait for a measured, correctly sized terminal texture before
+/// showing the window anyway.
+const WINDOW_REVEAL_FALLBACK_SECS: f32 = 2.0;
+
+/// Reveals the primary window if the renderer never produces a matching
+/// measured texture.
+///
+/// The window starts hidden and `sync_terminal_render_output` normally shows
+/// it once the first correctly sized texture exists. If font measurement
+/// fails (for example, no usable system fonts), that never happens; degrade
+/// to a visible window instead of a silent headless process.
+pub(crate) fn reveal_window_fallback(
+    time: Res<Time>,
+    mut primary_window: Query<&mut Window, With<PrimaryWindow>>,
+    mut hidden_for: Local<f32>,
+) {
+    let Ok(mut window) = primary_window.single_mut() else {
+        return;
+    };
+    if window.visible {
+        return;
+    }
+    *hidden_for += time.delta_secs();
+    if *hidden_for < WINDOW_REVEAL_FALLBACK_SECS {
+        return;
+    }
+    warn!(
+        "no measured terminal texture after {WINDOW_REVEAL_FALLBACK_SECS}s; showing the window anyway"
+    );
+    window.visible = true;
 }
 
 #[derive(SystemParam)]
