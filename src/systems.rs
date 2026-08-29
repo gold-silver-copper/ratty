@@ -289,14 +289,11 @@ pub(crate) fn handle_window_resize(
 
     // Before the first TerminalTexture arrives, no authoritative cell
     // dimensions exist. The first measured-output sync uses the current
-    // window, so dropping the event loses nothing — unless measurement never
-    // succeeds, in which case say so once instead of swallowing resizes
-    // silently for the life of the degraded session.
+    // window, so dropping the event loses nothing. (The OS delivers a resize
+    // at window creation on healthy startups too, so no warning here; a
+    // session where measurement never succeeds is reported by
+    // `reveal_window_fallback`.)
     if !terminal.is_measured() {
-        warn_once!(
-            "window resized before any font was measured; the terminal keeps its \
-             configured grid until measurement succeeds"
-        );
         return;
     }
 
@@ -493,7 +490,12 @@ pub(crate) fn sync_terminal_renderer_config(
     let needs_system_font = configured_faces
         .as_deref()
         .is_none_or(|configured| configured.uses_system_family);
-    if needs_system_font && font_cx.collection.family_by_name(system_family).is_none() {
+    let family_available = font_cx
+        .bypass_change_detection()
+        .collection
+        .family_by_name(system_family)
+        .is_some();
+    if needs_system_font && !family_available {
         warn_once!(
             "configured font family {:?} is unavailable; using the generic monospace family",
             system_family
@@ -808,6 +810,8 @@ pub(crate) struct SyncRenderOutputParams<'w, 's> {
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
     frame_dirty: ResMut<'w, TerminalFrameDirty>,
     renderer_ready: Res<'w, TerminalRendererReady>,
+    #[cfg(not(bevy_terminal_automatic_metrics))]
+    render_configs: Query<'w, 's, &'static TerminalRenderConfig, With<TerminalRenderTarget>>,
 }
 
 /// Adopts the renderer-owned texture and reflows the PTY when measured font
@@ -824,6 +828,8 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
         plane_back_query,
         frame_dirty,
         renderer_ready,
+        #[cfg(not(bevy_terminal_automatic_metrics))]
+        render_configs,
     } = &mut params;
     let (Ok(texture), Ok(mut window)) = (textures.single(), primary_window.single_mut()) else {
         return;
@@ -838,16 +844,24 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
         return;
     }
     // The packaged (registry) renderer cannot measure cells itself: Ratty's
-    // adapter pushes a measured CellSizing::Logical config, and until the
-    // renderer has re-rastered with exactly that cell, the texture still
-    // carries the estimate — adopting it would cause the visible double
-    // reflow the hidden-window startup exists to prevent.
+    // adapter pushes a measured CellSizing::Logical config onto the renderer
+    // entity (the surface's own copy stays FROM_FONT), and until the renderer
+    // has re-rastered with that cell, the texture still carries the estimate
+    // — adopting it would cause the visible double reflow the hidden-window
+    // startup exists to prevent. Compare within half a physical pixel: the
+    // renderer snaps the pushed cell to whole physical pixels, and bit-exact
+    // f32 equality would silently wedge adoption if its rounding ever drifts
+    // from the adapter's.
     #[cfg(not(bevy_terminal_automatic_metrics))]
     {
-        let CellSizing::Logical(cell) = terminal.render_config().cell_size else {
+        let Ok(pushed_config) = render_configs.single() else {
             return;
         };
-        if texture.cell_size != cell {
+        let CellSizing::Logical(cell) = pushed_config.cell_size else {
+            return;
+        };
+        let tolerance = 0.5 / texture.raster_scale.max(1.0);
+        if (texture.cell_size - cell).abs().max_element() > tolerance {
             return;
         }
     }
@@ -863,7 +877,7 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     if !terminal.render_output_changed(texture) {
         return;
     }
-    terminal.update_render_output(texture);
+    terminal.apply_render_output(texture);
     let previous_grid = (terminal.cols, terminal.rows);
     let layout = reflow_terminal(terminal, runtime, window_size, texture.raster_scale);
     sync_terminal_layout(layout, viewport, plane_query, plane_back_query);

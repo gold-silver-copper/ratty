@@ -275,10 +275,12 @@ impl TerminalRuntime {
 
     /// Resizes the PTY and parser screen.
     ///
-    /// The PTY cache is committed only after the operating-system resize
-    /// succeeds. This keeps an identical request retryable after a transient
-    /// failure and prevents the parser from adopting geometry the child did
-    /// not receive.
+    /// The parser adopts the new grid immediately so local rendering, the
+    /// viewport, and mouse mapping always track the committed layout. Only
+    /// the operating-system PTY resize is cached for retry after a failure,
+    /// so until it succeeds the child still holds — and may emit output for —
+    /// the previous geometry; `last_parser_size` is not a proxy for the
+    /// child's winsize while a resize is pending.
     ///
     /// # Errors
     ///

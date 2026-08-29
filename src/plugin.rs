@@ -2,7 +2,8 @@
 
 use bevy::prelude::*;
 use bevy_terminal_ratatui::prelude::{
-    TerminalPlugin as BevyTerminalPlugin, TerminalSystems as BevyTerminalSystems,
+    TerminalPlugin as BevyTerminalPlugin, TerminalRenderConfig,
+    TerminalSystems as BevyTerminalSystems,
 };
 
 use crate::camera::{
@@ -29,21 +30,38 @@ use crate::systems::{
     sync_asset_to_terminal_cursor, sync_inline_objects, sync_rgp_objects, sync_terminal_materials,
     sync_terminal_render_output, sync_terminal_renderer_config,
 };
-use crate::terminal::{ConfiguredFontFaces, TerminalRedrawState, TerminalSurface};
+use crate::terminal::{
+    ConfiguredFontFaces, TerminalRedrawState, TerminalRenderTarget, TerminalSurface,
+};
 
 /// Whether any input of `sync_terminal_renderer_config` changed this frame,
 /// so the per-frame config clone and font-collection lookup only run when
 /// they can produce a different result.
+///
+/// The surface is watched through its render-config revision rather than
+/// resource-level `is_changed`, which every widget redraw would trip; the
+/// font collection (`FontCx`) is watched so a Monospace fallback chosen
+/// before a family registered is revisited; and a freshly spawned renderer
+/// target re-arms the sync even when the triggering change ticks were
+/// consumed before the entity existed.
 fn renderer_config_inputs_changed(
     app_config: Res<AppConfig>,
     terminal: Res<TerminalSurface>,
     configured_faces: Option<Res<ConfiguredFontFaces>>,
     font_assets: Res<Assets<bevy::text::Font>>,
+    font_cx: Res<bevy::text::FontCx>,
+    fresh_targets: Query<(), (With<TerminalRenderTarget>, Added<TerminalRenderConfig>)>,
+    mut last_revision: Local<Option<u32>>,
 ) -> bool {
+    let revision = terminal.render_config_revision();
+    let revision_changed = *last_revision != Some(revision);
+    *last_revision = Some(revision);
     app_config.is_changed()
-        || terminal.is_changed()
+        || revision_changed
         || configured_faces.is_some_and(|faces| faces.is_changed())
         || font_assets.is_changed()
+        || font_cx.is_changed()
+        || !fresh_targets.is_empty()
 }
 
 /// Inline object entities spawned since the visibility pass last ran.

@@ -189,6 +189,7 @@ pub struct TerminalSurface {
     pub rows: u16,
     cursor_model_visible: bool,
     font_size: i32,
+    render_config_revision: u32,
     render_config: TerminalRenderConfig,
     render_scale: f32,
     cell_size: Vec2,
@@ -229,6 +230,7 @@ impl TerminalSurface {
             rows,
             cursor_model_visible: config.cursor.model.visible,
             font_size: config.font.size,
+            render_config_revision: 0,
             render_config,
             render_scale,
             // No geometry is inferred before the renderer measures the loaded font.
@@ -246,6 +248,7 @@ impl TerminalSurface {
 
         self.render_config.font_size = FontSizing::Px(points_to_logical_pixels(new_size));
         self.font_size = new_size;
+        self.render_config_revision = self.render_config_revision.wrapping_add(1);
         true
     }
 
@@ -263,6 +266,7 @@ impl TerminalSurface {
 
         self.render_scale = render_scale;
         self.render_config.raster.scale = TerminalRenderScale::Fixed(render_scale);
+        self.render_config_revision = self.render_config_revision.wrapping_add(1);
         true
     }
 
@@ -301,7 +305,7 @@ impl TerminalSurface {
     /// Returns the rendered cell size in logical pixels.
     ///
     /// Always at least 1x1: every writer of `cell_size` (the constructor and
-    /// `update_render_output`) floors it, so consumers need no re-clamp.
+    /// `apply_render_output`) floors it, so consumers need no re-clamp.
     pub fn char_dimensions(&self) -> Vec2 {
         self.cell_size
     }
@@ -334,17 +338,23 @@ impl TerminalSurface {
         &self.render_config
     }
 
-    /// Adopts the metrics and stable image handle produced by the Bevy renderer.
-    pub(crate) fn update_render_output(&mut self, texture: &TerminalTexture) -> bool {
-        if !self.render_output_changed(texture) {
-            return false;
-        }
+    /// Monotonic counter bumped whenever [`Self::render_config`] mutates.
+    ///
+    /// A narrower change signal than resource-level `is_changed`, which also
+    /// trips on every widget redraw through the same `ResMut`.
+    pub(crate) const fn render_config_revision(&self) -> u32 {
+        self.render_config_revision
+    }
+
+    /// Adopts the metrics and stable image handle produced by the Bevy
+    /// renderer. Callers gate on [`Self::render_output_changed`] first, so
+    /// the change contract lives in exactly one comparator.
+    pub(crate) fn apply_render_output(&mut self, texture: &TerminalTexture) {
         let (cell_size, render_scale) = clamped_render_metrics(texture);
         self.image_handle = Some(texture.image.clone());
         self.rendered_texture_size = Some(texture.size);
         self.cell_size = cell_size;
         self.render_scale = render_scale;
-        true
     }
 
     /// Whether adopting `texture` would change the stored presentation
@@ -471,14 +481,19 @@ impl Widget for TerminalWidget<'_> {
                 let square = grid_row[Column(usize::from(col))];
                 let cell = &mut buf[(area.x + col, area.y + row)];
 
-                // Ratatui's backend diff skips the trailing cell of a width-2
-                // symbol unconditionally, and the renderer reconstructs the
-                // continuation from the wide anchor's style — a style written
-                // here can never render, so the anchor branch below owns the
-                // selection highlight for both columns.
+                // When a Spacer trails a wide anchor, ratatui's backend diff
+                // skips it and the renderer copies the anchor's style, so the
+                // anchor branch below owns that highlight. But rio-vt can
+                // orphan a spacer (e.g. ESC[1K blanks the cells before it
+                // without touching it); behind a narrow predecessor the diff
+                // does emit this cell, so style it fully — including its own
+                // selection highlight.
                 if matches!(square.wide(), Wide::Spacer) {
-                    let style =
+                    let mut style =
                         square_style(styles, square, &theme_palette, theme_fg, self.font_style);
+                    if selection.is_some_and(|bounds| bounds.contains(row, col)) {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
                     cell.set_symbol(" ")
                         .set_style(style)
                         .set_diff_option(forced_width(1));
@@ -1023,7 +1038,8 @@ mod tests {
 
         let cell_size = texture.cell_size;
         let mut terminal = app.world_mut().resource_mut::<TerminalSurface>();
-        assert!(terminal.update_render_output(&texture));
+        assert!(terminal.render_output_changed(&texture));
+        terminal.apply_render_output(&texture);
         let layout = terminal.resize_to_fit(cell_size * Vec2::new(4.9, 3.9), 1.0);
         assert_eq!((layout.cols, layout.rows), (4, 3));
     }
@@ -1119,11 +1135,13 @@ mod tests {
             font_size: 20.0,
         };
 
-        assert!(terminal.update_render_output(&texture));
-        assert!(!terminal.update_render_output(&texture));
+        assert!(terminal.render_output_changed(&texture));
+        terminal.apply_render_output(&texture);
+        assert!(!terminal.render_output_changed(&texture));
 
         texture.size.x += 12;
-        assert!(terminal.update_render_output(&texture));
+        assert!(terminal.render_output_changed(&texture));
+        terminal.apply_render_output(&texture);
     }
 
     #[test]
@@ -1138,9 +1156,10 @@ mod tests {
             font_size: 1.0,
         };
 
-        assert!(terminal.update_render_output(&texture));
+        assert!(terminal.render_output_changed(&texture));
+        terminal.apply_render_output(&texture);
         assert!(
-            !terminal.update_render_output(&texture),
+            !terminal.render_output_changed(&texture),
             "clamped metrics must compare equal on the second adoption"
         );
     }
@@ -1156,7 +1175,8 @@ mod tests {
             cell_size: Vec2::new(12.0, 24.0),
             font_size: 20.0,
         };
-        assert!(terminal.update_render_output(&texture));
+        assert!(terminal.render_output_changed(&texture));
+        terminal.apply_render_output(&texture);
 
         assert!(terminal.set_render_scale(2.0));
         assert_eq!(terminal.char_dimensions(), Vec2::new(12.0, 24.0));

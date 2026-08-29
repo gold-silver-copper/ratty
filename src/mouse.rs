@@ -219,6 +219,17 @@ impl TerminalSelection {
                     }
                     let pos = vt::visible_pos(term, row, col);
                     if vt::is_wide_spacer(&term.grid, pos) {
+                        // The highlight renders a wide glyph as one unit, so a
+                        // selection starting on its trailing spacer includes
+                        // the glyph in the copied text too; spacers inside the
+                        // range are covered by their anchor and skipped.
+                        if col == row_start && col > 0 {
+                            vt::push_cell_text(
+                                &mut out,
+                                &term.grid,
+                                vt::visible_pos(term, row, col - 1),
+                            );
+                        }
                         continue;
                     }
 
