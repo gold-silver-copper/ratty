@@ -100,8 +100,14 @@ jobs:
       # the packaged tests too — they contain cfg'd packaged-source branches.
       - name: Verify the package builds against registry dependencies
         run: cargo package
+      # Point CARGO_TARGET_DIR at the workspace target dir so this reuses the
+      # artifacts the verify step just built instead of cold-building Bevy in
+      # the nested dir cargo package wipes each run.
       - name: Test the packaged crate against registry dependencies
-        run: cargo test --lib --manifest-path target/package/ratty-0.5.0/Cargo.toml
+        run: |
+          version="$(cargo pkgid | sed -E 's/.*#(.*@)?//')"
+          CARGO_TARGET_DIR="$PWD/target" \
+            cargo test --lib --manifest-path "target/package/ratty-$version/Cargo.toml"
 
   test:
     name: Test library
