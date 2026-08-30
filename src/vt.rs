@@ -217,6 +217,21 @@ pub fn is_wide_spacer(grid: &Grid<Square>, pos: Pos) -> bool {
     matches!(grid[pos].wide(), Wide::Spacer)
 }
 
+/// Whether a cell is the leading anchor of a width-2 glyph.
+pub fn is_wide_anchor(grid: &Grid<Square>, pos: Pos) -> bool {
+    matches!(grid[pos].wide(), Wide::Wide)
+}
+
+/// Appends a cell's text, or a space when the cell is blank — rio-vt stores
+/// blank cells as NUL, not as a space.
+pub fn push_cell_text_or_space(out: &mut String, grid: &Grid<Square>, pos: Pos) {
+    let before = out.len();
+    push_cell_text(out, grid, pos);
+    if out.len() == before {
+        out.push(' ');
+    }
+}
+
 /// Returns the grid position of a visible `(row, col)`.
 pub fn visible_pos(term: &VtTerminal, row: u16, col: u16) -> Pos {
     let offset = i32::try_from(term.display_offset()).unwrap_or(i32::MAX);
@@ -246,12 +261,7 @@ pub fn visible_row_texts(term: &VtTerminal) -> Vec<String> {
                 if is_wide_spacer(&term.grid, pos) {
                     continue;
                 }
-                let before = out.len();
-                push_cell_text(&mut out, &term.grid, pos);
-                if out.len() == before {
-                    // Blank cells are stored as NUL rather than a space.
-                    out.push(' ');
-                }
+                push_cell_text_or_space(&mut out, &term.grid, pos);
             }
             let trimmed = out.trim_end();
             out.truncate(trimmed.len());
@@ -328,8 +338,11 @@ pub fn resolve_color(color: AnsiColor) -> CellColor {
     }
 }
 
-/// Foreground colour, background colour, and attribute flags for a cell.
-pub fn cell_attributes(styles: &[Style], square: Square) -> (CellColor, CellColor, StyleFlags) {
+/// Foreground, background, optional underline colour, and attribute flags for a cell.
+pub fn cell_attributes(
+    styles: &[Style],
+    square: Square,
+) -> (CellColor, CellColor, Option<CellColor>, StyleFlags) {
     match square.content_tag() {
         ContentTag::Codepoint => {
             let style = styles
@@ -339,12 +352,14 @@ pub fn cell_attributes(styles: &[Style], square: Square) -> (CellColor, CellColo
             (
                 resolve_color(style.fg),
                 resolve_color(style.bg),
+                style.underline_color.map(resolve_color),
                 style.flags,
             )
         }
         ContentTag::BgPalette => (
             CellColor::Default,
             CellColor::Indexed(square.bg_palette_index()),
+            None,
             StyleFlags::empty(),
         ),
         ContentTag::BgRgb => {
@@ -352,6 +367,7 @@ pub fn cell_attributes(styles: &[Style], square: Square) -> (CellColor, CellColo
             (
                 CellColor::Default,
                 CellColor::Rgb(r, g, b),
+                None,
                 StyleFlags::empty(),
             )
         }
@@ -888,17 +904,20 @@ mod tests {
     #[test]
     fn cell_attributes_read_truecolor_and_flags() {
         let mut harness = Harness::new(3, 20);
-        harness.feed(b"\x1b[1;3;4;7;38;2;10;20;30;48;5;99mX");
+        harness.feed(b"\x1b[1;3;4;7;8;9;38;2;10;20;30;48;5;99;58;2;1;2;3mX");
 
         let row = visible_row(&harness.term, 0).expect("row 0");
-        let (fg, bg, flags) = cell_attributes(styles(&harness.term), row[Column(0)]);
+        let (fg, bg, underline, flags) = cell_attributes(styles(&harness.term), row[Column(0)]);
 
         assert_eq!(fg, CellColor::Rgb(10, 20, 30));
         assert_eq!(bg, CellColor::Indexed(99));
+        assert_eq!(underline, Some(CellColor::Rgb(1, 2, 3)));
         assert!(flags.contains(StyleFlags::BOLD));
         assert!(flags.contains(StyleFlags::ITALIC));
         assert!(flags.intersects(StyleFlags::ALL_UNDERLINES));
         assert!(flags.contains(StyleFlags::INVERSE));
+        assert!(flags.contains(StyleFlags::HIDDEN));
+        assert!(flags.contains(StyleFlags::STRIKEOUT));
     }
 
     /// rio-vt models `modifyOtherKeys` itself now, so ratty reads it from the

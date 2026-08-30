@@ -1,7 +1,7 @@
 fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=assets/ratty.ico");
     println!("cargo:rerun-if-changed=build.rs");
-
+    println!("cargo:rerun-if-changed=Cargo.toml");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return Ok(());
     }

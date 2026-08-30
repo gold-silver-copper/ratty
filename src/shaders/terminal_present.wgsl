@@ -3,7 +3,7 @@
 // A fullscreen (clip-space) quad covers the viewport; each fragment samples the
 // terminal texture by its own physical pixel coordinate via `textureLoad`, so
 // every texel maps to exactly one screen pixel with no resampling — the crisp
-// presentation pattern from linebender/bevy_vello, specialized to a centered,
+// render-target presentation pattern specialized to a centered,
 // pixel-aligned sub-rect (the terminal grid does not always fill the window).
 #import bevy_render::view::View
 #import bevy_sprite::mesh2d_vertex_output::VertexOutput
@@ -26,11 +26,9 @@ fn vertex(in: Vertex) -> VertexOutput {
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_size = vec2<f32>(textureDimensions(terminal_texture));
-    // Normally center the texture in the viewport. But when it is taller than
-    // the viewport (only at the clamped 2-row minimum, when the window is too
-    // short to show both rows), anchor to the bottom edge instead so the last
-    // terminal row stays visible and the top row clips first. Snapped to a whole
-    // physical pixel.
+    // Normally center the texture in the viewport. If it is taller than the
+    // viewport at the terminal's one-cell minimum, anchor to the bottom edge so
+    // the last row stays visible and clips at the top. Snapped to a whole pixel.
     let origin_x = view.viewport.x + floor((view.viewport.z - tex_size.x) * 0.5);
     let centered_y = view.viewport.y + floor((view.viewport.w - tex_size.y) * 0.5);
     let bottom_y = view.viewport.y + view.viewport.w - tex_size.y;

@@ -249,7 +249,7 @@ impl KittyTransfer {
                     return None;
                 }
                 let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-                for rgb in self.bytes.chunks_exact(3) {
+                for rgb in self.bytes.as_chunks::<3>().0 {
                     rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
                 }
                 (width, height, rgba)
@@ -314,7 +314,7 @@ pub fn refresh_kitty_placeholder_anchors(
             if square.c() != '\u{10EEEE}' {
                 continue;
             }
-            let (fg, _, _) = vt::cell_attributes(styles, square);
+            let (fg, _, _, _) = vt::cell_attributes(styles, square);
             let CellColor::Rgb(r, g, b) = fg else {
                 continue;
             };

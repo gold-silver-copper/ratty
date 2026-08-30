@@ -1036,7 +1036,7 @@ impl MeshPrimitive {
                 normal[0], normal[1], normal[2],
             ));
         }
-        for triangle in self.indices.chunks_exact(3) {
+        for triangle in self.indices.as_chunks::<3>().0 {
             let a = usize::from(triangle[0]);
             let b = usize::from(triangle[1]);
             let c = usize::from(triangle[2]);
@@ -1079,4 +1079,10 @@ fn emit_sequence(buf: &mut Buffer, x: u16, y: u16, sequence: &str) {
     symbol.push_str(sequence);
     symbol.push_str(existing);
     cell.set_symbol(&symbol);
+    // The escape prefix prints nothing; only the retained symbol occupies the
+    // cell. Tell the diff so it does not skip the sequence's string width in
+    // following cells (ratatui-core >= 0.1.2 semantics).
+    cell.set_diff_option(ratatui::buffer::CellDiffOption::ForcedWidth(
+        std::num::NonZeroU16::MIN,
+    ));
 }

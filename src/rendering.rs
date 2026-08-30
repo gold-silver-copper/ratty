@@ -52,14 +52,13 @@ pub fn sync_terminal_debug_image(
 /// Synchronizes an image handle across plane materials.
 ///
 /// Re-binds the texture on every call rather than only when the handle changes.
-/// The terminal plane textures are rebuilt on the GPU as the terminal updates:
-/// the back debug texture is re-uploaded each redraw, and the front present
-/// texture's GPU image is recreated whenever the terminal resizes. Either rebuild
-/// leaves a material's cached bind group pointing at a stale texture, so the plane
-/// freezes (front) or blanks (back) until the material is re-prepared.
+/// The back debug texture is re-uploaded each redraw, and the front terminal
+/// texture's GPU image is reallocated in place whenever the renderer remeasures
+/// the grid. Either rebuild can leave a material's cached bind group pointing at
+/// a stale texture until the material is re-prepared.
 /// Unconditionally re-binding re-prepares the bind group so the planes always
-/// sample the current texture. The caller only runs this on redraw frames (gated
-/// by the frame-dirty flag), so it is not per-frame churn.
+/// sample the current texture. The caller runs this on redraw frames or when
+/// entering 3-D, so it is not per-frame churn.
 pub fn sync_plane_texture<'a>(
     image_handle: Option<&Handle<Image>>,
     material_handles: impl IntoIterator<Item = &'a MeshMaterial3d<StandardMaterial>>,
@@ -128,7 +127,7 @@ impl<'a> CellDebugImageRenderer<'a> {
                 }
                 let square = grid_row[Column(col as usize)];
 
-                let (fg, bg, flags) = vt::cell_attributes(styles, square);
+                let (fg, bg, _, flags) = vt::cell_attributes(styles, square);
                 let bg = debug_color(bg).unwrap_or(DEBUG_BG_FALLBACK);
                 let fg = debug_color(fg).unwrap_or(DEBUG_FG_FALLBACK);
 
@@ -196,7 +195,7 @@ impl<'a> CellDebugImageRenderer<'a> {
     }
 
     fn fill(&mut self, color: Rgba) {
-        for pixel in self.data.chunks_exact_mut(4) {
+        for pixel in self.data.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&color);
         }
     }

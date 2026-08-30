@@ -72,6 +72,7 @@ fn main() -> io::Result<()> {
 - [`examples/draw.rs`](https://github.com/orhun/ratty/tree/main/widget/examples/draw.rs): 2D drawing pane with live 3D preview
 - [`examples/rubiks_cube.rs`](https://github.com/orhun/ratty/tree/main/widget/examples/rubiks_cube.rs): interactive 3D Rubik's cube
 - [`examples/mobius_chess.rs`](https://github.com/orhun/ratty/tree/main/widget/examples/mobius_chess.rs): 3D mobius strip chess board.
+- [`examples/renderer_fidelity.rs`](https://github.com/orhun/ratty/tree/main/widget/examples/renderer_fidelity.rs): scrollable visual coverage for blocks, box drawing, braille, international text, emoji, combining marks, styles, and colors
 
 ## License
 
