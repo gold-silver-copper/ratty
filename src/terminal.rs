@@ -694,6 +694,62 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn hidden_text_reaches_the_renderer_concealed() {
+        let mut term = Crosswords::new(
+            CrosswordsSize::new(20, 2),
+            CursorShape::Block,
+            TerminalEventSink::default(),
+            WindowId::from(0),
+            0,
+            1000,
+        );
+        Processor::default().advance(&mut term, b"ab\x1b[8mXY\x1b[28mcd");
+
+        // Widget output carries the modifier.
+        let area = Rect::new(0, 0, 20, 2);
+        let mut buffer = Buffer::empty(area);
+        TerminalWidget {
+            term: &term,
+            selection: &TerminalSelection::default(),
+            theme: &ThemeConfig::default(),
+            font_style: FontStyleConfig::Regular,
+        }
+        .render(area, &mut buffer);
+        assert!(
+            buffer[(2, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::HIDDEN),
+            "SGR 8 cell must reach the buffer with Modifier::HIDDEN"
+        );
+        assert!(
+            !buffer[(1, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::HIDDEN)
+        );
+        assert!(
+            !buffer[(4, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::HIDDEN)
+        );
+
+        // Backend translation preserves it for the renderer, which skips
+        // glyphs whose style is hidden.
+        let (mut tui, _) = RatatuiTerminal::new(20, 2);
+        draw_term(&mut tui, &term);
+        let snapshot = tui.surface().snapshot();
+        let hidden_cell = snapshot.cell((2, 0)).expect("cell");
+        assert!(
+            hidden_cell
+                .style
+                .has(bevy_terminal_ratatui::prelude::StyleFlags::HIDDEN),
+            "backend must hand the renderer StyleFlags::HIDDEN"
+        );
+    }
+
     /// Draws a terminal state through Ratatui's differential update path into
     /// the retained Bevy terminal surface.
     fn draw_term(tui: &mut RatatuiTerminal, term: &Crosswords<TerminalEventSink>) {
