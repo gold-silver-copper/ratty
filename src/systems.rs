@@ -833,15 +833,19 @@ fn opaque_rows(images: &Assets<Image>, texture: AssetId<Image>, rect: Rect) -> O
     Some(((first - y0) as u32, (last + 1 - y0) as u32))
 }
 
+/// The render target's texture and pushed config, present only once the
+/// renderer has signaled readiness.
+type ReadyTerminalTextureQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static TerminalTexture, &'static TerminalRenderConfig),
+    (With<TerminalRenderTarget>, With<TerminalRendererReady>),
+>;
+
 #[derive(SystemParam)]
 pub(crate) struct SyncRenderOutputParams<'w, 's> {
     primary_window: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
-    textures: Query<
-        'w,
-        's,
-        (&'static TerminalTexture, &'static TerminalRenderConfig),
-        (With<TerminalRenderTarget>, With<TerminalRendererReady>),
-    >,
+    textures: ReadyTerminalTextureQuery<'w, 's>,
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
