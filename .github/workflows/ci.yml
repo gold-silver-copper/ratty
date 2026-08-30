@@ -78,39 +78,6 @@ jobs:
       - name: Run cargo check
         run: cargo check --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }}
 
-  check-packaged-source:
-    name: Check packaged-source cfg paths
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install system dependencies
-        uses: ./.github/actions/install-linux-deps
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
-      - name: Check with git-source cfgs forced off
-        env:
-          RATTY_PACKAGED_SOURCE: "1"
-        run: cargo check --all-targets --locked
-      # `cargo package` strips the git sources and verifies the packaged crate
-      # against the crates.io releases, catching API drift the fork-based
-      # check above cannot see. Its verify step builds only lib/bins, so run
-      # the packaged tests too — they contain cfg'd packaged-source branches.
-      - name: Verify the package builds against registry dependencies
-        run: cargo package
-      # Point CARGO_TARGET_DIR at the workspace target dir so this reuses the
-      # artifacts the verify step just built instead of cold-building Bevy in
-      # the nested dir cargo package wipes each run.
-      - name: Test the packaged crate against registry dependencies
-        run: |
-          set -o pipefail
-          version="$(cargo metadata --no-deps --format-version 1 \
-            | jq -er '.packages[] | select(.name == "ratty").version')"
-          CARGO_TARGET_DIR="$PWD/target" \
-            cargo test --lib --manifest-path "target/package/ratty-$version/Cargo.toml"
-
   test:
     name: Test library
     runs-on: ubuntu-latest

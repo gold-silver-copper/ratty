@@ -10,6 +10,10 @@ repository = "https://github.com/orhun/ratty"
 keywords = ["terminal", "emulator", "3d", "graphics"]
 categories = ["command-line-utilities", "graphics"]
 edition = "2024"
+# Ratty depends on git forks (rio-vt blink preservation, bevy_terminal
+# automatic cell metrics) whose features have no registry release yet, so a
+# crates.io package cannot build correctly.
+publish = false
 exclude = ["website/**", ".github/**", "widget/**"]
 
 [dependencies]
@@ -43,9 +47,6 @@ bevy = { version = "0.19.0", default-features = false, features = [
 clap = { version = "4.5", features = ["derive"] }
 etcetera = "0.11"
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
-# Git and binary builds use the renderer's automatic cell-metric fix. Cargo
-# replaces git sources with the compatible registry version when packaging;
-# build.rs enables Ratty's own measured-advance adapter for that source only.
 bevy_terminal_ratatui = { version = "=0.7.0", git = "https://github.com/gold-silver-copper/bevy_terminal.git", rev = "2192e8a93b54e09119bd790a1263373db8fec4fa", default-features = false, features = ["system_fonts"] }
 portable-pty = "0.8"
 ratatui = "0.30"

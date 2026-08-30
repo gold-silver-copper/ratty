@@ -26,11 +26,8 @@ use crate::mouse::TerminalSelection;
 use crate::vt::{self, CellColor, VtTerminal};
 
 // rio-vt 0.5.19 has spare style bits but no named blink flags. The pinned fork
-// assigns these bits and preserves SGR 5/6/25. Cargo packages use the unpatched
-// registry source, so build.rs disables this mapping for that fallback.
-#[cfg(rio_vt_sgr_blink)]
+// assigns these bits and preserves SGR 5/6/25.
 const VT_SLOW_BLINK: StyleFlags = StyleFlags::from_bits_retain(1 << 11);
-#[cfg(rio_vt_sgr_blink)]
 const VT_RAPID_BLINK: StyleFlags = StyleFlags::from_bits_retain(1 << 12);
 
 /// Terminal grid and presentation dimensions.
@@ -583,14 +580,11 @@ fn square_style(
     if flags.contains(StyleFlags::STRIKEOUT) {
         modifiers |= Modifier::CROSSED_OUT;
     }
-    #[cfg(rio_vt_sgr_blink)]
-    {
-        if flags.contains(VT_SLOW_BLINK) {
-            modifiers |= Modifier::SLOW_BLINK;
-        }
-        if flags.contains(VT_RAPID_BLINK) {
-            modifiers |= Modifier::RAPID_BLINK;
-        }
+    if flags.contains(VT_SLOW_BLINK) {
+        modifiers |= Modifier::SLOW_BLINK;
+    }
+    if flags.contains(VT_RAPID_BLINK) {
+        modifiers |= Modifier::RAPID_BLINK;
     }
 
     style = style.add_modifier(modifiers);
@@ -878,7 +872,6 @@ mod tests {
         assert_eq!(cell.underline_color, TuiColor::Rgb(1, 2, 3));
     }
 
-    #[cfg(rio_vt_sgr_blink)]
     #[test]
     fn widget_preserves_slow_and_rapid_blink() {
         let rendered = render_cells(1, 3, b"\x1b[5mS\x1b[6mR\x1b[25mN");
@@ -1061,23 +1054,8 @@ mod tests {
             .get::<TerminalRenderConfig>(entity)
             .expect("render config");
         assert_eq!(render_config.font.regular, FontSource::Monospace);
-        #[cfg(bevy_terminal_automatic_metrics)]
-        {
-            assert_eq!(render_config.cell_size, CellSizing::FROM_FONT);
-            assert!(matches!(render_config.font_size, FontSizing::Px(_)));
-        }
-        #[cfg(not(bevy_terminal_automatic_metrics))]
-        {
-            let CellSizing::Logical(cell) = render_config.cell_size else {
-                panic!("packaged-source cells must use the measured-cell adapter");
-            };
-            assert!(cell.x > 1.0);
-            assert!(cell.y > 1.0);
-            let FontSizing::Px(font_size) = render_config.font_size else {
-                panic!("packaged-source font size must be measured in pixels");
-            };
-            assert!(font_size.is_finite() && font_size >= 1.0);
-        }
+        assert_eq!(render_config.cell_size, CellSizing::FROM_FONT);
+        assert!(matches!(render_config.font_size, FontSizing::Px(_)));
         let texture = app
             .world()
             .get::<TerminalTexture>(entity)
