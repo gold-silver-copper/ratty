@@ -10,9 +10,9 @@ repository = "https://github.com/orhun/ratty"
 keywords = ["terminal", "emulator", "3d", "graphics"]
 categories = ["command-line-utilities", "graphics"]
 edition = "2024"
-# Ratty depends on git forks (rio-vt blink preservation, bevy_terminal
-# automatic cell metrics) whose features have no registry release yet, so a
-# crates.io package cannot build correctly.
+# Ratty depends on a rio-vt fork (blink preservation, upstreamed in
+# raphamorim/rio#1911) with no registry release yet, so a crates.io package
+# cannot build correctly.
 publish = false
 exclude = ["website/**", ".github/**", "widget/**"]
 
@@ -47,7 +47,7 @@ bevy = { version = "0.19.0", default-features = false, features = [
 clap = { version = "4.5", features = ["derive"] }
 etcetera = "0.11"
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
-bevy_terminal_ratatui = { version = "=0.7.1", git = "https://github.com/gold-silver-copper/bevy_terminal.git", rev = "2b6aed15234ffc4a79d7898da7d062f5cf5e74d7", default-features = false, features = ["system_fonts"] }
+bevy_terminal_ratatui = { version = "0.7.2", default-features = false, features = ["system_fonts"] }
 portable-pty = "0.8"
 ratatui = "0.30"
 read-fonts = "0.39.2"
