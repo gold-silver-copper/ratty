@@ -227,11 +227,7 @@ impl TerminalSelection {
                             // so a selection starting on its trailing spacer
                             // includes the glyph in the copied text too.
                             Some(anchor) if col == row_start => {
-                                let before = out.len();
-                                vt::push_cell_text(&mut out, &term.grid, anchor);
-                                if out.len() == before {
-                                    out.push(' ');
-                                }
+                                vt::push_cell_text_or_space(&mut out, &term.grid, anchor);
                             }
                             // Inside the range the anchor already emitted the
                             // glyph; the spacer is padding, not a column.
@@ -244,12 +240,7 @@ impl TerminalSelection {
                         continue;
                     }
 
-                    let before = out.len();
-                    vt::push_cell_text(&mut out, &term.grid, pos);
-                    if out.len() == before {
-                        // Blank cell: rio-vt stores it as NUL, not a space.
-                        out.push(' ');
-                    }
+                    vt::push_cell_text_or_space(&mut out, &term.grid, pos);
                 }
             }
 

@@ -310,20 +310,24 @@ pub(crate) fn handle_window_resize(
     redraw.request();
 }
 
-/// The renderer entity whose `TerminalReady` has fired: its texture carries
-/// measured font geometry and may drive PTY layout.
+/// Marker on the render target once its `TerminalReady` has fired: the
+/// texture carries measured font geometry and may drive PTY layout.
 ///
-/// Entity-scoped rather than a process-wide bool, so a despawned-and-respawned
-/// renderer target starts ungated again instead of riding a stale flag.
-#[derive(Resource, Default)]
-pub(crate) struct TerminalRendererReady(pub(crate) Option<Entity>);
+/// A component rather than a resource, so it dies with a despawned target and
+/// a foreign `bevy_terminal` terminal (an embedder may run several) cannot
+/// vouch for Ratty's.
+#[derive(Component)]
+pub(crate) struct TerminalRendererReady;
 
 /// Marks the renderer's measured texture as authoritative for layout.
 pub(crate) fn on_terminal_ready(
     ready: On<TerminalReady>,
-    mut renderer_ready: ResMut<TerminalRendererReady>,
+    targets: Query<(), With<TerminalRenderTarget>>,
+    mut commands: Commands,
 ) {
-    renderer_ready.0 = Some(ready.entity);
+    if targets.contains(ready.entity) {
+        commands.entity(ready.entity).insert(TerminalRendererReady);
+    }
 }
 
 /// Fits the grid to the window, pushes the result to the PTY, and returns the
@@ -480,33 +484,55 @@ pub(crate) fn sync_terminal_renderer_config(
     #[cfg(not(bevy_terminal_automatic_metrics))] mut font_atlas_set: ResMut<FontAtlasSet>,
     #[cfg(not(bevy_terminal_automatic_metrics))] mut scale_cx: ResMut<ScaleCx>,
     #[cfg(not(bevy_terminal_automatic_metrics))] mut measured: Local<Option<FontCellMeasurement>>,
+    mut in_family_fallback: Local<bool>,
     mut configs: Query<&mut TerminalRenderConfig, With<TerminalRenderTarget>>,
 ) {
     let Ok(mut config) = configs.single_mut() else {
         return;
     };
+    // Idle-frame early-out before any clone or lookup. These are this
+    // system's own parameters, so the list cannot silently drift the way an
+    // external run condition's shadow list could; while the Monospace
+    // fallback is active the system keeps running so it recovers the moment
+    // the configured family registers.
+    #[cfg(not(bevy_terminal_automatic_metrics))]
+    let font_assets_changed = font_assets.is_changed();
+    #[cfg(bevy_terminal_automatic_metrics)]
+    let font_assets_changed = false;
+    let inputs_changed = app_config.is_changed()
+        || terminal.is_changed()
+        || configured_faces
+            .as_ref()
+            .is_some_and(|faces| faces.is_changed())
+        || font_assets_changed
+        || config.is_added();
+    if !inputs_changed && !*in_family_fallback {
+        return;
+    }
     let mut desired = terminal.render_config().clone();
     if let Some(ref configured_faces) = configured_faces {
         desired.font = configured_faces.faces.clone();
     }
-    let system_family = configured_faces
-        .as_deref()
-        .and_then(|configured| configured.system_family.as_deref())
-        .unwrap_or(&app_config.font.family);
-    let needs_system_font = configured_faces
-        .as_deref()
-        .is_none_or(|configured| configured.system_family.is_some());
-    let family_available = font_cx
-        .bypass_change_detection()
-        .collection
-        .family_by_name(system_family)
-        .is_some();
-    if needs_system_font && !family_available {
+    // The family retained inside ConfiguredFontFaces is the one actually
+    // pushed to the renderer; None means explicit font files, where no
+    // availability check applies.
+    let system_family: Option<&str> = match configured_faces.as_deref() {
+        Some(configured) => configured.system_family.as_deref(),
+        None => Some(app_config.font.family.as_str()),
+    };
+    *in_family_fallback = false;
+    if let Some(family) = system_family
+        && font_cx
+            .bypass_change_detection()
+            .collection
+            .family_by_name(family)
+            .is_none()
+    {
         warn_once!(
-            "configured font family {:?} is unavailable; using the generic monospace family",
-            system_family
+            "configured font family {family:?} is unavailable; using the generic monospace family"
         );
         desired.font = FontFaces::regular(FontSource::Monospace);
+        *in_family_fallback = true;
     }
 
     #[cfg(not(bevy_terminal_automatic_metrics))]
@@ -518,20 +544,22 @@ pub(crate) fn sync_terminal_renderer_config(
             return;
         };
         let raster_scale = raster_scale.clamp(1.0, 8.0);
-        if font_assets.is_changed() {
+        if font_assets_changed {
             *measured = None;
         }
-        let metrics = measured
-            .as_ref()
-            .filter(|measurement| {
-                measurement.faces == desired.font
-                    && measurement.requested_font_size == font_size
-                    && measurement.raster_scale == raster_scale
-                    && measurement.hinting == desired.raster.hinting
-            })
-            .map(|measurement| (measurement.font_size, measurement.cell_size))
-            .or_else(|| {
-                let (effective_font_size, cell_size) = measure_font_cell(
+        // Failures are cached too — keyed like successes and invalidated on
+        // font-asset changes — so a session where measurement persistently
+        // fails costs one shaping probe per input change, not one per frame.
+        let cached = measured.as_ref().filter(|measurement| {
+            measurement.faces == desired.font
+                && measurement.requested_font_size == font_size
+                && measurement.raster_scale == raster_scale
+                && measurement.hinting == desired.raster.hinting
+        });
+        let metrics = match cached {
+            Some(measurement) => measurement.metrics,
+            None => {
+                let metrics = measure_font_cell(
                     &desired.font,
                     font_size,
                     raster_scale,
@@ -543,17 +571,17 @@ pub(crate) fn sync_terminal_renderer_config(
                     &mut font_cx,
                     &mut layout_cx,
                     &mut scale_cx,
-                )?;
+                );
                 *measured = Some(FontCellMeasurement {
                     faces: desired.font.clone(),
                     requested_font_size: font_size,
-                    font_size: effective_font_size,
                     raster_scale,
                     hinting: desired.raster.hinting,
-                    cell_size,
+                    metrics,
                 });
-                Some((effective_font_size, cell_size))
-            });
+                metrics
+            }
+        };
         let Some((font_size, cell_size)) = metrics else {
             return;
         };
@@ -572,10 +600,11 @@ pub(crate) fn sync_terminal_renderer_config(
 pub(crate) struct FontCellMeasurement {
     faces: FontFaces,
     requested_font_size: f32,
-    font_size: f32,
     raster_scale: f32,
     hinting: FontHinting,
-    cell_size: Vec2,
+    /// Effective font size and logical cell of a successful probe; `None`
+    /// caches a failed attempt until the key or the font assets change.
+    metrics: Option<(f32, Vec2)>,
 }
 
 #[cfg(not(bevy_terminal_automatic_metrics))]
@@ -807,7 +836,12 @@ fn opaque_rows(images: &Assets<Image>, texture: AssetId<Image>, rect: Rect) -> O
 #[derive(SystemParam)]
 pub(crate) struct SyncRenderOutputParams<'w, 's> {
     primary_window: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
-    textures: Query<'w, 's, (Entity, &'static TerminalTexture), With<TerminalRenderTarget>>,
+    textures: Query<
+        'w,
+        's,
+        (&'static TerminalTexture, &'static TerminalRenderConfig),
+        (With<TerminalRenderTarget>, With<TerminalRendererReady>),
+    >,
     runtime: ResMut<'w, TerminalRuntime>,
     terminal: ResMut<'w, TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
@@ -815,9 +849,6 @@ pub(crate) struct SyncRenderOutputParams<'w, 's> {
     plane_query: TerminalPlaneLayoutQuery<'w, 's>,
     plane_back_query: TerminalPlaneBackLayoutQuery<'w, 's>,
     frame_dirty: ResMut<'w, TerminalFrameDirty>,
-    renderer_ready: Res<'w, TerminalRendererReady>,
-    #[cfg(not(bevy_terminal_automatic_metrics))]
-    render_configs: Query<'w, 's, &'static TerminalRenderConfig, With<TerminalRenderTarget>>,
 }
 
 /// Adopts the renderer-owned texture and reflows the PTY when measured font
@@ -833,24 +864,20 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
         plane_query,
         plane_back_query,
         frame_dirty,
-        renderer_ready,
-        #[cfg(not(bevy_terminal_automatic_metrics))]
-        render_configs,
     } = &mut params;
-    let (Ok((texture_entity, texture)), Ok(mut window)) =
+    // The renderer inserts a provisional texture with estimated cell metrics
+    // before the font face has shaped. Adopting it would reflow the PTY to a
+    // wrong grid, so the query requires TerminalRendererReady — the
+    // renderer's own signal that the texture carries measured geometry.
+    // (An exact-size heuristic would misclassify legitimately tiny measured
+    // cells, wedging the terminal at a 1pt font.)
+    let (Ok((texture, pushed_config)), Ok(mut window)) =
         (textures.single(), primary_window.single_mut())
     else {
         return;
     };
-    // The renderer inserts a provisional texture with estimated cell metrics
-    // before the font face has shaped. Adopting it would reflow the PTY to a
-    // wrong grid, so wait for TerminalReady — the renderer's own signal that
-    // the texture carries measured geometry — before treating the texture as
-    // authoritative. (An exact-size heuristic would misclassify legitimately
-    // tiny measured cells, wedging the terminal at a 1pt font.)
-    if renderer_ready.0 != Some(texture_entity) {
-        return;
-    }
+    #[cfg(bevy_terminal_automatic_metrics)]
+    let _ = pushed_config;
     // The packaged (registry) renderer cannot measure cells itself: Ratty's
     // adapter pushes a measured CellSizing::Logical config onto the renderer
     // entity (the surface's own copy stays FROM_FONT), and until the renderer
@@ -862,9 +889,6 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     // from the adapter's.
     #[cfg(not(bevy_terminal_automatic_metrics))]
     {
-        let Ok(pushed_config) = render_configs.single() else {
-            return;
-        };
         let CellSizing::Logical(cell) = pushed_config.cell_size else {
             return;
         };
@@ -880,9 +904,17 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     if window_size.x < 1.0 || window_size.y < 1.0 {
         return;
     }
-    if !terminal.update_render_output(texture) {
+    // Bypass change detection for the steady-state no-op call so unchanged
+    // frames do not bump the public resource's tick, then mark explicitly on
+    // real adoption (the reflow below would mark it anyway; this keeps the
+    // tick correct even if that ever changes).
+    if !terminal
+        .bypass_change_detection()
+        .update_render_output(texture)
+    {
         return;
     }
+    terminal.set_changed();
     let previous_grid = (terminal.cols, terminal.rows);
     let layout = reflow_terminal(terminal, runtime, window_size, texture.raster_scale);
     sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
@@ -906,45 +938,51 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
 /// only exists so a font that never shapes cannot leave a headless process.
 const WINDOW_REVEAL_FALLBACK_SECS: f32 = 10.0;
 
-/// Reveals the primary window if the renderer never produces a matching
-/// measured texture.
+/// Reports a session where the renderer never produces a measured texture,
+/// and reveals the window if it is still hidden.
 ///
-/// The window starts hidden and `sync_terminal_render_output` normally shows
-/// it once the first correctly sized texture exists. If font measurement
-/// fails (for example, no usable system fonts), that never happens; degrade
-/// to a visible window instead of a silent headless process.
+/// Ratty's own binary starts the window hidden and
+/// `sync_terminal_render_output` normally shows it once the first correctly
+/// sized texture exists; if font measurement fails (for example, no usable
+/// system fonts), this degrades to a visible window instead of a silent
+/// headless process. An embedder's window may already be visible — the
+/// deadline warning still fires there, so a never-measuring session (whose
+/// resizes are silently dropped) is never diagnostic-free.
 ///
-/// One-shot: once the window has been visible — through either path — the
-/// system disarms permanently, so a later intentional hide is never reverted.
+/// One-shot: the system disarms on measurement success or after firing, so a
+/// later intentional hide is never reverted.
 pub(crate) fn reveal_window_fallback(
     time: Res<Time<Real>>,
+    terminal: Res<TerminalSurface>,
     mut primary_window: Query<&mut Window, With<PrimaryWindow>>,
-    mut hidden_for: Local<f32>,
+    mut waited: Local<f32>,
     mut disarmed: Local<bool>,
 ) {
     if *disarmed {
         return;
     }
-    let Ok(mut window) = primary_window.single_mut() else {
-        return;
-    };
-    if window.visible {
+    if terminal.is_measured() {
         *disarmed = true;
         return;
     }
-    // Accumulate the observed hidden time rather than reading elapsed_secs():
-    // an embedder may add this plugin long after app startup, and app-elapsed
+    // Accumulate the observed wait rather than reading elapsed_secs(): an
+    // embedder may add this plugin long after app startup, and app-elapsed
     // time would fire the fallback instantly. Real time, because virtual time
     // clamps long blocking frames to `max_delta`.
-    *hidden_for += time.delta_secs();
-    if *hidden_for < WINDOW_REVEAL_FALLBACK_SECS {
+    *waited += time.delta_secs();
+    if *waited < WINDOW_REVEAL_FALLBACK_SECS {
         return;
     }
-    warn!(
-        "no measured terminal texture after {WINDOW_REVEAL_FALLBACK_SECS}s; showing the window anyway"
-    );
-    window.visible = true;
     *disarmed = true;
+    warn!(
+        "no measured terminal texture after {WINDOW_REVEAL_FALLBACK_SECS}s; \
+         window resizes are ignored until font measurement succeeds"
+    );
+    if let Ok(mut window) = primary_window.single_mut()
+        && !window.visible
+    {
+        window.visible = true;
+    }
 }
 
 #[derive(SystemParam)]

@@ -222,6 +222,16 @@ pub fn is_wide_anchor(grid: &Grid<Square>, pos: Pos) -> bool {
     matches!(grid[pos].wide(), Wide::Wide)
 }
 
+/// Appends a cell's text, or a space when the cell is blank — rio-vt stores
+/// blank cells as NUL, not as a space.
+pub fn push_cell_text_or_space(out: &mut String, grid: &Grid<Square>, pos: Pos) {
+    let before = out.len();
+    push_cell_text(out, grid, pos);
+    if out.len() == before {
+        out.push(' ');
+    }
+}
+
 /// Returns the grid position of a visible `(row, col)`.
 pub fn visible_pos(term: &VtTerminal, row: u16, col: u16) -> Pos {
     let offset = i32::try_from(term.display_offset()).unwrap_or(i32::MAX);
@@ -251,12 +261,7 @@ pub fn visible_row_texts(term: &VtTerminal) -> Vec<String> {
                 if is_wide_spacer(&term.grid, pos) {
                     continue;
                 }
-                let before = out.len();
-                push_cell_text(&mut out, &term.grid, pos);
-                if out.len() == before {
-                    // Blank cells are stored as NUL rather than a space.
-                    out.push(' ');
-                }
+                push_cell_text_or_space(&mut out, &term.grid, pos);
             }
             let trimmed = out.trim_end();
             out.truncate(trimmed.len());

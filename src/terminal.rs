@@ -331,7 +331,13 @@ impl TerminalSurface {
         )
     }
 
-    /// Returns the renderer component configuration for the current settings.
+    /// Returns the base render configuration derived from Ratty's settings.
+    ///
+    /// This is a template, not the live renderer state: the config actually
+    /// pushed to the renderer entity may differ (packaged builds replace
+    /// `cell_size` with measured `CellSizing::Logical`, and the font faces
+    /// may be swapped for a fallback). Read the entity's
+    /// [`TerminalRenderConfig`] component for pushed values.
     pub(crate) const fn render_config(&self) -> &TerminalRenderConfig {
         &self.render_config
     }
