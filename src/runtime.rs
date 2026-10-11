@@ -46,6 +46,7 @@ const IDENTITY: Identity = Identity {
 pub const PARSER_OPTIONS: Options = Options::new()
     .with(Feature::KittyKeyboard)
     .with(Feature::Reflow)
+    .with(Feature::ModeReports)
     .with_identity(Some(IDENTITY));
 
 /// Receives what the engine leaves to its host: replies to queries, queued
@@ -55,21 +56,39 @@ pub const PARSER_OPTIONS: Options = Options::new()
 pub struct TerminalParserSink {
     seen: HashSet<String>,
     pending_replies: Vec<Vec<u8>>,
+    reply_bytes: usize,
+    reply_overflow: bool,
 }
 
 impl TerminalParserSink {
     /// Drains any terminal replies the parser queued.
     pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
+        self.reply_bytes = 0;
+        self.reply_overflow = false;
         std::mem::take(&mut self.pending_replies)
     }
 }
 
 impl Sink for TerminalParserSink {
     fn reply(&mut self, bytes: &[u8]) {
+        if self.reply_bytes.saturating_add(bytes.len()) > 64 * 1024
+            || self.pending_replies.len() >= 1024
+        {
+            if !self.reply_overflow {
+                bevy::log::warn!("terminal reply budget exceeded; excess replies discarded");
+            }
+            self.reply_overflow = true;
+            return;
+        }
+        self.reply_bytes += bytes.len();
         self.pending_replies.push(bytes.to_vec());
     }
 
     fn unhandled(&mut self, sequence: Unhandled<'_>) {
+        // A hostile program must not grow the diagnostic deduplication set.
+        if self.seen.len() >= 128 {
+            return;
+        }
         let (kind, sequence) = match sequence {
             Unhandled::Csi {
                 params,
@@ -103,6 +122,9 @@ impl Sink for TerminalParserSink {
             }
             _ => return,
         };
+        if sequence.len() > 1024 {
+            return;
+        }
         if self.seen.insert(sequence.clone()) {
             bevy::log::warn!("unhandled terminal {kind} sequence: {sequence}");
         }
@@ -424,6 +446,10 @@ impl TerminalRuntime {
         self.screen().row_texts()
     }
 
+    pub(crate) fn queue_reply(&mut self, bytes: &[u8]) {
+        self.sink.reply(bytes);
+    }
+
     /// Drains the replies the parser has queued for write-back to the PTY.
     pub fn take_replies(&mut self) -> Vec<Vec<u8>> {
         self.sink.take_replies()
@@ -651,6 +677,22 @@ mod tests {
         let got = replies(&mut sink);
         assert_eq!(got, vec!["\x1b[?62;22c", "\x1b[0n", "\x1b[3;7R"]);
         assert!(replies(&mut sink).is_empty(), "replies must drain");
+    }
+
+    #[test]
+    fn replies_and_distinct_diagnostics_have_fixed_budgets() {
+        let (mut parser, mut sink) = parser(2, 4);
+        process(&mut parser, &mut sink, &b"\x1b[5n".repeat(2048));
+        assert_eq!(sink.pending_replies.len(), 1024);
+        assert!(sink.reply_bytes <= 64 * 1024);
+        assert!(sink.reply_overflow);
+        sink.take_replies();
+        process(&mut parser, &mut sink, b"\x1b[5n");
+        assert_eq!(replies(&mut sink), ["\x1b[0n"]);
+        for number in 0..512 {
+            process(&mut parser, &mut sink, format!("\x1b[{number}z").as_bytes());
+        }
+        assert_eq!(sink.seen.len(), 128);
     }
 
     /// DA1 must not advertise sixel (`4`) or OSC 52 (`52`), or applications
@@ -976,6 +1018,42 @@ mod resize_tests {
         }
         assert!(!crate::systems::drain_pty_output(&mut runtime, &mut objects, &mut camera).pending);
         drop(tx);
+    }
+
+    #[test]
+    fn synchronized_output_commits_cells_images_and_camera_together() {
+        let mut runtime = test_runtime(Box::new(FailOnceMaster {
+            attempts: Arc::new(AtomicUsize::new(1)),
+            applied_size: Arc::new(Mutex::new(None)),
+        }));
+        let mut objects = crate::inline::TerminalInlineObjects::default();
+        let mut camera = Vec::new();
+        let mut processed = false;
+        objects.consume_pty_output(b"old\x1b[?2026h", &mut runtime, &mut camera, &mut processed);
+        let snapshot = runtime.screen().row_texts();
+        let frame =
+            b"\rnew\x1b_Ga=T,f=32,s=1,v=1,i=7;/wAA/w==\x1b\\\x1b_ratty;g;c;id=1;scale=2\x1b\\";
+        for byte in frame {
+            objects.consume_pty_output(&[*byte], &mut runtime, &mut camera, &mut processed);
+            assert_eq!(runtime.screen().row_texts(), snapshot);
+            assert!(objects.objects.is_empty());
+            assert!(camera.is_empty());
+        }
+        for byte in b"\x1b[?2026l" {
+            objects.consume_pty_output(&[*byte], &mut runtime, &mut camera, &mut processed);
+        }
+        assert_eq!(runtime.screen().row_texts()[0], "new");
+        assert!(objects.objects.contains_key(&7));
+        assert_eq!(camera.len(), 1);
+        assert!(!objects.frame_pending());
+        objects.consume_pty_output(
+            b"\x1b[?2026h\rbye",
+            &mut runtime,
+            &mut camera,
+            &mut processed,
+        );
+        objects.release_output(&mut runtime, &mut camera, &mut processed, true, true);
+        assert_eq!(runtime.screen().row_texts()[0], "bye");
     }
 
     #[test]

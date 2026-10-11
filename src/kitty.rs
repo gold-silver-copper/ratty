@@ -3,6 +3,11 @@
 use std::collections::HashMap;
 
 use base64::Engine as _;
+use image::ImageDecoder;
+use std::io::Cursor;
+
+const TRANSFER_LIMIT: usize = 32 * 1024 * 1024;
+const RASTER_LIMIT: usize = 64 * 1024 * 1024;
 
 use crate::inline::{InlineAnchor, InlineObject, InlineStyle, KittyInlineObject, RasterObject};
 use fux_vt::Color;
@@ -17,11 +22,15 @@ const C1_ST: u8 = 0x9c;
 /// Parser state for Kitty graphics sequences.
 #[derive(Default)]
 pub struct KittyParserState {
-    transfer: Option<KittyTransfer>,
+    transfer: Transfer,
     next_object_id: u32,
 }
 
 impl KittyParserState {
+    pub(crate) fn abort_transfer(&mut self) {
+        self.transfer = Transfer::Discarding;
+    }
+
     /// Consumes a Kitty graphics APC sequence.
     pub fn consume_sequence(
         &mut self,
@@ -61,13 +70,20 @@ impl KittyParserState {
                     || params.contains_key("s")
                     || params.contains_key("v")
                     || params.contains_key("i");
+                let more = params.get("m").copied().unwrap_or("0") == "1";
+                if matches!(self.transfer, Transfer::Discarding) && !starts_new_transfer {
+                    if !more {
+                        self.transfer = Transfer::Idle;
+                    }
+                    return Some(KittyOperation::Ignored);
+                }
                 if starts_new_transfer {
                     let object_id = params
                         .get("i")
                         .and_then(|value| value.parse().ok())
                         .unwrap_or(self.next_object_id.max(1));
-                    self.next_object_id = self.next_object_id.max(object_id + 1);
-                    self.transfer = Some(KittyTransfer {
+                    self.next_object_id = self.next_object_id.max(object_id.wrapping_add(1).max(1));
+                    self.transfer = Transfer::Receiving(KittyTransfer {
                         action: action.to_owned(),
                         object_id,
                         format: params
@@ -86,12 +102,26 @@ impl KittyParserState {
                 }
 
                 let transfer = self.transfer.as_mut()?;
-                let chunk = base64::engine::general_purpose::STANDARD
-                    .decode(payload)
-                    .ok()?;
+                let chunk = match base64::engine::general_purpose::STANDARD.decode(payload) {
+                    Ok(chunk)
+                        if transfer.bytes.len().saturating_add(chunk.len()) <= TRANSFER_LIMIT =>
+                    {
+                        chunk
+                    }
+                    _ => {
+                        self.transfer = if more {
+                            Transfer::Discarding
+                        } else {
+                            Transfer::Idle
+                        };
+                        bevy::log::warn!(
+                            "Kitty transfer rejected: invalid base64 or more than 32 MiB"
+                        );
+                        return Some(KittyOperation::Ignored);
+                    }
+                };
                 transfer.bytes.extend_from_slice(&chunk);
-
-                if params.get("m").copied().unwrap_or("0") == "1" {
+                if more {
                     return Some(KittyOperation::Pending);
                 }
 
@@ -232,24 +262,70 @@ struct KittyTransfer {
     bytes: Vec<u8>,
 }
 
+#[derive(Default)]
+enum Transfer {
+    #[default]
+    Idle,
+    Receiving(KittyTransfer),
+    Discarding,
+}
+impl Transfer {
+    fn is_none(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+    fn as_mut(&mut self) -> Option<&mut KittyTransfer> {
+        match self {
+            Self::Receiving(t) => Some(t),
+            _ => None,
+        }
+    }
+    fn take(&mut self) -> Option<KittyTransfer> {
+        match std::mem::take(self) {
+            Self::Receiving(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+fn rgba_len(width: u32, height: u32) -> Option<usize> {
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return None;
+    }
+    (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)
+        .filter(|bytes| *bytes <= RASTER_LIMIT)
+}
+
 impl KittyTransfer {
     fn finalize(&self) -> Option<KittyImage> {
         let (width, height, rgba) = match self.format {
             100 => {
-                let image =
-                    image::load_from_memory_with_format(&self.bytes, image::ImageFormat::Png)
-                        .ok()?;
+                let mut reader = image::ImageReader::with_format(
+                    Cursor::new(&self.bytes),
+                    image::ImageFormat::Png,
+                );
+                let mut limits = image::Limits::default();
+                limits.max_image_width = Some(8192);
+                limits.max_image_height = Some(8192);
+                limits.max_alloc = Some(RASTER_LIMIT as u64);
+                reader.limits(limits);
+                let decoder = reader.into_decoder().ok()?;
+                let (width, height) = decoder.dimensions();
+                rgba_len(width, height)?;
+                let image = image::DynamicImage::from_decoder(decoder).ok()?;
                 let rgba = image.to_rgba8();
                 (rgba.width(), rgba.height(), rgba.into_raw())
             }
             24 => {
                 let width = self.width?;
                 let height = self.height?;
-                let expected = width as usize * height as usize * 3;
+                let rgba_bytes = rgba_len(width, height)?;
+                let expected = rgba_bytes / 4 * 3;
                 if self.bytes.len() != expected {
                     return None;
                 }
-                let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+                let mut rgba = Vec::with_capacity(rgba_bytes);
                 for rgb in self.bytes.as_chunks::<3>().0 {
                     rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
                 }
@@ -258,7 +334,7 @@ impl KittyTransfer {
             32 => {
                 let width = self.width?;
                 let height = self.height?;
-                let expected = width as usize * height as usize * 4;
+                let expected = rgba_len(width, height)?;
                 if self.bytes.len() != expected {
                     return None;
                 }
@@ -354,4 +430,56 @@ pub fn refresh_kitty_placeholder_anchors(
     }
 
     changed
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    #[test]
+    fn chunked_pixels_survive_and_invalid_chunks_require_a_new_transfer() {
+        let mut parser = KittyParserState::default();
+        assert!(matches!(
+            parser.consume_sequence(b"\x1b_Ga=T,f=32,s=1,v=1,i=9,m=1;/wA=\x1b\\", (0, 0)),
+            Some(KittyOperation::Pending)
+        ));
+        let Some(KittyOperation::TransmitAndPlace { image, .. }) =
+            parser.consume_sequence(b"\x1b_Gm=0;AP8=\x1b\\", (0, 0))
+        else {
+            panic!("complete image");
+        };
+        assert_eq!(image.rgba, [255, 0, 0, 255]);
+        parser.consume_sequence(b"\x1b_Ga=T,m=1;not-base64!\x1b\\", (0, 0));
+        assert!(matches!(parser.transfer, Transfer::Discarding));
+        assert!(matches!(
+            parser.consume_sequence(b"\x1b_Gm=0;AP8=\x1b\\", (0, 0)),
+            Some(KittyOperation::Ignored)
+        ));
+        assert!(matches!(parser.transfer, Transfer::Idle));
+    }
+
+    #[test]
+    fn graphics_size_and_transfer_limits_prevent_growth_before_decode() {
+        let mut parser = KittyParserState::default();
+        parser.consume_sequence(b"\x1b_Ga=T,f=32,s=1,v=1,m=1;/wA=\x1b\\", (0, 0));
+        parser
+            .transfer
+            .as_mut()
+            .expect("pending transfer")
+            .bytes
+            .resize(TRANSFER_LIMIT, 0);
+        assert!(matches!(
+            parser.consume_sequence(b"\x1b_Gm=1;AA==\x1b\\", (0, 0)),
+            Some(KittyOperation::Ignored)
+        ));
+        assert!(matches!(parser.transfer, Transfer::Discarding));
+        assert!(rgba_len(u32::MAX, u32::MAX).is_none());
+        assert!(rgba_len(8192, 8192).is_none());
+        assert_eq!(rgba_len(4096, 4096), Some(RASTER_LIMIT));
+        // User IDs may reach u32::MAX without overflowing the allocator.
+        parser.consume_sequence(
+            b"\x1b_Ga=T,f=32,s=1,v=1,i=4294967295;/wAA/w==\x1b\\",
+            (0, 0),
+        );
+    }
 }

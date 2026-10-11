@@ -320,3 +320,43 @@ inline graphics but designed for modern terminal capabilities and 3D rendering.
 [DolDoc]: https://tinkeros.github.io/WbTempleOS/Doc/DolDocOverview.html
 [Glyph Protocol]: https://rapha.land/introducing-glyph-protocol-for-terminals/
 [APC]: https://en.wikipedia.org/wiki/C0_and_C1_control_codes#C1_controls
+
+## Buffering and synchronized output
+
+Each encoded APC command is limited to 1 MiB. Larger images and models must use
+multipart transfers. Oversized commands are discarded through their terminator;
+payload fragments are never rendered as text. CAN and SUB cancel an incomplete
+command. A canceled or discarded command also aborts incomplete graphics transfers.
+
+Kitty transfers accept up to 32 MiB of decoded payload. Images are limited to
+8192 pixels per dimension and 64 MiB of RGBA pixels, with limits checked before
+image decoding allocates its output. A rejected multipart transfer discards its
+continuations through the final chunk; an explicit new transfer can restart it.
+
+RGP permits eight concurrent multipart registrations, at most 32 MiB per model
+and 64 MiB across incomplete registrations. Exceeding these limits or changing
+format mid-transfer aborts the registrations. Send a delete-all command before
+restarting them; this prevents an orphaned final chunk from being mistaken for a
+new model. Placement dimensions must be between 1 and 65535 cells.
+
+DEC synchronized output (mode 2026) commits terminal text, graphics operations,
+and camera commands together. MCP screen reads observe the committed frame.
+An incomplete frame is published after one second, at 2 MiB of held data or
+4096 commands, on disconnect, or before a host resize. After a limit or timeout,
+output streams normally until another begin-frame sequence. Commands inside an
+APC payload cannot terminate a frame. A frame spanning multiple PTY reads has
+the same behavior as one received in a single read.
+
+Terminal query replies have a separate 64 KiB / 1024-packet budget per drain;
+excess replies are discarded with a diagnostic. Distinct unhandled-sequence
+log entries are capped at 128. PTY input accepts at most 1 MiB in 256 packets,
+including an in-progress write. A successful MCP input response means
+`bytes_accepted` into that queue (`delivery: "queued"`); state observations report
+actual `input_written_bytes`, pending bytes, and any writer error. A full queue
+returns `input_backpressure` without blocking the rendering thread.
+
+The graphics registry retains at most 64 objects and 256 MiB of raster pixel
+payloads. Further registrations are rejected; delete unused objects to make
+room. File-based RGP models have the same 32 MiB source-size limit as transfers.
+These are parser and registry budgets, not a cap on the GPU driver's allocations
+or on textures referenced by a glTF asset.

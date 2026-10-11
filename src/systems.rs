@@ -260,13 +260,58 @@ pub fn drain_pty_output(
             }
         }
     }
+    let mut replies = inline_objects.release_output(
+        runtime,
+        camera_updates,
+        &mut drained.processed,
+        drained.disconnected,
+        drained.disconnected,
+    );
+    replies.extend(runtime.take_replies());
+    for reply in replies {
+        if let Err(error) = runtime.write_input(&reply) {
+            warn!("terminal reply rejected: {error}");
+        }
+    }
+    // Low-power windows must continue updating until a held frame's deadline.
+    drained.pending |= inline_objects.frame_pending();
+    if drained.processed {
+        inline_objects.refresh_text_anchors(runtime.screen());
+        inline_objects.refresh_placeholder_anchors(runtime.screen());
+    }
     drained
+}
+
+/// Commits a held frame before an externally requested geometry change.
+pub(crate) fn flush_terminal_frame(
+    runtime: &mut TerminalRuntime,
+    objects: &mut TerminalInlineObjects,
+    camera_updates: &mut MessageWriter<TerminalCameraUpdate>,
+    redraw: &mut TerminalRedrawState,
+) {
+    let mut updates = Vec::new();
+    let mut processed = false;
+    let mut replies = objects.release_output(runtime, &mut updates, &mut processed, true, false);
+    replies.extend(runtime.take_replies());
+    for reply in replies {
+        if let Err(error) = runtime.write_input(&reply) {
+            warn!("terminal reply rejected: {error}");
+        }
+    }
+    for update in updates {
+        camera_updates.write(update);
+    }
+    if processed {
+        redraw.request();
+    }
 }
 
 #[derive(SystemParam)]
 pub(crate) struct ResizeParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
     runtime: ResMut<'w, TerminalRuntime>,
+    inline_objects: ResMut<'w, TerminalInlineObjects>,
+    camera_updates: MessageWriter<'w, TerminalCameraUpdate>,
     terminal: ResMut<'w, TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
     viewport: ResMut<'w, TerminalViewport>,
@@ -289,6 +334,8 @@ pub(crate) fn handle_window_resize(
     let ResizeParams {
         primary_window,
         runtime,
+        inline_objects,
+        camera_updates,
         terminal,
         redraw,
         viewport,
@@ -333,6 +380,7 @@ pub(crate) fn handle_window_resize(
         // reflow using those authoritative metrics and the current window.
         return;
     }
+    flush_terminal_frame(runtime, inline_objects, camera_updates, redraw);
     let layout = reflow_terminal(terminal, runtime, window_size, render_scale);
     sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
     redraw.request();
@@ -544,6 +592,8 @@ pub(crate) struct SyncRenderOutputParams<'w, 's> {
     textures: Query<'w, 's, Ref<'static, TerminalTexture>, With<TerminalRenderTarget>>,
     pending: ResMut<'w, TerminalOutputPending>,
     runtime: ResMut<'w, TerminalRuntime>,
+    inline_objects: ResMut<'w, TerminalInlineObjects>,
+    camera_updates: MessageWriter<'w, TerminalCameraUpdate>,
     terminal: ResMut<'w, TerminalSurface>,
     redraw: ResMut<'w, TerminalRedrawState>,
     viewport: ResMut<'w, TerminalViewport>,
@@ -564,6 +614,8 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
         textures,
         pending,
         runtime,
+        inline_objects,
+        camera_updates,
         terminal,
         redraw,
         viewport,
@@ -604,6 +656,7 @@ pub(crate) fn sync_terminal_render_output(mut params: SyncRenderOutputParams) {
     }
     terminal.set_changed();
     let previous_grid = (terminal.cols, terminal.rows);
+    flush_terminal_frame(runtime, inline_objects, camera_updates, redraw);
     let layout = reflow_terminal(terminal, runtime, window_size, geometry.raster_scale());
     sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
     frame_dirty.0 = true;

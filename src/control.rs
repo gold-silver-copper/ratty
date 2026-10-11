@@ -635,6 +635,7 @@ type TerminalPlaneBackTransformQuery<'w, 's> = Query<
 #[derive(SystemParam)]
 pub(crate) struct ControlApplyParams<'w, 's> {
     runtime: ResMut<'w, TerminalRuntime>,
+    inline_objects: ResMut<'w, crate::inline::TerminalInlineObjects>,
     terminal: ResMut<'w, TerminalSurface>,
     slots: Res<'w, TerminalCameraSlots>,
     warp: ResMut<'w, TerminalPlaneWarp>,
@@ -662,6 +663,7 @@ pub(crate) fn pump_control_commands(
 fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> ControlResponse {
     let ControlApplyParams {
         runtime,
+        inline_objects,
         terminal,
         slots,
         warp,
@@ -696,6 +698,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                 },
                 "modes": {
                     "alternate_screen": screen.mode(fux_vt::Mode::AlternateScreen),
+                    "synchronized_output": inline_objects.frame_pending(),
                     "application_cursor": screen.mode(fux_vt::Mode::ApplicationCursor),
                     "application_keypad": screen.mode(fux_vt::Mode::ApplicationKeypad),
                     "bracketed_paste": screen.mode(fux_vt::Mode::BracketedPaste),
@@ -835,6 +838,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                     "terminal columns and rows must be between 1 and 1000",
                 );
             }
+            crate::systems::flush_terminal_frame(runtime, inline_objects, camera_updates, redraw);
             let layout = terminal.layout_for_size(request.columns, request.rows);
             let pixels = layout.pty_pixels();
             if let Err(error) = runtime.resize(
@@ -860,6 +864,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
             )
         }
         ControlCommand::Close {} => {
+            crate::systems::flush_terminal_frame(runtime, inline_objects, camera_updates, redraw);
             runtime.shutdown();
             ControlResponse::data(serde_json::json!({ "accepted": true }))
         }
@@ -1047,6 +1052,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                 terminal.set_font_size(size);
                 app_config.font.size = size;
             }
+            crate::systems::flush_terminal_frame(runtime, inline_objects, camera_updates, redraw);
             let layout = terminal.layout_for_size(columns, rows);
             let pixels = layout.pty_pixels();
             if let Err(error) = runtime.resize(columns, rows, pixels.x as u16, pixels.y as u16) {

@@ -11,16 +11,14 @@ use crate::model::{
     ObjectLoadOptions, load_object_source_from_bytes_with_options,
     load_rgp_object_source_with_options,
 };
+use crate::output::{ApcScanner, Frames, Piece};
 use crate::rgp::{
     RgpOperation, RgpPlacementStyle, RgpPlacementUpdate, RgpRegisterSource,
     consume_sequence as consume_rgp_sequence, support_reply,
 };
 use crate::runtime::TerminalRuntime;
 use crate::screen::{ScreenView, TextAnchor};
-
-const APC_START: &[u8] = b"\x1b_";
-const ST: &[u8] = b"\x1b\\";
-const C1_ST: u8 = 0x9c;
+use std::time::Instant;
 
 /// Marker for 2D inline object sprites.
 #[derive(Component)]
@@ -69,8 +67,9 @@ pub struct TerminalRgpObject {
 /// Inline object registry and anchor state.
 #[derive(Resource, Default)]
 pub struct TerminalInlineObjects {
-    pending_bytes: Vec<u8>,
-    pending_rgp_payloads: HashMap<u32, PendingRgpPayload>,
+    scanner: ApcScanner,
+    frames: Frames,
+    pending_rgp_payloads: RgpTransfers,
     kitty: KittyParserState,
     dirty: bool,
     last_viewport_size: Vec2,
@@ -90,56 +89,83 @@ impl TerminalInlineObjects {
         camera_updates: &mut Vec<TerminalCameraUpdate>,
         terminal_output: &mut bool,
     ) -> Vec<Vec<u8>> {
-        self.pending_bytes.extend_from_slice(chunk);
-        let mut replies = Vec::new();
-
-        let mut cursor = 0;
-        loop {
-            let Some(start_offset) = self.pending_bytes[cursor..]
-                .windows(APC_START.len())
-                .position(|window| window == APC_START)
-            else {
-                let pending_len = self.pending_bytes.len();
-                let keep_from = pending_apc_prefix_start(&self.pending_bytes, cursor);
-                if cursor < keep_from {
-                    *terminal_output = true;
-                    runtime.process(&self.pending_bytes[cursor..keep_from]);
-                }
-                if keep_from < pending_len {
-                    self.pending_bytes.drain(..keep_from);
-                } else {
-                    self.pending_bytes.clear();
-                }
-                return replies;
-            };
-            let start = cursor + start_offset;
-            if cursor < start {
-                *terminal_output = true;
-                runtime.process(&self.pending_bytes[cursor..start]);
-            }
-
-            let payload_start = start + APC_START.len();
-            let Some(end) = apc_end(&self.pending_bytes, payload_start) else {
-                self.pending_bytes.drain(..start);
-                return replies;
-            };
-            let sequence = self.pending_bytes[start..end].to_vec();
-            self.refresh_text_anchors(ScreenView::new(&runtime.screen(), 0));
-            let (handled, reply) = self.handle_apc_sequence(
-                &sequence,
-                runtime.screen().cursor_position(),
-                camera_updates,
-            );
-            self.refresh_text_anchors(ScreenView::new(&runtime.screen(), 0));
-            if let Some(reply) = reply {
-                replies.push(reply);
-            }
-            if !handled {
-                *terminal_output = true;
-                runtime.process(&sequence);
-            }
-            cursor = end;
+        let now = Instant::now();
+        let mut committed = Vec::new();
+        for piece in self.scanner.feed(chunk) {
+            committed.extend(self.frames.feed(piece, now));
         }
+        self.apply_output(committed, runtime, camera_updates, terminal_output)
+    }
+
+    /// Publishes a timed-out or explicitly interrupted frame. Cells, graphics
+    /// and scene commands are applied together before any observer can run.
+    pub(crate) fn release_output(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        camera_updates: &mut Vec<TerminalCameraUpdate>,
+        terminal_output: &mut bool,
+        force: bool,
+        disconnected: bool,
+    ) -> Vec<Vec<u8>> {
+        let now = Instant::now();
+        let mut committed = Vec::new();
+        if disconnected {
+            for piece in self.scanner.finish() {
+                committed.extend(self.frames.feed(piece, now));
+            }
+        }
+        committed.extend(if force {
+            self.frames.release()
+        } else {
+            self.frames.expire(now)
+        });
+        self.apply_output(committed, runtime, camera_updates, terminal_output)
+    }
+
+    /// Whether the child has an incomplete synchronized presentation frame.
+    pub fn frame_pending(&self) -> bool {
+        self.frames.pending()
+    }
+
+    fn apply_output(
+        &mut self,
+        pieces: Vec<Piece>,
+        runtime: &mut TerminalRuntime,
+        camera_updates: &mut Vec<TerminalCameraUpdate>,
+        terminal_output: &mut bool,
+    ) -> Vec<Vec<u8>> {
+        let replies = Vec::new();
+        for piece in pieces {
+            match piece {
+                Piece::Text(bytes) => {
+                    *terminal_output |= !bytes.is_empty();
+                    runtime.process(&bytes);
+                }
+                Piece::Apc(sequence) => {
+                    runtime.process(b"\x1b_\x1b\\");
+                    self.refresh_text_anchors(ScreenView::new(&runtime.screen(), 0));
+                    let (handled, reply) = self.handle_apc_sequence(
+                        &sequence,
+                        runtime.screen().cursor_position(),
+                        camera_updates,
+                    );
+                    self.refresh_text_anchors(ScreenView::new(&runtime.screen(), 0));
+                    *terminal_output |= handled;
+                    if let Some(reply) = reply {
+                        runtime.queue_reply(&reply);
+                    }
+                    // Unknown APCs are ignored whole. Malformed payload bytes
+                    // cannot escape into the VT text/control stream.
+                }
+                Piece::DiscardGraphics => {
+                    runtime.process(b"\x1b_\x1b\\");
+                    self.kitty.abort_transfer();
+                    self.pending_rgp_payloads = RgpTransfers::Discarding;
+                    warn!("discarded malformed, oversized, or incomplete graphics command");
+                }
+            }
+        }
+        replies
     }
 
     /// Returns whether inline objects need synchronization.
@@ -212,7 +238,36 @@ impl TerminalInlineObjects {
         }
     }
 
+    fn object_fits(&self, id: u32, object: &InlineObject) -> bool {
+        let bytes = |object: &InlineObject| match object {
+            InlineObject::KittyImage(image) => image.raster.rgba.len(),
+            _ => 0,
+        };
+        let retained = self
+            .objects
+            .iter()
+            .filter(|(old, _)| **old != id)
+            .map(|(_, object)| bytes(object))
+            .sum::<usize>();
+        (self.objects.contains_key(&id) || self.objects.len() < 64)
+            && retained.saturating_add(bytes(object)) <= 256 * 1024 * 1024
+    }
+
+    fn register_object(&mut self, id: u32, object: InlineObject) -> bool {
+        if !self.object_fits(id, &object) {
+            warn!("graphics registry limit reached (64 objects / 256 MiB raster data)");
+            return false;
+        }
+        self.objects.insert(id, object);
+        self.dirty = true;
+        true
+    }
+
     fn set_anchor(&mut self, object_id: u32, anchor: InlineAnchor) {
+        if !valid_anchor(&anchor) {
+            warn!("graphics placement dimensions exceed 65535 cells");
+            return;
+        }
         self.text_anchors.remove(&object_id);
         self.anchors.insert(object_id, anchor);
         self.dirty = true;
@@ -251,9 +306,7 @@ impl TerminalInlineObjects {
         match operation {
             KittyOperation::Pending | KittyOperation::Ignored => (true, None),
             KittyOperation::TransmitOnly { object_id, image } => {
-                self.objects
-                    .insert(object_id, InlineObject::KittyImage(image.rasterize()));
-                self.dirty = true;
+                self.register_object(object_id, InlineObject::KittyImage(image.rasterize()));
                 (true, None)
             }
             KittyOperation::TransmitAndPlace {
@@ -261,6 +314,11 @@ impl TerminalInlineObjects {
                 image,
                 anchor,
             } => {
+                let object = InlineObject::KittyImage(image.rasterize());
+                if !self.object_fits(object_id, &object) {
+                    warn!("graphics registry limit reached");
+                    return (true, None);
+                }
                 self.remove_objects_at(&InlineAnchor {
                     row: i32::from(anchor.row),
                     col: anchor.col,
@@ -268,8 +326,7 @@ impl TerminalInlineObjects {
                     rows: anchor.rows,
                     style: InlineStyle::default(),
                 });
-                self.objects
-                    .insert(object_id, InlineObject::KittyImage(image.rasterize()));
+                self.register_object(object_id, object);
                 self.set_anchor(
                     object_id,
                     InlineAnchor {
@@ -347,6 +404,12 @@ impl TerminalInlineObjects {
                 } else {
                     match source {
                         RgpRegisterSource::Path { path } => {
+                            if std::fs::metadata(&path)
+                                .is_ok_and(|metadata| metadata.len() > 32 * 1024 * 1024)
+                            {
+                                warn!("RGP file exceeds 32 MiB");
+                                return Some(None);
+                            }
                             self.pending_rgp_payloads.remove(&object_id);
                             match load_rgp_object_source_with_options(
                                 Path::new(&path),
@@ -354,8 +417,7 @@ impl TerminalInlineObjects {
                             ) {
                                 Ok((source, source_data)) => {
                                     info!("registered RGP object {} from {}", object_id, source);
-                                    self.objects.insert(object_id, source_data.into());
-                                    self.dirty = true;
+                                    self.register_object(object_id, source_data.into());
                                     None
                                 }
                                 Err(error) => {
@@ -422,6 +484,9 @@ impl TerminalInlineObjects {
     }
 
     fn remove_objects_at(&mut self, new_anchor: &InlineAnchor) {
+        if !valid_anchor(new_anchor) {
+            return;
+        }
         let row_start = new_anchor.row;
         let row_end = row_start + new_anchor.rows as i32;
         let col_start = new_anchor.col as i32;
@@ -461,8 +526,23 @@ impl TerminalInlineObjects {
         data: Vec<u8>,
         options: ObjectLoadOptions,
     ) -> Option<Vec<u8>> {
-        let pending = self
-            .pending_rgp_payloads
+        let RgpTransfers::Receiving(transfers) = &mut self.pending_rgp_payloads else {
+            return None;
+        };
+        let total = transfers.values().map(|p| p.data.len()).sum::<usize>();
+        let old = transfers.get(&object_id);
+        let reject = (!transfers.contains_key(&object_id) && transfers.len() >= 8)
+            || total.saturating_add(data.len()) > 64 * 1024 * 1024
+            || old.map_or(0, |p| p.data.len()).saturating_add(data.len()) > 32 * 1024 * 1024
+            || old.is_some_and(|p| p.format != format);
+        if reject {
+            self.pending_rgp_payloads = RgpTransfers::Discarding;
+            warn!(
+                "RGP transfer budget or format violated; send delete-all before restarting transfers"
+            );
+            return None;
+        }
+        let pending = transfers
             .entry(object_id)
             .or_insert_with(|| PendingRgpPayload {
                 format: format.to_string(),
@@ -470,13 +550,6 @@ impl TerminalInlineObjects {
                 data: Vec::new(),
                 options,
             });
-        if pending.format != format {
-            warn!(
-                "ignoring RGP payload chunk for object {} due to format mismatch ({} vs {})",
-                object_id, pending.format, format
-            );
-            return None;
-        }
         if pending.name.is_none() {
             pending.name = name;
         }
@@ -507,8 +580,7 @@ impl TerminalInlineObjects {
         ) {
             Ok((source, source_data)) => {
                 info!("registered RGP object {} from {}", object_id, source);
-                self.objects.insert(object_id, source_data.into());
-                self.dirty = true;
+                self.register_object(object_id, source_data.into());
                 None
             }
             Err(error) => {
@@ -519,36 +591,34 @@ impl TerminalInlineObjects {
     }
 }
 
+enum RgpTransfers {
+    Receiving(HashMap<u32, PendingRgpPayload>),
+    // RGP has no distinct start flag on a chunk. After an aborted transfer,
+    // require delete-all rather than treating its tail as a new model.
+    Discarding,
+}
+impl Default for RgpTransfers {
+    fn default() -> Self {
+        Self::Receiving(HashMap::new())
+    }
+}
+impl RgpTransfers {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+    fn remove(&mut self, id: &u32) -> Option<PendingRgpPayload> {
+        match self {
+            Self::Receiving(transfers) => transfers.remove(id),
+            Self::Discarding => None,
+        }
+    }
+}
+
 struct PendingRgpPayload {
     format: String,
     name: Option<String>,
     data: Vec<u8>,
     options: ObjectLoadOptions,
-}
-
-fn pending_apc_prefix_start(bytes: &[u8], cursor: usize) -> usize {
-    let start = cursor.min(bytes.len());
-    if bytes[start..].ends_with(&APC_START[..1]) {
-        bytes.len() - 1
-    } else {
-        bytes.len()
-    }
-}
-
-fn apc_end(bytes: &[u8], payload_start: usize) -> Option<usize> {
-    let mut index = payload_start;
-    loop {
-        if index >= bytes.len() {
-            return None;
-        }
-        if bytes[index] == C1_ST {
-            return Some(index + 1);
-        }
-        if index + 1 < bytes.len() && bytes[index] == ST[0] && bytes[index + 1] == ST[1] {
-            return Some(index + 2);
-        }
-        index += 1;
-    }
 }
 
 /// Registered inline object.
@@ -613,6 +683,11 @@ impl InlineObject {
             InlineObject::RgpObject(_) => true,
         }
     }
+}
+
+fn valid_anchor(anchor: &InlineAnchor) -> bool {
+    (1..=u32::from(u16::MAX)).contains(&anchor.rows)
+        && (1..=u32::from(u16::MAX)).contains(&anchor.columns)
 }
 
 /// Inline object anchor.
@@ -741,6 +816,59 @@ mod anchor_tests {
                 style: InlineStyle::default(),
             },
         );
+    }
+
+    #[test]
+    fn rgp_chunks_are_bounded_and_delete_all_recovers_after_overflow() {
+        let mut objects = TerminalInlineObjects::default();
+        let options = ObjectLoadOptions { normalize: false };
+        for id in 0..8 {
+            objects.handle_rgp_payload_chunk(id, "obj", None, true, vec![b'v'], options);
+        }
+        objects.handle_rgp_payload_chunk(9, "obj", None, true, vec![b'v'], options);
+        assert!(matches!(
+            objects.pending_rgp_payloads,
+            RgpTransfers::Discarding
+        ));
+        objects.handle_rgp_payload_chunk(9, "obj", None, false, vec![b'v'], options);
+        assert!(objects.objects.is_empty());
+        objects.clear_objects();
+        objects.handle_rgp_payload_chunk(
+            1,
+            "obj",
+            Some("test.obj".into()),
+            true,
+            b"v 0 0 0\nv 1 0 0\n".to_vec(),
+            options,
+        );
+        objects.handle_rgp_payload_chunk(
+            1,
+            "obj",
+            None,
+            false,
+            b"v 0 1 0\nf 1 2 3\n".to_vec(),
+            options,
+        );
+        assert!(objects.objects.contains_key(&1));
+    }
+
+    #[test]
+    fn registry_limit_rejects_new_ids_but_allows_replacement_and_recovery() {
+        let mut objects = TerminalInlineObjects::default();
+        for id in 0..64 {
+            place(&mut objects, id, 0, 0, false);
+        }
+        let object = || {
+            InlineObject::RgpObject(RgpInlineObject::Gltf {
+                asset_path: "test.glb".into(),
+                handle: None,
+            })
+        };
+        assert!(!objects.register_object(65, object()));
+        assert!(objects.register_object(0, object()));
+        objects.remove_object(0);
+        assert!(objects.register_object(65, object()));
+        assert_eq!(objects.objects.len(), 64);
     }
 
     #[test]
