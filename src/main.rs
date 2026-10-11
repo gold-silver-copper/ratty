@@ -100,6 +100,7 @@ fn main() -> anyhow::Result<()> {
                     },
                     transparent: app_config.window.opacity < 1.0,
                     visible: false,
+                    ime_enabled: true,
                     ..default()
                 }),
                 ..default()

@@ -5,6 +5,7 @@ use bevy::ecs::world::FromWorld;
 use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
+use bevy::window::{Ime, PrimaryWindow};
 use fux_vt::Screen;
 
 use arboard::Clipboard;
@@ -16,7 +17,7 @@ use crate::camera::{
     TerminalMobiusSource,
 };
 use crate::config::{AppConfig, BindingAction, FontConfig, KeyBindingConfig};
-use crate::mouse::{TerminalSelection, encode_mouse_wheel};
+use crate::mouse::{TerminalSelection, encode_mouse_wheel, mouse_modifiers};
 use crate::runtime::TerminalRuntime;
 use crate::scene::{
     MobiusEnterZoomFloor, MobiusTransition, TerminalPlaneWarp, TerminalPresentationMode,
@@ -379,13 +380,7 @@ impl TerminalKeyboard {
     }
 
     /// Translates a keyboard event into terminal input bytes.
-    pub fn handle_event_with_modes(
-        &mut self,
-        event: &KeyboardInput,
-        application_cursor: bool,
-        kitty_keyboard_flags: u8,
-        modify_other_keys: Option<u8>,
-    ) -> Option<Vec<u8>> {
+    pub fn handle_event(&mut self, event: &KeyboardInput, screen: &Screen) -> Option<Vec<u8>> {
         match event.key_code {
             KeyCode::ControlLeft | KeyCode::ControlRight => {
                 self.ctrl_pressed = event.state == ButtonState::Pressed;
@@ -423,9 +418,8 @@ impl TerminalKeyboard {
                 alt_pressed: self.left_alt_pressed,
                 alt_gr_pressed: self.right_alt_pressed,
                 shift_pressed: self.shift_pressed,
-                application_cursor,
-                kitty_keyboard_flags,
-                modify_other_keys,
+                screen,
+                super_pressed: self.super_pressed,
             },
         ))
     }
@@ -434,6 +428,7 @@ impl TerminalKeyboard {
 /// Keyboard input system parameters.
 #[derive(SystemParam)]
 pub struct KeyboardSystemParams<'w, 's> {
+    primary_window: Query<'w, 's, Entity, With<PrimaryWindow>>,
     keys: Res<'w, ButtonInput<KeyCode>>,
     selection: ResMut<'w, TerminalSelection>,
     plane_warp: ResMut<'w, TerminalPlaneWarp>,
@@ -452,10 +447,28 @@ pub struct KeyboardSystemParams<'w, 's> {
 /// Handles terminal keyboard input.
 pub fn handle_keyboard_input(
     mut keyboard_events: MessageReader<KeyboardInput>,
+    mut ime_events: MessageReader<Ime>,
     mut keyboard: Local<TerminalKeyboard>,
     mut params: KeyboardSystemParams,
 ) {
+    let primary = params.primary_window.single().ok();
+    for event in ime_events.read() {
+        if let Ime::Commit { window, value } = event
+            && Some(*window) == primary
+            && !value.is_empty()
+        {
+            // An IME commit has no physical key or modifier identity. Send
+            // its text once, even when the child requests Kitty all-keys.
+            params.runtime.set_scrollback(0);
+            params.selection.clear();
+            params.runtime.write_human_input(value.as_bytes());
+            params.redraw.request();
+        }
+    }
     for event in keyboard_events.read() {
+        if Some(event.window) != primary {
+            continue;
+        }
         let binding_key_code = navigation_key_code(&event.logical_key).unwrap_or(event.key_code);
         let modifiers = current_modifiers(&params.keys).union(keyboard.modifiers());
         if event.state == ButtonState::Pressed
@@ -546,15 +559,16 @@ pub fn handle_keyboard_input(
                     if params.camera_slots.active().mode == TerminalPresentationMode::Flat2d
                         && mouse_mode != MouseProtocolMode::None
                     {
-                        let encoding = params.runtime.screen().mouse_protocol_encoding();
                         let (row, col) = params.runtime.screen().display_cursor_position();
                         let cell = UVec2::new(col as u32, row as u32);
                         for _ in 0..amount {
-                            params.runtime.write_human_input(&encode_mouse_wheel(
+                            let report = encode_mouse_wheel(
                                 cell,
                                 direction.is_positive(),
-                                encoding,
-                            ));
+                                &params.runtime.screen(),
+                                mouse_modifiers(&params.keys),
+                            );
+                            params.runtime.write_human_input(&report);
                         }
                     } else {
                         let current = params.runtime.scrollback();
@@ -646,15 +660,7 @@ pub fn handle_keyboard_input(
             params.redraw.request();
         }
 
-        if let Some(input) = keyboard.handle_event_with_modes(
-            event,
-            params
-                .runtime
-                .screen()
-                .mode(fux_vt::Mode::ApplicationCursor),
-            params.runtime.kitty_keyboard_flags(),
-            params.runtime.modify_other_keys(),
-        ) {
+        if let Some(input) = keyboard.handle_event(event, &params.runtime.screen()) {
             if params.runtime.scrollback() != 0 {
                 params.runtime.set_scrollback(0);
                 params.redraw.request();
@@ -852,33 +858,20 @@ struct KeyTranslationContext<'a> {
     alt_pressed: bool,
     alt_gr_pressed: bool,
     shift_pressed: bool,
-    application_cursor: bool,
-    kitty_keyboard_flags: u8,
-    modify_other_keys: Option<u8>,
+    screen: &'a Screen,
+    super_pressed: bool,
 }
 
 fn translate_key(key_code: KeyCode, ctx: KeyTranslationContext<'_>) -> Vec<u8> {
     let Some(key) = normalize_winit_key(key_code, &ctx) else {
         return Vec::new();
     };
-    encode_normalized_key_with_modes(
-        &key,
-        ctx.application_cursor,
-        ctx.kitty_keyboard_flags,
-        ctx.modify_other_keys,
-    )
-    .unwrap_or_default()
+    encode_key(&key, ctx.screen, Some((key_code, ctx.super_pressed))).unwrap_or_default()
 }
 
-/// Encodes a normalized key using the active modes from Ratty's authoritative
-/// terminal screen.
+/// Encodes a normalized key using the modes requested by the terminal program.
 pub fn encode_normalized_key(key: &NormalizedKey, screen: &Screen) -> Result<Vec<u8>, String> {
-    encode_normalized_key_with_modes(
-        key,
-        screen.mode(fux_vt::Mode::ApplicationCursor),
-        screen.kitty_keyboard_flags(),
-        screen.modify_other_keys(),
-    )
+    encode_key(key, screen, None)
 }
 
 fn normalize_winit_key(
@@ -957,158 +950,175 @@ fn normalize_winit_key(
     Some(NormalizedKey { key, modifiers })
 }
 
+fn encode_key(
+    key: &NormalizedKey,
+    screen: &Screen,
+    physical: Option<(KeyCode, bool)>,
+) -> Result<Vec<u8>, String> {
+    use fux_vt::keys::{Direction, Key as VtKey, KeyPress, Keystroke, Kitty, Modifiers};
+    let mut mods = Modifiers {
+        ctrl: key.modifiers.control,
+        alt: key.modifiers.alt,
+        shift: key.modifiers.shift,
+    };
+    let vt_key = match &key.key {
+        TerminalKey::Text(text) => {
+            if text.is_empty() || text.chars().any(char::is_control) {
+                return Err("printable key text must be non-empty and contain no controls".into());
+            }
+            let mut chars = text.chars();
+            let first = chars.next().expect("nonempty text");
+            if chars.next().is_some() {
+                // A dead-key/IME commit is text, not a series of physical key
+                // presses. Retain the public multi-character text contract.
+                let mut out = Vec::with_capacity(text.len() + usize::from(mods.alt));
+                if mods.alt {
+                    out.push(0x1b);
+                }
+                out.extend_from_slice(text.as_bytes());
+                return Ok(out);
+            }
+            VtKey::Char(first)
+        }
+        TerminalKey::Enter => VtKey::Enter,
+        TerminalKey::Escape => VtKey::Escape,
+        TerminalKey::Tab => VtKey::Tab,
+        TerminalKey::BackTab => {
+            mods.shift = true;
+            VtKey::Tab
+        }
+        TerminalKey::Backspace => VtKey::Backspace,
+        TerminalKey::ArrowUp => VtKey::Arrow(Direction::Up),
+        TerminalKey::ArrowDown => VtKey::Arrow(Direction::Down),
+        TerminalKey::ArrowLeft => VtKey::Arrow(Direction::Left),
+        TerminalKey::ArrowRight => VtKey::Arrow(Direction::Right),
+        TerminalKey::Home => VtKey::Home,
+        TerminalKey::End => VtKey::End,
+        TerminalKey::PageUp => VtKey::PageUp,
+        TerminalKey::PageDown => VtKey::PageDown,
+        TerminalKey::Insert => VtKey::Insert,
+        TerminalKey::Delete => VtKey::Delete,
+        TerminalKey::Function(number) => {
+            if !(1..=24).contains(number) {
+                return Err("function key number must be between 1 and 24".into());
+            }
+            // Ratty has historically exposed F13–F24 as shifted F1–F12
+            // in legacy mode. Kitty has distinct codes for these keys.
+            if *number > 12
+                && matches!(
+                    screen.key_mode(),
+                    fux_vt::keys::encode::KeyMode::Legacy { .. }
+                )
+            {
+                mods.shift = true;
+                VtKey::F(number - 12)
+            } else {
+                VtKey::F(*number)
+            }
+        }
+    };
+    let (code, shifted) = match vt_key {
+        VtKey::Char(c) => {
+            // Bevy provides the resulting logical character, but no complete
+            // unshifted layout map. ASCII letters can be recovered; do not
+            // substitute a US physical key for a non-ASCII logical key.
+            (
+                Some(u32::from(c.to_ascii_lowercase())),
+                c.is_ascii_alphabetic()
+                    .then_some(u32::from(c.to_ascii_uppercase())),
+            )
+        }
+        _ => (None, None),
+    };
+    let bits = u8::from(mods.shift)
+        | (u8::from(mods.alt) << 1)
+        | (u8::from(mods.ctrl) << 2)
+        | (u8::from(physical.is_some_and(|(_, super_key)| super_key)) << 3);
+    let kitty = Kitty {
+        code,
+        shifted,
+        base: physical
+            .and_then(|(key, _)| physical_base_key(key))
+            .map(u32::from),
+        // For remote text without physical modifier information, capitals
+        // still imply Shift, as they do in fux-vt's normalized key API.
+        mods: bits
+            | u8::from(
+                physical.is_none() && matches!(vt_key, VtKey::Char(c) if c.is_ascii_uppercase()),
+            ),
+    };
+    let mut out = Vec::new();
+    screen.encode_key(
+        Keystroke {
+            press: KeyPress::new(vt_key, mods),
+            kitty: Some(kitty),
+        },
+        &mut out,
+    );
+    Ok(out)
+}
+
+fn physical_base_key(key: KeyCode) -> Option<char> {
+    match key {
+        KeyCode::Digit0 => Some('0'),
+        KeyCode::Digit1 => Some('1'),
+        KeyCode::Digit2 => Some('2'),
+        KeyCode::Digit3 => Some('3'),
+        KeyCode::Digit4 => Some('4'),
+        KeyCode::Digit5 => Some('5'),
+        KeyCode::Digit6 => Some('6'),
+        KeyCode::Digit7 => Some('7'),
+        KeyCode::Digit8 => Some('8'),
+        KeyCode::Digit9 => Some('9'),
+        KeyCode::Space => Some(' '),
+        KeyCode::Minus => Some('-'),
+        KeyCode::Equal => Some('='),
+        KeyCode::BracketLeft => Some('['),
+        KeyCode::BracketRight => Some(']'),
+        KeyCode::Backslash => Some('\\'),
+        KeyCode::Semicolon => Some(';'),
+        KeyCode::Quote => Some('\''),
+        KeyCode::Backquote => Some('`'),
+        KeyCode::Comma => Some(','),
+        KeyCode::Period => Some('.'),
+        KeyCode::Slash => Some('/'),
+        _ => ctrl_keycode_byte(key)
+            .filter(|b| (1..=26).contains(b))
+            .map(|b| char::from(b'a' + b - 1)),
+    }
+}
+
+// Tests set modes through the same parser interface as the child process.
+#[cfg(test)]
+fn key_test_parser(application: bool, kitty: u8, other: Option<u8>) -> fux_vt::Parser {
+    let mut parser = fux_vt::Parser::with_options(
+        fux_vt::Size::new(2, 20).expect("valid test operation"),
+        0,
+        fux_vt::Feature::KittyKeyboard.into(),
+    )
+    .expect("valid test operation");
+    if application {
+        parser.process(b"\x1b[?1h").expect("valid test operation");
+    }
+    parser
+        .process(format!("\x1b[>{kitty}u").as_bytes())
+        .expect("valid test operation");
+    if let Some(level) = other {
+        parser
+            .process(format!("\x1b[>4;{level}m").as_bytes())
+            .expect("valid test operation");
+    }
+    parser
+}
+
+#[cfg(test)]
 fn encode_normalized_key_with_modes(
     key: &NormalizedKey,
-    application_cursor: bool,
-    kitty_keyboard_flags: u8,
-    modify_other_keys: Option<u8>,
+    application: bool,
+    kitty: u8,
+    other: Option<u8>,
 ) -> Result<Vec<u8>, String> {
-    let modifiers = key.modifiers;
-    let modifier_code =
-        1 + modifiers.shift as u8 + (modifiers.alt as u8 * 2) + (modifiers.control as u8 * 4);
-
-    if let TerminalKey::Text(text) = &key.key {
-        if text.is_empty() || text.chars().any(char::is_control) {
-            return Err("printable key text must be non-empty and contain no controls".into());
-        }
-        if modifiers.control
-            && let Some(byte) = control_text_byte(text)
-        {
-            let mut bytes = Vec::with_capacity(2);
-            if modifiers.alt {
-                bytes.push(0x1b);
-            }
-            bytes.push(byte);
-            return Ok(bytes);
-        }
-        let mut bytes = Vec::with_capacity(text.len() + usize::from(modifiers.alt));
-        if modifiers.alt {
-            bytes.push(0x1b);
-        }
-        bytes.extend_from_slice(text.as_bytes());
-        return Ok(bytes);
-    }
-
-    let kitty_disambiguate = kitty_keyboard_flags & 1 != 0;
-    let special_codepoint = match key.key {
-        TerminalKey::Enter => Some(13),
-        TerminalKey::Tab => Some(9),
-        TerminalKey::Backspace => Some(127),
-        TerminalKey::Escape => Some(27),
-        _ => None,
-    };
-    if modifier_code != 1
-        && let Some(codepoint) = special_codepoint
-    {
-        if kitty_disambiguate {
-            return Ok(format!("\x1b[{codepoint};{modifier_code}u").into_bytes());
-        }
-        if modify_other_keys.is_some() {
-            return Ok(format!("\x1b[27;{modifier_code};{codepoint}~").into_bytes());
-        }
-    }
-
-    let navigation = match key.key {
-        TerminalKey::ArrowUp => Some(NavigationKey::ArrowUp),
-        TerminalKey::ArrowDown => Some(NavigationKey::ArrowDown),
-        TerminalKey::ArrowRight => Some(NavigationKey::ArrowRight),
-        TerminalKey::ArrowLeft => Some(NavigationKey::ArrowLeft),
-        TerminalKey::Home => Some(NavigationKey::Home),
-        TerminalKey::End => Some(NavigationKey::End),
-        TerminalKey::PageUp => Some(NavigationKey::PageUp),
-        TerminalKey::PageDown => Some(NavigationKey::PageDown),
-        TerminalKey::Insert => Some(NavigationKey::Insert),
-        TerminalKey::Delete => Some(NavigationKey::Delete),
-        _ => None,
-    };
-    if let Some(navigation) = navigation {
-        return Ok(navigation.encode(
-            modifiers.control,
-            modifiers.alt,
-            modifiers.shift,
-            application_cursor,
-        ));
-    }
-
-    if let TerminalKey::Function(number) = key.key {
-        return encode_function_key(number, modifiers);
-    }
-
-    let mut bytes = Vec::with_capacity(4);
-    if modifiers.alt {
-        bytes.push(0x1b);
-    }
-    match key.key {
-        TerminalKey::Enter => bytes.push(b'\r'),
-        TerminalKey::Escape => bytes.push(0x1b),
-        TerminalKey::Tab => {
-            if modifiers.shift {
-                bytes.extend_from_slice(b"\x1b[Z");
-            } else {
-                bytes.push(b'\t');
-            }
-        }
-        TerminalKey::BackTab => bytes.extend_from_slice(b"\x1b[Z"),
-        TerminalKey::Backspace => bytes.push(0x7f),
-        TerminalKey::Text(_)
-        | TerminalKey::ArrowUp
-        | TerminalKey::ArrowDown
-        | TerminalKey::ArrowLeft
-        | TerminalKey::ArrowRight
-        | TerminalKey::Home
-        | TerminalKey::End
-        | TerminalKey::PageUp
-        | TerminalKey::PageDown
-        | TerminalKey::Insert
-        | TerminalKey::Delete
-        | TerminalKey::Function(_) => unreachable!("handled above"),
-    }
-    Ok(bytes)
-}
-
-fn encode_function_key(number: u8, mut modifiers: TerminalKeyModifiers) -> Result<Vec<u8>, String> {
-    if !(1..=24).contains(&number) {
-        return Err("function key number must be between 1 and 24".into());
-    }
-    let number = if number > 12 {
-        modifiers.shift = true;
-        number - 12
-    } else {
-        number
-    };
-    let modifier_code =
-        1 + modifiers.shift as u8 + (modifiers.alt as u8 * 2) + (modifiers.control as u8 * 4);
-    if number <= 4 {
-        let suffix = (*b"PQRS")[usize::from(number - 1)] as char;
-        return Ok(if modifier_code == 1 {
-            format!("\x1bO{suffix}").into_bytes()
-        } else {
-            format!("\x1b[1;{modifier_code}{suffix}").into_bytes()
-        });
-    }
-    let code = [15, 17, 18, 19, 20, 21, 23, 24][usize::from(number - 5)];
-    Ok(if modifier_code == 1 {
-        format!("\x1b[{code}~").into_bytes()
-    } else {
-        format!("\x1b[{code};{modifier_code}~").into_bytes()
-    })
-}
-
-fn control_text_byte(text: &str) -> Option<u8> {
-    let [byte] = text.as_bytes() else {
-        return None;
-    };
-    match byte.to_ascii_lowercase() {
-        b'@' | b' ' => Some(0),
-        b'a'..=b'z' => Some(byte.to_ascii_lowercase() - b'a' + 1),
-        b'[' => Some(27),
-        b'\\' => Some(28),
-        b']' => Some(29),
-        b'^' => Some(30),
-        b'_' => Some(31),
-        b'?' => Some(127),
-        _ => None,
-    }
+    encode_normalized_key(key, key_test_parser(application, kitty, other).screen())
 }
 
 fn control_text_for_keycode(key: KeyCode) -> Option<String> {
@@ -1142,9 +1152,7 @@ pub(crate) fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
             .filter(|&ch| ch != '\u{1b}' && ch != '\u{9b}')
             .collect();
         let mut bytes = Vec::with_capacity(sanitized.len() + PASTE_START.len() + PASTE_END.len());
-        bytes.extend_from_slice(PASTE_START);
-        bytes.extend_from_slice(sanitized.as_bytes());
-        bytes.extend_from_slice(PASTE_END);
+        fux_vt::keys::encode::paste(&sanitized, true, &mut bytes);
         bytes
     } else {
         text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
@@ -1167,11 +1175,12 @@ pub fn encode_agent_text(text: &str, paste: bool, screen: &Screen) -> Vec<u8> {
 
 /// Determine the text to send for a key event.
 fn printable_text<'a>(text: Option<&'a str>, logical_key: &'a Key) -> Option<&'a str> {
-    text.or_else(|| match logical_key {
-        Key::Character(chars) => Some(chars.as_str()),
-        _ => None,
-    })
-    .filter(|text| !text.is_empty())
+    text.filter(|text| !text.chars().any(char::is_control))
+        .or_else(|| match logical_key {
+            Key::Character(chars) => Some(chars.as_str()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
 }
 
 #[derive(Clone, Copy)]
@@ -1221,102 +1230,6 @@ impl NavigationKey {
             Key::Insert => Some(Self::Insert),
             Key::Delete => Some(Self::Delete),
             _ => None,
-        }
-    }
-
-    fn encode(
-        self,
-        ctrl_pressed: bool,
-        alt_pressed: bool,
-        shift_pressed: bool,
-        application_cursor: bool,
-    ) -> Vec<u8> {
-        let modifier_code =
-            1 + shift_pressed as u8 + (alt_pressed as u8 * 2) + (ctrl_pressed as u8 * 4);
-
-        if modifier_code != 1 {
-            let arrow_suffix = match self {
-                Self::ArrowUp => Some('A'),
-                Self::ArrowDown => Some('B'),
-                Self::ArrowRight => Some('C'),
-                Self::ArrowLeft => Some('D'),
-                Self::Home => Some('H'),
-                Self::End => Some('F'),
-                _ => None,
-            };
-
-            if let Some(suffix) = arrow_suffix {
-                return format!("\x1b[1;{modifier_code}{suffix}").into_bytes();
-            }
-
-            let tilde_code = match self {
-                Self::PageUp => Some(5),
-                Self::PageDown => Some(6),
-                Self::Insert => Some(2),
-                Self::Delete => Some(3),
-                _ => None,
-            };
-
-            if let Some(code) = tilde_code {
-                return format!("\x1b[{code};{modifier_code}~").into_bytes();
-            }
-        }
-
-        match self {
-            Self::ArrowUp => {
-                if ctrl_pressed {
-                    b"\x1b[1;5A".to_vec()
-                } else if application_cursor {
-                    b"\x1bOA".to_vec()
-                } else {
-                    b"\x1b[A".to_vec()
-                }
-            }
-            Self::ArrowDown => {
-                if ctrl_pressed {
-                    b"\x1b[1;5B".to_vec()
-                } else if application_cursor {
-                    b"\x1bOB".to_vec()
-                } else {
-                    b"\x1b[B".to_vec()
-                }
-            }
-            Self::ArrowRight => {
-                if ctrl_pressed {
-                    b"\x1b[1;5C".to_vec()
-                } else if application_cursor {
-                    b"\x1bOC".to_vec()
-                } else {
-                    b"\x1b[C".to_vec()
-                }
-            }
-            Self::ArrowLeft => {
-                if ctrl_pressed {
-                    b"\x1b[1;5D".to_vec()
-                } else if application_cursor {
-                    b"\x1bOD".to_vec()
-                } else {
-                    b"\x1b[D".to_vec()
-                }
-            }
-            Self::Home => {
-                if application_cursor {
-                    b"\x1bOH".to_vec()
-                } else {
-                    b"\x1b[1~".to_vec()
-                }
-            }
-            Self::End => {
-                if application_cursor {
-                    b"\x1bOF".to_vec()
-                } else {
-                    b"\x1b[4~".to_vec()
-                }
-            }
-            Self::PageUp => b"\x1b[5~".to_vec(),
-            Self::PageDown => b"\x1b[6~".to_vec(),
-            Self::Insert => b"\x1b[2~".to_vec(),
-            Self::Delete => b"\x1b[3~".to_vec(),
         }
     }
 }
@@ -1689,9 +1602,8 @@ mod keyboard_translation_tests {
                 alt_pressed,
                 alt_gr_pressed: false,
                 shift_pressed,
-                application_cursor,
-                kitty_keyboard_flags: 0,
-                modify_other_keys: None,
+                screen: key_test_parser(application_cursor, 0, None).screen(),
+                super_pressed: false,
             },
         )
     }
@@ -1745,6 +1657,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_key_regressions() {
+        let mut parser = fux_vt::Parser::with_options(
+            fux_vt::Size::new(2, 20).expect("valid test operation"),
+            0,
+            fux_vt::Feature::KittyKeyboard.into(),
+        )
+        .expect("valid test operation");
+        let ctrl = TerminalKeyModifiers {
+            control: true,
+            ..default()
+        };
+        assert_eq!(
+            encode_normalized_key(
+                &NormalizedKey {
+                    key: TerminalKey::Backspace,
+                    modifiers: ctrl,
+                },
+                parser.screen()
+            )
+            .expect("valid test operation"),
+            b"\x08"
+        );
+        parser.process(b"\x1b[>1u").expect("valid test operation");
+        assert_eq!(
+            encode_normalized_key(
+                &NormalizedKey {
+                    key: TerminalKey::Text("i".into()),
+                    modifiers: ctrl,
+                },
+                parser.screen()
+            )
+            .expect("valid test operation"),
+            b"\x1b[105;5u"
+        );
+        parser.process(b"\x1b[>8u").expect("valid test operation");
+        assert_eq!(
+            encode_normalized_key(
+                &NormalizedKey {
+                    key: TerminalKey::Text("a".into()),
+                    modifiers: default(),
+                },
+                parser.screen()
+            )
+            .expect("valid test operation"),
+            b"\x1b[97u"
+        );
+    }
+
+    #[test]
     fn local_and_remote_normalized_navigation_match() {
         let local = translate_key(
             KeyCode::ArrowUp,
@@ -1755,9 +1716,8 @@ mod tests {
                 alt_pressed: true,
                 alt_gr_pressed: false,
                 shift_pressed: false,
-                application_cursor: true,
-                kitty_keyboard_flags: 0,
-                modify_other_keys: None,
+                screen: key_test_parser(true, 0, None).screen(),
+                super_pressed: false,
             },
         );
         let remote = encode_normalized_key_with_modes(
@@ -1855,6 +1815,124 @@ mod tests {
                 None,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn keys_follow_protocol_transitions_and_keep_legacy_function_aliases() {
+        let mut parser = key_test_parser(false, 8, None);
+        let key = |key, modifiers| NormalizedKey { key, modifiers };
+        let f13 = key(TerminalKey::Function(13), default());
+        assert_eq!(
+            encode_normalized_key(&f13, parser.screen()).expect("valid test operation"),
+            b"\x1b[57376u"
+        );
+        parser.process(b"\x1b[<u").expect("valid test operation");
+        assert_eq!(
+            encode_normalized_key(&f13, parser.screen()).expect("valid test operation"),
+            b"\x1b[1;2P"
+        );
+        let ctrl_i = key(
+            TerminalKey::Text("i".into()),
+            TerminalKeyModifiers {
+                control: true,
+                ..default()
+            },
+        );
+        assert_eq!(
+            encode_normalized_key(&ctrl_i, parser.screen()).expect("valid test operation"),
+            b"\t"
+        );
+        parser.process(b"\x1b[>4;2m").expect("valid test operation");
+        assert_eq!(
+            encode_normalized_key(&ctrl_i, parser.screen()).expect("valid test operation"),
+            b"\x1b[27;5;105~"
+        );
+        parser.process(b"\x1b[>1u").expect("valid test operation");
+        assert_eq!(
+            encode_normalized_key(&ctrl_i, parser.screen()).expect("valid test operation"),
+            b"\x1b[105;5u"
+        );
+    }
+
+    #[test]
+    fn local_keys_retain_alternate_codes_and_committed_text() {
+        let parser = key_test_parser(false, 13, None);
+        let translate = |physical, logical: Key, text, ctrl, shift, alt_gr| {
+            translate_key(
+                physical,
+                KeyTranslationContext {
+                    logical_key: &logical,
+                    text,
+                    ctrl_pressed: ctrl,
+                    shift_pressed: shift,
+                    alt_pressed: false,
+                    alt_gr_pressed: alt_gr,
+                    super_pressed: false,
+                    screen: parser.screen(),
+                },
+            )
+        };
+        assert_eq!(
+            translate(
+                KeyCode::KeyI,
+                Key::Character("I".into()),
+                Some("\t"),
+                true,
+                true,
+                false
+            ),
+            b"\x1b[105:73:105;6u"
+        );
+        assert_eq!(
+            translate(
+                KeyCode::KeyC,
+                Key::Character("с".into()),
+                None,
+                true,
+                false,
+                false
+            ),
+            "\x1b[1089::99;5u".as_bytes()
+        );
+        assert_eq!(
+            translate(
+                KeyCode::KeyE,
+                Key::Character("e".into()),
+                Some("´e"),
+                false,
+                false,
+                false
+            ),
+            "´e".as_bytes()
+        );
+        assert_eq!(
+            translate(
+                KeyCode::KeyE,
+                Key::Character("€".into()),
+                Some("€"),
+                true,
+                false,
+                true
+            ),
+            b"\x1b[8364::101u"
+        );
+    }
+
+    #[test]
+    fn clipboard_sanitizes_nested_markers_but_agent_text_is_exact() {
+        let text = "a\x1b[20\x1b[201~1~\u{9b}201~界\r\n";
+        let paste = encode_paste(text, true);
+        assert_eq!(paste, "\x1b[200~a[20[201~1~201~界\n\x1b[201~".as_bytes());
+        let mut parser = key_test_parser(false, 0, None);
+        parser
+            .process(b"\x1b[?2004h")
+            .expect("valid test operation");
+        let expected = [b"\x1b[200~".as_slice(), text.as_bytes(), b"\x1b[201~"].concat();
+        assert_eq!(encode_agent_text(text, true, parser.screen()), expected);
+        assert_eq!(
+            encode_paste(text, false),
+            text.replace("\r\n", "\r").as_bytes()
         );
     }
 

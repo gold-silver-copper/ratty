@@ -333,6 +333,16 @@ impl TerminalSurface {
         self.layout()
     }
 
+    /// Computes a proposed layout without allocating or committing a grid.
+    pub(crate) fn layout_for_size(&self, cols: u16, rows: u16) -> TerminalLayout {
+        let texture =
+            (self.cell_size * Vec2::new(f32::from(cols), f32::from(rows)) * self.render_scale)
+                .round()
+                .max(Vec2::ONE)
+                .as_uvec2();
+        TerminalLayout::new(cols, rows, texture, self.render_scale)
+    }
+
     /// Resizes the terminal grid.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         if cols == 0 || rows == 0 {
@@ -534,7 +544,7 @@ impl Widget for TerminalWidget<'_> {
         let theme_palette = self.theme.palette().map(|[r, g, b]| TuiColor::Rgb(r, g, b));
         buf.set_style(area, Style::default().fg(theme_fg));
 
-        let selection = self.selection.normalized_bounds();
+        let selection = self.selection.bounds_in(self.screen);
         let (rows, cols): (u16, u16) = self.screen.size().into();
         let draw_rows = rows.min(area.height);
         let draw_cols = cols.min(area.width);
@@ -544,8 +554,8 @@ impl Widget for TerminalWidget<'_> {
                 continue;
             };
             for col in 0..draw_cols {
-                let Some(vt_cell) = grid_row.cell(usize::from(col)) else {
-                    break;
+                let Some(vt_cell) = self.screen.cell(row, col) else {
+                    continue;
                 };
                 let cell = &mut buf[(area.x + col, area.y + row)];
 

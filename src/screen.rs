@@ -8,7 +8,78 @@
 
 use std::ops::Deref;
 
-use fux_vt::{CellRef, Row, Screen};
+use fux_vt::{CellRef, Row, RowId, Screen, Window};
+
+/// A retained text position. Ordinary output follows its row identity. Reflow
+/// follows its offset in the soft-wrapped logical line, whose first row keeps
+/// its identity. Eviction or a screen switch invalidates the position.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TextAnchor {
+    row: RowId,
+    line: RowId,
+    col: u16,
+    offset: usize,
+    width: u16,
+    alternate: bool,
+}
+
+impl TextAnchor {
+    pub(crate) fn capture(screen: &Screen, row: Row<'_>, col: u16) -> Self {
+        let col = if row
+            .cell(usize::from(col))
+            .is_some_and(|c| c.is_wide_continuation())
+        {
+            col.saturating_sub(1)
+        } else {
+            col
+        };
+        let mut line = row;
+        let mut offset = usize::from(col);
+        while let Some(previous) = line.above().filter(Row::wrapped) {
+            offset = offset.saturating_add(text_width(previous));
+            line = previous;
+        }
+        Self {
+            row: row.id(),
+            line: line.id(),
+            col,
+            offset,
+            width: screen.size().cols(),
+            alternate: screen.mode(fux_vt::Mode::AlternateScreen),
+        }
+    }
+
+    pub(crate) fn resolve<'a>(&self, screen: &'a Screen) -> Option<(Row<'a>, u16)> {
+        if self.alternate != screen.mode(fux_vt::Mode::AlternateScreen) {
+            return None;
+        }
+        if self.width == screen.size().cols() {
+            return Some((screen.row_by_id(self.row)?, self.col));
+        }
+        let mut row = screen.row_by_id(self.line)?;
+        let mut offset = self.offset;
+        while row.wrapped() && offset >= text_width(row) {
+            offset = offset.saturating_sub(text_width(row));
+            row = row.below()?;
+        }
+        let col = u16::try_from(offset.min(row.len().saturating_sub(1))).ok()?;
+        Some((row, col))
+    }
+}
+
+fn text_width(row: Row<'_>) -> usize {
+    let spacer = row.wrapped()
+        && row
+            .len()
+            .checked_sub(1)
+            .and_then(|col| row.cell(col))
+            .is_some_and(|c| !c.has_contents() && c.attributes() == fux_vt::Attributes::default())
+        && row
+            .below()
+            .and_then(|next| next.cell(0))
+            .is_some_and(|c| c.is_wide());
+    row.len().saturating_sub(usize::from(spacer))
+}
 
 /// Kitty graphics Unicode placeholder (U+10EEEE). A cell starting with it
 /// marks where an image goes; its diacritics carry the image row and column.
@@ -23,6 +94,7 @@ pub const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
 pub struct ScreenView<'a> {
     screen: &'a Screen,
     scrollback: usize,
+    window: Window<'a>,
 }
 
 impl<'a> ScreenView<'a> {
@@ -30,9 +102,15 @@ impl<'a> ScreenView<'a> {
     /// history the current screen holds (the alternate screen holds none).
     #[must_use]
     pub fn new(screen: &'a Screen, scrollback: usize) -> Self {
+        let scrollback = scrollback.min(screen.history_len());
+        let window = screen
+            .window()
+            .row(0)
+            .map_or_else(|| screen.window(), |row| row.up(scrollback).window());
         Self {
             screen,
-            scrollback: scrollback.min(screen.history_len()),
+            scrollback,
+            window,
         }
     }
 
@@ -45,18 +123,19 @@ impl<'a> ScreenView<'a> {
     /// Returns the row drawn at `row`, counting from the top of the view.
     #[must_use]
     pub fn visible_row(&self, row: u16) -> Option<Row<'a>> {
-        self.screen
-            .window()
-            .row(0)?
-            .up(self.scrollback)
-            .window()
-            .row(row)
+        self.window.row(row)
+    }
+
+    /// The resolved window shared by rendering, selection and observations.
+    #[must_use]
+    pub fn window(&self) -> Window<'a> {
+        self.window
     }
 
     /// Returns the cell drawn at `row`, `col` of the view.
     #[must_use]
     pub fn cell(&self, row: u16, col: u16) -> Option<CellRef<'a>> {
-        self.visible_row(row)?.cell(usize::from(col))
+        self.window.cell(row, col)
     }
 
     /// Returns the cell a renderer should draw the cursor in, as `(row, col)`.

@@ -214,8 +214,6 @@ pub fn drain_pty_output(
     loop {
         match runtime.try_recv() {
             Ok(chunk) => {
-                let track_scroll = inline_objects.has_scroll_tracked_anchors();
-                let prev_rows = track_scroll.then(|| runtime.visible_row_texts());
                 let mut replies = inline_objects.consume_pty_output(
                     &chunk,
                     runtime,
@@ -226,11 +224,7 @@ pub fn drain_pty_output(
                 for reply in replies {
                     runtime.write_input(&reply);
                 }
-                if let Some(prev_rows) = prev_rows {
-                    let next_rows = runtime.visible_row_texts();
-                    let scrolled = infer_upward_scroll(&prev_rows, &next_rows);
-                    inline_objects.apply_scroll(scrolled);
-                }
+                inline_objects.refresh_text_anchors(runtime.screen());
                 inline_objects.refresh_placeholder_anchors(runtime.screen());
                 runtime.record_output_batch();
             }
@@ -242,21 +236,6 @@ pub fn drain_pty_output(
         }
     }
     drained
-}
-
-fn infer_upward_scroll(prev_rows: &[String], next_rows: &[String]) -> u16 {
-    let max_shift = prev_rows.len().min(next_rows.len());
-    for shift in (1..max_shift).rev() {
-        if prev_rows
-            .iter()
-            .skip(shift)
-            .zip(next_rows.iter())
-            .all(|(prev, next)| prev == next)
-        {
-            return shift as u16;
-        }
-    }
-    0
 }
 
 #[derive(SystemParam)]
@@ -349,7 +328,12 @@ fn reflow_terminal(
     window_size: Vec2,
     render_scale: f32,
 ) -> crate::terminal::TerminalLayout {
-    let layout = terminal.resize_to_fit(window_size, render_scale);
+    terminal.set_render_scale(render_scale);
+    let grid = bevy_terminal_ratatui::bevy_terminal::render::grid_for(
+        window_size.max(Vec2::ONE),
+        terminal.char_dimensions(),
+    );
+    let layout = terminal.layout_for_size(grid.width, grid.height);
     let pty_pixels = layout.pty_pixels();
     if let Err(error) = runtime.resize(
         layout.cols,
@@ -359,7 +343,11 @@ fn reflow_terminal(
     ) {
         warn!("terminal resize remains pending: {error:#}");
     }
-    layout
+    let applied = runtime.screen().size();
+    if terminal.cols != applied.cols() || terminal.rows != applied.rows() {
+        terminal.resize(applied.cols(), applied.rows());
+    }
+    terminal.layout()
 }
 
 /// Retries an operating-system PTY resize that failed when it was requested.
@@ -790,6 +778,7 @@ pub(crate) fn finish_terminal_model_load(mut params: ModelLoadParams) {
 /// Synchronizes Kitty inline objects.
 #[derive(SystemParam)]
 pub(crate) struct SyncInlineParams<'w, 's> {
+    runtime: Res<'w, TerminalRuntime>,
     commands: Commands<'w, 's>,
     inline_objects: ResMut<'w, TerminalInlineObjects>,
     terminal: Res<'w, TerminalSurface>,
@@ -819,6 +808,7 @@ pub(crate) struct SyncInlineParams<'w, 's> {
 /// Warp motion is handled in place by [`animate_inline_kitty_planes`].
 pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
     let SyncInlineParams {
+        runtime,
         commands,
         inline_objects,
         terminal,
@@ -836,6 +826,8 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         images,
         meshes,
     } = &mut params;
+    inline_objects.refresh_text_anchors(runtime.screen());
+    inline_objects.refresh_placeholder_anchors(runtime.screen());
     if !inline_objects.needs_sync(viewport.size, terminal.cols, terminal.rows) {
         return;
     }
@@ -862,7 +854,7 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
         .iter()
         .filter_map(|(object_id, anchor)| {
             inline_objects.objects.get(object_id)?;
-            let start = anchor.row as i32;
+            let start = anchor.row;
             let end = start + anchor.rows as i32;
             (start < terminal.rows as i32 && end > 0).then_some(*object_id)
         })
@@ -2361,6 +2353,7 @@ fn mobius_surface_point(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::scene::MobiusEnterZoomFloor;
 

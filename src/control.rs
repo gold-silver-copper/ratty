@@ -826,8 +826,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                     "terminal columns and rows must be between 1 and 1000",
                 );
             }
-            terminal.resize(request.columns, request.rows);
-            let layout = terminal.layout();
+            let layout = terminal.layout_for_size(request.columns, request.rows);
             let pixels = layout.pty_pixels();
             if let Err(error) = runtime.resize(
                 request.columns,
@@ -835,12 +834,20 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                 pixels.x as u16,
                 pixels.y as u16,
             ) {
-                warn!("terminal resize remains pending: {error:#}");
+                let applied = runtime.screen().size();
+                terminal.resize(applied.cols(), applied.rows());
+                sync_terminal_layout(terminal.layout(), viewport, plane_query, plane_back_query);
+                redraw.request();
+                return ControlResponse::error(format!(
+                    "resize failed (PTY retry pending: {}): {error:#}",
+                    runtime.resize_pending()
+                ));
             }
-            sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
+            terminal.resize(request.columns, request.rows);
+            sync_terminal_layout(terminal.layout(), viewport, plane_query, plane_back_query);
             redraw.request();
             ControlResponse::data(
-                serde_json::json!({ "columns": request.columns, "rows": request.rows }),
+                serde_json::json!({ "columns": request.columns, "rows": request.rows, "pending": false }),
             )
         }
         ControlCommand::Close {} => {
@@ -1031,16 +1038,23 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                 terminal.set_font_size(size);
                 app_config.font.size = size;
             }
-            terminal.resize(columns, rows);
-            let layout = terminal.layout();
+            let layout = terminal.layout_for_size(columns, rows);
             let pixels = layout.pty_pixels();
             if let Err(error) = runtime.resize(columns, rows, pixels.x as u16, pixels.y as u16) {
-                warn!("terminal resize remains pending: {error:#}");
+                let applied = runtime.screen().size();
+                terminal.resize(applied.cols(), applied.rows());
+                sync_terminal_layout(terminal.layout(), viewport, plane_query, plane_back_query);
+                redraw.request();
+                return ControlResponse::error(format!(
+                    "resize failed (PTY retry pending: {}): {error:#}",
+                    runtime.resize_pending()
+                ));
             }
-            sync_terminal_layout(layout, viewport, plane_query, plane_back_query);
+            terminal.resize(columns, rows);
+            sync_terminal_layout(terminal.layout(), viewport, plane_query, plane_back_query);
             redraw.request();
             ControlResponse::data(
-                serde_json::json!({ "columns": columns, "rows": rows, "font_size": terminal.font_size() }),
+                serde_json::json!({ "columns": columns, "rows": rows, "font_size": terminal.font_size(), "pending": false }),
             )
         }
         ControlCommand::SetShape(update) => {

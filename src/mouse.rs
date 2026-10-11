@@ -17,9 +17,13 @@ use crate::keyboard::enter_mobius_presentation;
 use crate::runtime::TerminalRuntime;
 use crate::scene::{MobiusTransition, TerminalPresentationMode, TerminalViewport};
 use crate::terminal::TerminalSurface;
-use fux_vt::{MouseProtocolEncoding, MouseProtocolMode};
+use fux_vt::keys::{
+    Modifiers,
+    mouse::{MouseAction, MouseButton as VtButton, MouseEvent},
+};
+use fux_vt::{MouseProtocolEncoding, MouseProtocolMode, Screen};
 
-use crate::screen::ScreenView;
+use crate::screen::{ScreenView, TextAnchor};
 
 /// Distance in pixels the pointer must move with a pending selection to start dragging.
 const SELECTION_DRAG_THRESHOLD: f32 = 4.0;
@@ -42,6 +46,9 @@ pub struct TerminalSelection {
     pending_position: Option<Vec2>,
     dragging: bool,
     cursor_position: Option<Vec2>,
+    start_anchor: Option<TextAnchor>,
+    end_anchor: Option<TextAnchor>,
+    pending_anchor: Option<TextAnchor>,
 }
 
 #[derive(Default)]
@@ -50,6 +57,87 @@ pub(crate) struct ForwardedMouseState {
     middle_pressed: bool,
     right_pressed: bool,
     last_cell: Option<UVec2>,
+    protocol: Option<(MouseProtocolMode, MouseProtocolEncoding)>,
+}
+
+impl ForwardedMouseState {
+    fn held(&self) -> Option<VtButton> {
+        if self.left_pressed {
+            Some(VtButton::Left)
+        } else if self.middle_pressed {
+            Some(VtButton::Middle)
+        } else if self.right_pressed {
+            Some(VtButton::Right)
+        } else {
+            None
+        }
+    }
+
+    fn button(
+        &mut self,
+        button: VtButton,
+        pressed: bool,
+        cell: Option<UVec2>,
+        screen: &Screen,
+        mods: Modifiers,
+    ) -> Vec<u8> {
+        let owned = match button {
+            VtButton::Left => &mut self.left_pressed,
+            VtButton::Middle => &mut self.middle_pressed,
+            VtButton::Right => &mut self.right_pressed,
+            _ => return Vec::new(),
+        };
+        if !pressed && !*owned {
+            return Vec::new();
+        }
+        let action = if pressed {
+            MouseAction::Press
+        } else {
+            MouseAction::Release
+        };
+        let mut cell = cell.or_else(|| (!pressed).then_some(self.last_cell).flatten());
+        let mut out = cell.map_or_else(Vec::new, |cell| {
+            encode_mouse_event(screen, cell, action, Some(button), mods)
+        });
+        // A legacy drag can leave the representable coordinate range. Release
+        // at the last position actually delivered instead of losing ownership.
+        if !pressed
+            && out.is_empty()
+            && let Some(last) = self.last_cell
+        {
+            out = encode_mouse_event(screen, last, action, Some(button), mods);
+            cell = Some(last);
+        }
+        if pressed {
+            *owned = !out.is_empty();
+        } else {
+            *owned = false;
+        }
+        if !out.is_empty() {
+            self.last_cell = cell;
+        }
+        out
+    }
+
+    fn motion(&mut self, cell: UVec2, screen: &Screen, mods: Modifiers) -> Vec<u8> {
+        if self.last_cell == Some(cell) {
+            return Vec::new();
+        }
+        let out = encode_mouse_event(screen, cell, MouseAction::Motion, self.held(), mods);
+        if !out.is_empty() {
+            self.last_cell = Some(cell);
+        }
+        out
+    }
+
+    fn release_all(&mut self, screen: &Screen, mods: Modifiers) -> Vec<u8> {
+        let mut out = Vec::new();
+        for button in [VtButton::Left, VtButton::Middle, VtButton::Right] {
+            out.extend(self.button(button, false, self.last_cell, screen, mods));
+        }
+        self.last_cell = None;
+        out
+    }
 }
 
 #[derive(Default)]
@@ -229,17 +317,25 @@ impl TerminalSelection {
     pub fn normalized_bounds(&self) -> Option<SelectionBounds> {
         let start = self.start?;
         let end = self.end.unwrap_or(start);
+        let (start, end) = if (start.y, start.x) <= (end.y, end.x) {
+            (start, end)
+        } else {
+            (end, start)
+        };
         Some(SelectionBounds {
-            start_row: start.y.min(end.y),
-            end_row: start.y.max(end.y),
-            start_col: start.x.min(end.x),
-            end_col: start.x.max(end.x),
+            start_row: start.y,
+            end_row: end.y,
+            start_col: start.x,
+            end_col: end.x,
         })
     }
 
     /// Starts a selection at a cell.
     pub fn begin(&mut self, cell: UVec2) -> bool {
         let changed = self.start != Some(cell) || self.end != Some(cell) || !self.dragging;
+        self.start_anchor = None;
+        self.end_anchor = None;
+        self.pending_anchor = None;
         self.start = Some(cell);
         self.end = Some(cell);
         self.pending_start = None;
@@ -253,6 +349,9 @@ impl TerminalSelection {
         let changed = self.start.is_some() || self.end.is_some() || self.dragging;
         self.start = None;
         self.end = None;
+        self.start_anchor = None;
+        self.end_anchor = None;
+        self.pending_anchor = None;
         self.pending_start = Some(cell);
         self.pending_position = Some(position);
         self.dragging = false;
@@ -263,6 +362,7 @@ impl TerminalSelection {
     pub fn update(&mut self, cell: UVec2) -> bool {
         if self.dragging && self.end != Some(cell) {
             self.end = Some(cell);
+            self.end_anchor = None;
             return true;
         }
         false
@@ -285,6 +385,8 @@ impl TerminalSelection {
             return false;
         }
 
+        self.start_anchor = self.pending_anchor.take();
+        self.end_anchor = None;
         self.start = Some(start);
         self.end = Some(cell);
         self.pending_start = None;
@@ -315,6 +417,9 @@ impl TerminalSelection {
         self.pending_position = None;
         self.dragging = false;
         self.cursor_position = None;
+        self.start_anchor = None;
+        self.end_anchor = None;
+        self.pending_anchor = None;
         changed
     }
 
@@ -328,57 +433,90 @@ impl TerminalSelection {
         self.cursor_position
     }
 
-    /// Returns the selected screen text.
-    ///
-    /// Kept hand-rolled rather than using the engine's `contents_between`:
-    /// ratty's selection is a plain rectangular row/column range driven by the
-    /// 3D viewport, and it must keep interior blank cells as spaces.
-    pub fn selected_text(&self, screen: ScreenView<'_>) -> Option<String> {
-        let bounds = self.normalized_bounds()?;
-
-        let cols = screen.size().cols();
-        let mut out = String::new();
-
-        let start_row = bounds.start_row as u16;
-        let end_row = bounds.end_row as u16;
-        let start_col = bounds.start_col as u16;
-        let end_col = bounds.end_col as u16;
-
-        for row in start_row..=end_row {
-            let row_start = if row == start_row { start_col } else { 0 };
-            let row_end = if row == end_row {
-                end_col.min(cols.saturating_sub(1))
-            } else {
-                cols.saturating_sub(1)
-            };
-
-            if let Some(grid_row) = screen.visible_row(row) {
-                for col in row_start..=row_end {
-                    let Some(cell) = grid_row.cell(usize::from(col)) else {
-                        break;
-                    };
-                    // The second half of a wide glyph is padding, not an
-                    // empty cell; a space there would split every CJK glyph.
-                    if cell.is_wide_continuation() {
-                        continue;
-                    }
-                    if cell.has_contents() {
-                        out.push_str(cell.contents());
-                    } else {
-                        out.push(' ');
-                    }
+    /// Capture newly selected endpoints and refresh positions after output or
+    /// reflow. A lost row or screen switch clears the selection rather than
+    /// selecting unrelated text that moved into its former coordinates.
+    pub(crate) fn anchor_to(&mut self, screen: ScreenView<'_>) {
+        let capture = |point: UVec2| {
+            Some(TextAnchor::capture(
+                &screen,
+                screen.visible_row(u16::try_from(point.y).ok()?)?,
+                u16::try_from(point.x).ok()?,
+            ))
+        };
+        let mut invalid = false;
+        for (point, anchor) in [
+            (&mut self.start, &mut self.start_anchor),
+            (&mut self.end, &mut self.end_anchor),
+            (&mut self.pending_start, &mut self.pending_anchor),
+        ] {
+            if let Some(old) = *anchor {
+                let Some((row, col)) = old.resolve(&screen) else {
+                    invalid = true;
+                    break;
+                };
+                *anchor = Some(TextAnchor::capture(&screen, row, col));
+                if let Some(y) = screen.window().place(&row) {
+                    *point = Some(UVec2::new(u32::from(col), u32::from(y)));
                 }
-            }
-
-            if row != end_row {
-                while out.ends_with(' ') {
-                    out.pop();
-                }
-                out.push('\n');
+            } else if let Some(point) = *point {
+                *anchor = capture(point);
             }
         }
+        if invalid {
+            self.clear();
+        }
+    }
 
-        Some(out)
+    /// The visible selection. If either endpoint is outside the window, copying
+    /// and highlighting both wait until that retained range is visible again.
+    pub(crate) fn bounds_in(&self, screen: ScreenView<'_>) -> Option<SelectionBounds> {
+        let resolve = |anchor: Option<TextAnchor>, point: Option<UVec2>| {
+            if let Some(anchor) = anchor {
+                let (row, col) = anchor.resolve(&screen)?;
+                Some(UVec2::new(
+                    u32::from(col),
+                    u32::from(screen.window().place(&row)?),
+                ))
+            } else {
+                point
+            }
+        };
+        let start = resolve(self.start_anchor, self.start)?;
+        let end = if self.end.is_some() {
+            resolve(self.end_anchor, self.end)?
+        } else {
+            start
+        };
+        let (start, end) = if (start.y, start.x) <= (end.y, end.x) {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        Some(SelectionBounds {
+            start_row: start.y,
+            start_col: start.x,
+            end_row: end.y,
+            end_col: end.x,
+        })
+    }
+
+    /// Copies a linear selection, joining soft wraps and including complete
+    /// wide glyphs. Refuse excessively large copies before allocating them.
+    pub fn selected_text(&self, screen: ScreenView<'_>) -> Option<String> {
+        const MAX_COPY_CELLS: usize = 1_000_000;
+        const MAX_COPY_BYTES: usize = 16 * 1024 * 1024;
+        let bounds = self.bounds_in(screen)?;
+        let point = |row, col| Some((u16::try_from(row).ok()?, u16::try_from(col).ok()?));
+        screen
+            .window()
+            .text(
+                point(bounds.start_row, bounds.start_col)?,
+                point(bounds.end_row, bounds.end_col)?,
+                MAX_COPY_CELLS,
+                MAX_COPY_BYTES,
+            )
+            .ok()
     }
 }
 
@@ -387,6 +525,7 @@ impl TerminalSelection {
 pub struct MouseSystemParams<'w, 's> {
     primary_window: Query<'w, 's, (Entity, &'static Window), With<PrimaryWindow>>,
     runtime: ResMut<'w, TerminalRuntime>,
+    keys: Res<'w, ButtonInput<KeyCode>>,
     terminal: Res<'w, TerminalSurface>,
     viewport: Res<'w, TerminalViewport>,
     camera_slots: ResMut<'w, TerminalCameraSlots>,
@@ -415,6 +554,7 @@ pub(crate) fn handle_mouse_input(
     let MouseSystemParams {
         primary_window,
         runtime,
+        keys,
         terminal,
         viewport,
         camera_slots,
@@ -428,44 +568,36 @@ pub(crate) fn handle_mouse_input(
         return;
     };
 
+    selection.anchor_to(runtime.screen());
     let window_size = window.resolution.size().max(Vec2::ONE);
     let mouse_mode = runtime.screen().mouse_protocol_mode();
     let mouse_encoding = runtime.screen().mouse_protocol_encoding();
 
-    // Button releases delivered while the window is unfocused never reach the
-    // handlers below, so losing focus mid-drag would otherwise leave held
-    // button state re-arming on bare cursor movement after refocus.
-    for event in focus_events.read() {
-        if event.window == primary_window && !event.focused {
-            // The PTY application saw the press and will never see the real
-            // release, so synthesize one per held button before dropping the
-            // local state.
-            if mouse_mode != MouseProtocolMode::None
-                && let Some(cell) = forwarded_mouse.last_cell
-            {
-                for (pressed, code) in [
-                    (forwarded_mouse.left_pressed, 0),
-                    (forwarded_mouse.middle_pressed, 1),
-                    (forwarded_mouse.right_pressed, 2),
-                ] {
-                    if pressed {
-                        runtime.write_human_input(&encode_mouse_event(
-                            cell,
-                            code,
-                            true,
-                            mouse_encoding,
-                        ));
-                    }
-                }
-            }
-            release_pointer_drags(camera_interaction, selection, &mut forwarded_mouse);
-            touch_gesture.reset();
-        }
-    }
+    let mods = mouse_modifiers(keys);
     let mode = camera_slots.active().mode;
     let mobius_animating = mode == TerminalPresentationMode::Mobius3d && mobius_transition.active;
     let forward_mouse =
         mode == TerminalPresentationMode::Flat2d && mouse_mode != MouseProtocolMode::None;
+    let protocol = (mouse_mode, mouse_encoding);
+    if forwarded_mouse.protocol != Some(protocol) || !forward_mouse {
+        let releases = forwarded_mouse.release_all(&runtime.screen(), mods);
+        runtime.write_human_input(&releases);
+        forwarded_mouse.protocol = Some(protocol);
+    }
+    for event in focus_events.read() {
+        if event.window != primary_window {
+            continue;
+        }
+        if !event.focused {
+            let releases = forwarded_mouse.release_all(&runtime.screen(), mods);
+            runtime.write_human_input(&releases);
+            release_pointer_drags(camera_interaction, selection, &mut forwarded_mouse);
+            touch_gesture.reset();
+        }
+        let mut report = Vec::new();
+        runtime.screen().encode_focus(event.focused, &mut report);
+        runtime.write_human_input(&report);
+    }
 
     for event in cursor_events.read() {
         if event.window != primary_window {
@@ -494,34 +626,15 @@ pub(crate) fn handle_mouse_input(
                 camera_interaction.last_pan_cursor = Some(event.position);
             }
         } else if forward_mouse {
-            if let Some(cell) = position_to_cell(event.position, window_size, viewport, terminal)
-                && forwarded_mouse.last_cell != Some(cell)
-                && match mouse_mode {
-                    MouseProtocolMode::ButtonMotion => {
-                        forwarded_mouse.left_pressed
-                            || forwarded_mouse.middle_pressed
-                            || forwarded_mouse.right_pressed
-                    }
-                    MouseProtocolMode::AnyMotion => true,
-                    _ => false,
-                }
-            {
-                let button_code = if forwarded_mouse.left_pressed {
-                    32
-                } else if forwarded_mouse.middle_pressed {
-                    33
-                } else if forwarded_mouse.right_pressed {
-                    34
-                } else {
-                    35
-                };
-                runtime.write_human_input(&encode_mouse_event(
-                    cell,
-                    button_code,
-                    false,
-                    mouse_encoding,
-                ));
-                forwarded_mouse.last_cell = Some(cell);
+            if let Some(cell) = mouse_cell(
+                event.position,
+                window_size,
+                viewport,
+                terminal,
+                forwarded_mouse.held().is_some(),
+            ) {
+                let report = forwarded_mouse.motion(cell, &runtime.screen(), mods);
+                runtime.write_human_input(&report);
             }
         } else if (selection.dragging || selection.pending_start.is_some())
             && let Some(cell) = position_to_cell(event.position, window_size, viewport, terminal)
@@ -565,29 +678,37 @@ pub(crate) fn handle_mouse_input(
             continue;
         }
 
+        if forward_mouse {
+            let button = match event.button {
+                MouseButton::Left => Some(VtButton::Left),
+                MouseButton::Middle => Some(VtButton::Middle),
+                MouseButton::Right => Some(VtButton::Right),
+                _ => None,
+            };
+            if let Some(button) = button {
+                let pressed = event.state == ButtonState::Pressed;
+                let cell = window
+                    .cursor_position()
+                    .or(selection.cursor_position())
+                    .and_then(|position| {
+                        mouse_cell(position, window_size, viewport, terminal, !pressed)
+                    });
+                let report = forwarded_mouse.button(button, pressed, cell, &runtime.screen(), mods);
+                runtime.write_human_input(&report);
+            }
+            continue;
+        }
         match (event.button, event.state) {
+            (MouseButton::Left, ButtonState::Pressed) if mode.is_3d() => {
+                camera_interaction.rotating = true;
+                camera_interaction.last_rotate_cursor = selection.cursor_position();
+            }
+            (MouseButton::Left, ButtonState::Released) if mode.is_3d() => {
+                camera_interaction.rotating = false;
+                camera_interaction.last_rotate_cursor = selection.cursor_position();
+            }
             (MouseButton::Left, ButtonState::Pressed) => {
-                if forward_mouse {
-                    forwarded_mouse.left_pressed = true;
-                    if let Some(cell) = window
-                        .cursor_position()
-                        .or(selection.cursor_position())
-                        .and_then(|position| {
-                            position_to_cell(position, window_size, viewport, terminal)
-                        })
-                    {
-                        runtime.write_human_input(&encode_mouse_event(
-                            cell,
-                            0,
-                            false,
-                            mouse_encoding,
-                        ));
-                        forwarded_mouse.last_cell = Some(cell);
-                    }
-                } else if mode.is_3d() {
-                    camera_interaction.rotating = true;
-                    camera_interaction.last_rotate_cursor = selection.cursor_position();
-                } else if let Some(pos) = selection.cursor_position()
+                if let Some(pos) = selection.cursor_position()
                     && let Some(cell) = position_to_cell(pos, window_size, viewport, terminal)
                     && selection.begin_pending(cell, pos)
                 {
@@ -595,81 +716,7 @@ pub(crate) fn handle_mouse_input(
                 }
             }
             (MouseButton::Left, ButtonState::Released) => {
-                if forward_mouse {
-                    forwarded_mouse.left_pressed = false;
-                    if let Some(cell) = window
-                        .cursor_position()
-                        .or(selection.cursor_position())
-                        .and_then(|position| {
-                            position_to_cell(position, window_size, viewport, terminal)
-                        })
-                    {
-                        runtime.write_human_input(&encode_mouse_event(
-                            cell,
-                            0,
-                            true,
-                            mouse_encoding,
-                        ));
-                        forwarded_mouse.last_cell = Some(cell);
-                    }
-                } else if mode.is_3d() {
-                    camera_interaction.rotating = false;
-                    camera_interaction.last_rotate_cursor = selection.cursor_position();
-                } else {
-                    let _ = selection.end();
-                }
-            }
-            (MouseButton::Middle, ButtonState::Pressed) if forward_mouse => {
-                forwarded_mouse.middle_pressed = true;
-                if let Some(cell) = window
-                    .cursor_position()
-                    .or(selection.cursor_position())
-                    .and_then(|position| {
-                        position_to_cell(position, window_size, viewport, terminal)
-                    })
-                {
-                    runtime.write_human_input(&encode_mouse_event(cell, 1, false, mouse_encoding));
-                    forwarded_mouse.last_cell = Some(cell);
-                }
-            }
-            (MouseButton::Middle, ButtonState::Released) if forward_mouse => {
-                forwarded_mouse.middle_pressed = false;
-                if let Some(cell) = window
-                    .cursor_position()
-                    .or(selection.cursor_position())
-                    .and_then(|position| {
-                        position_to_cell(position, window_size, viewport, terminal)
-                    })
-                {
-                    runtime.write_human_input(&encode_mouse_event(cell, 1, true, mouse_encoding));
-                    forwarded_mouse.last_cell = Some(cell);
-                }
-            }
-            (MouseButton::Right, ButtonState::Pressed) if forward_mouse => {
-                forwarded_mouse.right_pressed = true;
-                if let Some(cell) = window
-                    .cursor_position()
-                    .or(selection.cursor_position())
-                    .and_then(|position| {
-                        position_to_cell(position, window_size, viewport, terminal)
-                    })
-                {
-                    runtime.write_human_input(&encode_mouse_event(cell, 2, false, mouse_encoding));
-                    forwarded_mouse.last_cell = Some(cell);
-                }
-            }
-            (MouseButton::Right, ButtonState::Released) if forward_mouse => {
-                forwarded_mouse.right_pressed = false;
-                if let Some(cell) = window
-                    .cursor_position()
-                    .or(selection.cursor_position())
-                    .and_then(|position| {
-                        position_to_cell(position, window_size, viewport, terminal)
-                    })
-                {
-                    runtime.write_human_input(&encode_mouse_event(cell, 2, true, mouse_encoding));
-                    forwarded_mouse.last_cell = Some(cell);
-                }
+                selection.end();
             }
             (MouseButton::Right, ButtonState::Pressed) if mode.is_3d() => {
                 camera_interaction.panning = true;
@@ -684,6 +731,9 @@ pub(crate) fn handle_mouse_input(
     }
 
     for event in wheel_events.read() {
+        if event.window != primary_window {
+            continue;
+        }
         let delta = match event.unit {
             MouseScrollUnit::Line => event.y * 0.1,
             MouseScrollUnit::Pixel => event.y * 0.001,
@@ -695,12 +745,8 @@ pub(crate) fn handle_mouse_input(
                 .or(selection.cursor_position())
                 .and_then(|position| position_to_cell(position, window_size, viewport, terminal))
             {
-                runtime.write_human_input(&encode_mouse_event(
-                    cell,
-                    if delta > 0.0 { 64 } else { 65 },
-                    false,
-                    mouse_encoding,
-                ));
+                let report = encode_mouse_wheel(cell, delta > 0.0, &runtime.screen(), mods);
+                runtime.write_human_input(&report);
             }
         } else if mode == TerminalPresentationMode::Flat2d
             && !runtime.screen().mode(fux_vt::Mode::AlternateScreen)
@@ -735,37 +781,73 @@ pub(crate) fn handle_mouse_input(
             );
         }
     }
+    selection.anchor_to(runtime.screen());
 }
 
 fn encode_mouse_event(
+    screen: &Screen,
     cell: UVec2,
-    button_code: u16,
-    release: bool,
-    encoding: MouseProtocolEncoding,
+    action: MouseAction,
+    button: Option<VtButton>,
+    mods: Modifiers,
 ) -> Vec<u8> {
-    let col = cell.x + 1;
-    let row = cell.y + 1;
-    match encoding {
-        MouseProtocolEncoding::Sgr => {
-            let final_byte = if release { 'm' } else { 'M' };
-            format!("\x1b[<{button_code};{col};{row}{final_byte}").into_bytes()
-        }
-        MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => {
-            let code = if release { 3 } else { button_code }.saturating_add(32);
-            let x = (col + 32).min(u8::MAX as u32) as u8;
-            let y = (row + 32).min(u8::MAX as u32) as u8;
-            vec![0x1b, b'[', b'M', code as u8, x, y]
-        }
-        _ => Vec::new(),
+    let mut out = Vec::new();
+    if let (Ok(row), Ok(col)) = (u16::try_from(cell.y), u16::try_from(cell.x)) {
+        screen.encode_mouse(
+            MouseEvent {
+                action,
+                button,
+                mods,
+                row,
+                col,
+            },
+            &mut out,
+        );
+    }
+    out
+}
+
+pub(crate) fn mouse_modifiers(keys: &ButtonInput<KeyCode>) -> Modifiers {
+    Modifiers {
+        ctrl: keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]),
+        alt: keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]),
+        shift: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
     }
 }
 
 pub(crate) fn encode_mouse_wheel(
     cell: UVec2,
     up: bool,
-    encoding: MouseProtocolEncoding,
+    screen: &Screen,
+    mods: Modifiers,
 ) -> Vec<u8> {
-    encode_mouse_event(cell, if up { 64 } else { 65 }, false, encoding)
+    encode_mouse_event(
+        screen,
+        cell,
+        MouseAction::Press,
+        Some(if up {
+            VtButton::WheelUp
+        } else {
+            VtButton::WheelDown
+        }),
+        mods,
+    )
+}
+
+fn mouse_cell(
+    position: Vec2,
+    window_size: Vec2,
+    viewport: &TerminalViewport,
+    terminal: &TerminalSurface,
+    held: bool,
+) -> Option<UVec2> {
+    let position = if held {
+        let margin = (window_size - viewport.size).max(Vec2::ZERO) * 0.5;
+        position.clamp(margin, margin + (viewport.size - Vec2::ONE).max(Vec2::ZERO))
+    } else {
+        position
+    };
+    position_to_cell(position, window_size, viewport, terminal)
 }
 
 fn position_to_cell(
@@ -957,6 +1039,7 @@ mod wheel_zoom_tests {
             middle_pressed: true,
             right_pressed: true,
             last_cell: Some(UVec2::ZERO),
+            protocol: None,
         };
 
         release_pointer_drags(&mut interaction, &mut selection, &mut forwarded);
@@ -1026,9 +1109,131 @@ mod tests {
 
     use fux_vt::Parser;
 
+    #[test]
+    fn mouse_utf8_encodes_multibyte_positions() {
+        let parser = terminal(2, 400, "\x1b[?1000h\x1b[?1005h");
+        let bytes = encode_mouse_event(
+            parser.screen(),
+            UVec2::new(300, 0),
+            MouseAction::Press,
+            Some(VtButton::Left),
+            Modifiers::NONE,
+        );
+        assert_eq!(bytes, "\x1b[M \u{14d}!".as_bytes());
+    }
+
+    #[test]
+    fn mouse_legacy_refuses_out_of_range_positions() {
+        assert!(
+            encode_mouse_event(
+                terminal(2, 400, "\x1b[?1000h").screen(),
+                UVec2::new(223, 0),
+                MouseAction::Press,
+                Some(VtButton::Left),
+                Modifiers::NONE
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn forwarded_buttons_require_a_delivered_press_and_release_once() {
+        let parser = terminal(3, 20, "\x1b[?1002h\x1b[?1006h");
+        let screen = parser.screen();
+        let mut state = ForwardedMouseState::default();
+        assert!(
+            state
+                .button(VtButton::Left, true, None, screen, Modifiers::NONE)
+                .is_empty()
+        );
+        assert!(state.held().is_none());
+        assert!(
+            state
+                .button(
+                    VtButton::Left,
+                    false,
+                    Some(UVec2::ZERO),
+                    screen,
+                    Modifiers::NONE
+                )
+                .is_empty()
+        );
+        let mods = Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+        };
+        assert_eq!(
+            state.button(VtButton::Left, true, Some(UVec2::ZERO), screen, mods),
+            b"\x1b[<28;1;1M"
+        );
+        assert!(state.motion(UVec2::ZERO, screen, mods).is_empty());
+        assert_eq!(
+            state.motion(UVec2::new(19, 2), screen, mods),
+            b"\x1b[<60;20;3M"
+        );
+        // Missing coordinates on window exit still release the owned button.
+        assert_eq!(
+            state.button(VtButton::Left, false, None, screen, mods),
+            b"\x1b[<28;20;3m"
+        );
+        assert!(state.release_all(screen, mods).is_empty());
+    }
+
+    #[test]
+    fn focus_loss_releases_only_delivered_buttons_and_reports_focus() {
+        let parser = terminal(3, 20, "\x1b[?1000h\x1b[?1006h\x1b[?1004h");
+        let mut state = ForwardedMouseState::default();
+        state.button(
+            VtButton::Right,
+            true,
+            Some(UVec2::new(2, 1)),
+            parser.screen(),
+            Modifiers::NONE,
+        );
+        let mut out = state.release_all(parser.screen(), Modifiers::NONE);
+        parser.screen().encode_focus(false, &mut out);
+        parser.screen().encode_focus(true, &mut out);
+        assert_eq!(out, b"\x1b[<2;3;2m\x1b[O\x1b[I");
+        assert!(state.held().is_none());
+    }
+
+    #[test]
+    fn x10_filters_wheel_releases_and_motion() {
+        let parser = terminal(3, 20, "\x1b[?9h");
+        let mut state = ForwardedMouseState::default();
+        assert!(
+            !state
+                .button(
+                    VtButton::Left,
+                    true,
+                    Some(UVec2::ZERO),
+                    parser.screen(),
+                    Modifiers::CTRL
+                )
+                .is_empty()
+        );
+        assert!(
+            state
+                .motion(UVec2::ONE, parser.screen(), Modifiers::NONE)
+                .is_empty()
+        );
+        assert!(encode_mouse_wheel(UVec2::ZERO, true, parser.screen(), Modifiers::NONE).is_empty());
+        assert!(
+            state
+                .release_all(parser.screen(), Modifiers::NONE)
+                .is_empty()
+        );
+        assert!(state.held().is_none());
+    }
+
     fn terminal(rows: u16, cols: u16, input: &str) -> Parser {
-        let mut parser =
-            Parser::new(fux_vt::Size::new(rows, cols).expect("valid size"), 1000).expect("parser");
+        let mut parser = Parser::with_options(
+            fux_vt::Size::new(rows, cols).expect("valid size"),
+            1000,
+            fux_vt::Feature::Reflow.into(),
+        )
+        .expect("parser");
         parser.process(input.as_bytes()).expect("process");
         parser
     }
@@ -1052,6 +1257,71 @@ mod tests {
             selection.selected_text(view(&term)).as_deref(),
             Some("hello world")
         );
+    }
+
+    #[test]
+    fn selection_joins_soft_wraps() {
+        let term = terminal(3, 4, "abcdef");
+        assert_eq!(
+            select((0, 0), (1, 1)).selected_text(view(&term)).as_deref(),
+            Some("abcdef")
+        );
+    }
+
+    #[test]
+    fn selection_includes_a_wide_glyph_from_its_trailing_half() {
+        let term = terminal(3, 4, "界");
+        assert_eq!(
+            select((1, 0), (1, 0)).selected_text(view(&term)).as_deref(),
+            Some("界")
+        );
+    }
+
+    #[test]
+    fn selection_orders_endpoints_by_row_then_column() {
+        let term = terminal(3, 8, "abcdef\r\nghijkl");
+        for (start, end) in [((4, 0), (1, 1)), ((1, 1), (4, 0))] {
+            assert_eq!(
+                select(start, end).selected_text(view(&term)).as_deref(),
+                Some("ef\ngh")
+            );
+        }
+    }
+
+    #[test]
+    fn selection_follows_rows_through_output_reflow_and_eviction() {
+        let mut term = terminal(4, 8, "first\r\nabcdef\r\nlast");
+        let mut selection = select((1, 1), (4, 1));
+        selection.anchor_to(view(&term));
+        term.process(b"\r\nnext\r\n").expect("valid test operation");
+        selection.anchor_to(view(&term));
+        assert_eq!(
+            selection.selected_text(view(&term)).as_deref(),
+            Some("bcde")
+        );
+        term.resize(fux_vt::Size::new(6, 4).expect("valid test operation"))
+            .expect("valid test operation");
+        selection.anchor_to(view(&term));
+        assert_eq!(
+            selection.selected_text(view(&term)).as_deref(),
+            Some("bcde")
+        );
+        term.process(&b"\r\n".repeat(1010))
+            .expect("valid test operation");
+        selection.anchor_to(view(&term));
+        assert!(selection.selected_text(view(&term)).is_none());
+        assert!(selection.normalized_bounds().is_none());
+    }
+
+    #[test]
+    fn screen_switch_clears_retained_selection() {
+        let mut term = terminal(3, 8, "abc");
+        let mut selection = select((0, 0), (2, 0));
+        selection.anchor_to(view(&term));
+        term.process(b"\x1b[?1049h").expect("valid test operation");
+        selection.anchor_to(view(&term));
+        term.process(b"\x1b[?1049l").expect("valid test operation");
+        assert!(selection.selected_text(view(&term)).is_none());
     }
 
     #[test]

@@ -113,22 +113,23 @@ impl Sink for TerminalParserSink {
 /// the row at its top: rows scrolled into history or re-wrapped by a reflow
 /// would otherwise slide under it. A row that leaves history altogether
 /// leaves the offset as it was, clamped to the history left.
-fn keep_scrollback_anchored(
+fn keep_scrollback_anchored<T>(
     parser: &mut Parser,
     scrollback: &mut usize,
-    change: impl FnOnce(&mut Parser),
-) {
+    change: impl FnOnce(&mut Parser) -> T,
+) -> T {
     let anchor = (*scrollback > 0)
         .then(|| ScreenView::new(parser.screen(), *scrollback).visible_row(0))
         .flatten()
         .map(|row| row.id());
-    change(parser);
+    let result = change(parser);
     let screen = parser.screen();
     *scrollback = anchor
         .and_then(|id| screen.row_by_id(id))
         .map(|row| screen.history_len().saturating_sub(row.index()))
         .unwrap_or(*scrollback)
         .min(screen.history_len());
+    result
 }
 
 /// Running PTY and parser state.
@@ -165,16 +166,27 @@ pub struct TerminalRuntime {
     shutdown_started: bool,
     /// Last dimensions successfully applied to the PTY.
     last_pty_size: PtyDimensions,
-    /// Last column and row dimensions applied to the VT parser.
-    last_parser_size: ParserDimensions,
     /// Desired dimensions retained until both the PTY and parser accept them.
     pending_resize: Option<PtyDimensions>,
 }
 
-/// `(cols, rows, pixel_width, pixel_height)` as sent to the PTY.
-type PtyDimensions = (u16, u16, u16, u16);
-/// `(cols, rows)` as applied to the parser grid.
-type ParserDimensions = (u16, u16);
+/// Validated character geometry and its independent physical pixel dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PtyDimensions {
+    grid: Size,
+    pixel_width: u16,
+    pixel_height: u16,
+}
+
+impl PtyDimensions {
+    fn new(cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> anyhow::Result<Self> {
+        Ok(Self {
+            grid: Size::new(rows, cols)?,
+            pixel_width,
+            pixel_height,
+        })
+    }
+}
 
 /// Returns the default shell for the current platform.
 ///
@@ -350,8 +362,7 @@ impl TerminalRuntime {
             last_output_at: None,
             child_exit_code: None,
             shutdown_started: false,
-            last_pty_size: (cols, rows, 0, 0),
-            last_parser_size: (cols, rows),
+            last_pty_size: PtyDimensions::new(cols, rows, 0, 0)?,
             pending_resize: None,
         })
     }
@@ -493,76 +504,48 @@ impl TerminalRuntime {
         self.child_exit_code
     }
 
-    /// Resizes the PTY and parser screen.
-    ///
-    /// The parser adopts the new grid immediately so local rendering, the
-    /// viewport, and mouse mapping always track the committed layout. Only
-    /// the operating-system PTY resize is cached for retry after a failure,
-    /// so until it succeeds the child still holds the previous geometry.
-    /// Dimensions equal to the last applied ones are not resent.
+    /// Validates and applies the parser grid before notifying the child. A
+    /// rejected parser resize leaves the committed geometry untouched. A PTY
+    /// failure leaves only its notification pending for an independent retry.
     ///
     /// # Errors
-    ///
-    /// Returns an error when the operating system fails to resize the PTY.
+    /// Returns a validation, parser allocation, or operating-system error.
     pub fn resize(&mut self, cols: u16, rows: u16, pw: u16, ph: u16) -> anyhow::Result<()> {
-        if cols == 0 || rows == 0 {
-            return Ok(());
+        let desired = PtyDimensions::new(cols, rows, pw, ph)?;
+        if self.parser.screen().size() != desired.grid {
+            keep_scrollback_anchored(&mut self.parser, &mut self.scrollback, |parser| {
+                parser.resize(desired.grid)
+            })
+            .context("failed to resize terminal parser")?;
+            self.screen_revision = self.screen_revision.saturating_add(1);
         }
-
-        self.pending_resize = Some((cols, rows, pw, ph));
+        self.pending_resize = Some(desired);
         self.retry_pending_resize().map(drop)
     }
 
-    /// Retries the most recently requested resize, if one remains pending.
-    ///
-    /// Returns `true` when a pending resize was applied.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the operating system fails to resize the PTY;
-    /// the request stays pending for the next attempt.
+    /// Whether the child still needs notification of the committed local size.
+    pub fn resize_pending(&self) -> bool {
+        self.pending_resize.is_some()
+    }
+
+    /// Retries only the child-facing resize. Applied dimensions change only
+    /// after the operating system accepts them.
     pub(crate) fn retry_pending_resize(&mut self) -> anyhow::Result<bool> {
-        let Some(pty_size @ (cols, rows, pw, ph)) = self.pending_resize else {
+        let Some(desired) = self.pending_resize else {
             return Ok(false);
         };
-
-        // The caller has already committed the surface, viewport, and mouse
-        // mapping to the new grid, so the local parser must follow even when
-        // the OS notification below fails. Only the child-facing ioctl is
-        // retried.
-        let parser_size = (cols, rows);
-        if self.last_parser_size != parser_size {
-            // The engine reflows content and resets the scrolling region
-            // itself, so the grid resize is the whole operation: no snapshot
-            // and replay. A failed resize (the size past the engine's
-            // allocation limit) leaves the old grid intact.
-            let Self {
-                parser, scrollback, ..
-            } = self;
-            let size = Size::new(rows, cols)?;
-            keep_scrollback_anchored(parser, scrollback, |parser| {
-                if let Err(err) = parser.resize(size) {
-                    bevy::log::warn!("terminal resize to {cols}x{rows} failed: {err}");
-                }
-            });
-            self.last_parser_size = parser_size;
-            self.screen_revision = self.screen_revision.saturating_add(1);
+        if self.last_pty_size != desired {
+            let master = self.master.get().as_ref().context("PTY is closed")?;
+            master
+                .resize(PtySize {
+                    rows: desired.grid.rows(),
+                    cols: desired.grid.cols(),
+                    pixel_width: desired.pixel_width,
+                    pixel_height: desired.pixel_height,
+                })
+                .context("failed to resize PTY")?;
+            self.last_pty_size = desired;
         }
-
-        if self.last_pty_size != pty_size {
-            if let Some(master) = self.master.get().as_ref() {
-                master
-                    .resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: pw,
-                        pixel_height: ph,
-                    })
-                    .context("failed to resize PTY")?;
-            }
-            self.last_pty_size = pty_size;
-        }
-
         self.pending_resize = None;
         Ok(true)
     }
@@ -778,9 +761,11 @@ mod resize_tests {
 
     use super::*;
 
+    type RecordedSize = (u16, u16, u16, u16);
+
     struct FailOnceMaster {
         attempts: Arc<AtomicUsize>,
-        applied_size: Arc<Mutex<Option<PtyDimensions>>>,
+        applied_size: Arc<Mutex<Option<RecordedSize>>>,
     }
 
     impl MasterPty for FailOnceMaster {
@@ -845,8 +830,7 @@ mod resize_tests {
             last_output_at: None,
             child_exit_code: None,
             shutdown_started: false,
-            last_pty_size: (80, 24, 0, 0),
-            last_parser_size: (80, 24),
+            last_pty_size: PtyDimensions::new(80, 24, 0, 0).expect("valid test operation"),
             pending_resize: None,
         }
     }
@@ -865,13 +849,22 @@ mod resize_tests {
         assert!(first.is_err());
         // The parser follows the committed layout immediately; only the
         // child-facing PTY notification is retried.
-        assert_eq!(runtime.last_pty_size, (80, 24, 0, 0));
-        assert_eq!(runtime.last_parser_size, (100, 30));
+        assert_eq!(
+            runtime.last_pty_size,
+            PtyDimensions::new(80, 24, 0, 0).expect("valid test operation")
+        );
+        assert_eq!(
+            runtime.screen().size(),
+            Size::new(30, 100).expect("valid test operation")
+        );
         assert_eq!(
             runtime.screen().size(),
             Size::new(30, 100).expect("valid size")
         );
-        assert_eq!(runtime.pending_resize, Some((100, 30, 800, 600)));
+        assert_eq!(
+            runtime.pending_resize,
+            Some(PtyDimensions::new(100, 30, 800, 600).expect("valid test operation"))
+        );
 
         let mut app = bevy::prelude::App::new();
         app.init_resource::<crate::terminal::TerminalRedrawState>();
@@ -883,7 +876,10 @@ mod resize_tests {
 
         let mut runtime = app.world_mut().resource_mut::<TerminalRuntime>();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(runtime.last_pty_size, (100, 30, 800, 600));
+        assert_eq!(
+            runtime.last_pty_size,
+            PtyDimensions::new(100, 30, 800, 600).expect("valid test operation")
+        );
         assert_eq!(runtime.pending_resize, None);
         assert_eq!(
             *applied_size.lock().expect("resize state lock"),
@@ -900,8 +896,14 @@ mod resize_tests {
             .resize(100, 30, 900, 600)
             .expect("pixel-only resize should reach the PTY");
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
-        assert_eq!(runtime.last_pty_size, (100, 30, 900, 600));
-        assert_eq!(runtime.last_parser_size, (100, 30));
+        assert_eq!(
+            runtime.last_pty_size,
+            PtyDimensions::new(100, 30, 900, 600).expect("valid test operation")
+        );
+        assert_eq!(
+            runtime.screen().size(),
+            Size::new(30, 100).expect("valid test operation")
+        );
     }
 
     #[test]
@@ -922,5 +924,24 @@ mod resize_tests {
         assert!(runtime.elapsed_since_output().is_some());
         assert_eq!(runtime.human_input_sequence(), 1);
         assert_eq!(runtime.agent_input_sequence(), 1);
+    }
+
+    #[test]
+    fn failed_parser_resize_never_reports_success_or_notifies_the_pty() {
+        let attempts = Arc::new(AtomicUsize::new(1));
+        let mut runtime = test_runtime(Box::new(FailOnceMaster {
+            attempts: attempts.clone(),
+            applied_size: Arc::new(Mutex::new(None)),
+        }));
+        let size = runtime.screen().size();
+        let revision = runtime.screen_revision;
+        assert!(runtime.resize(u16::MAX, u16::MAX, 0, 0).is_err());
+        assert_eq!(runtime.screen().size(), size);
+        assert_eq!(
+            runtime.screen().size(),
+            Size::new(24, 80).expect("valid test operation")
+        );
+        assert_eq!(runtime.screen_revision, revision);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 }

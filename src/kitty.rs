@@ -300,12 +300,9 @@ pub fn refresh_kitty_placeholder_anchors(
     let mut bounds = HashMap::<u32, (u16, u16, u16, u16)>::new();
     let (rows, cols): (u16, u16) = screen.size().into();
     for row in 0..rows {
-        let Some(grid_row) = screen.visible_row(row) else {
-            continue;
-        };
         for col in 0..cols {
-            let Some(cell) = grid_row.cell(usize::from(col)) else {
-                break;
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
             };
             // Placeholders may carry combining diacritics that encode the
             // image row and column, so match on the base character.
@@ -337,7 +334,7 @@ pub fn refresh_kitty_placeholder_anchors(
             let columns = u32::from(right - left + 1);
             let rows = u32::from(bottom - top + 1);
             let new_anchor = InlineAnchor {
-                row: top,
+                row: i32::from(top),
                 col: left,
                 columns,
                 rows,
@@ -346,7 +343,7 @@ pub fn refresh_kitty_placeholder_anchors(
             changed |= anchors
                 .insert(object_id, new_anchor)
                 .is_none_or(|old_anchor| {
-                    old_anchor.row != top
+                    old_anchor.row != i32::from(top)
                         || old_anchor.col != left
                         || old_anchor.columns != columns
                         || old_anchor.rows != rows

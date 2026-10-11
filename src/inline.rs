@@ -16,7 +16,7 @@ use crate::rgp::{
     consume_sequence as consume_rgp_sequence, support_reply,
 };
 use crate::runtime::TerminalRuntime;
-use crate::screen::ScreenView;
+use crate::screen::{ScreenView, TextAnchor};
 
 const APC_START: &[u8] = b"\x1b_";
 const ST: &[u8] = b"\x1b\\";
@@ -78,6 +78,7 @@ pub struct TerminalInlineObjects {
     last_rows: u16,
     pub(crate) objects: HashMap<u32, InlineObject>,
     pub(crate) anchors: HashMap<u32, InlineAnchor>,
+    text_anchors: HashMap<u32, (TextAnchor, i32)>,
 }
 
 impl TerminalInlineObjects {
@@ -123,11 +124,13 @@ impl TerminalInlineObjects {
                 return replies;
             };
             let sequence = self.pending_bytes[start..end].to_vec();
+            self.refresh_text_anchors(ScreenView::new(&runtime.screen(), 0));
             let (handled, reply) = self.handle_apc_sequence(
                 &sequence,
                 runtime.screen().cursor_position(),
                 camera_updates,
             );
+            self.refresh_text_anchors(ScreenView::new(&runtime.screen(), 0));
             if let Some(reply) = reply {
                 replies.push(reply);
             }
@@ -155,37 +158,51 @@ impl TerminalInlineObjects {
         self.last_rows = rows;
     }
 
-    /// Applies upward scroll to anchored objects.
-    pub fn apply_scroll(&mut self, rows_scrolled: u16) {
-        if rows_scrolled == 0 || self.anchors.is_empty() {
-            return;
-        }
-
-        self.anchors.retain(|object_id, anchor| {
-            if self
+    /// Resolves text-following placements against retained rows. History is
+    /// kept until eviction; negative rows preserve partially visible images.
+    /// Reflow follows logical text offsets. A deleted row or a screen switch
+    /// removes its placement, while retaining the reusable object payload.
+    pub fn refresh_text_anchors(&mut self, screen: ScreenView<'_>) {
+        self.text_anchors
+            .retain(|id, _| self.anchors.contains_key(id));
+        let top = screen.window().row(0).map_or(0, |row| row.index());
+        self.anchors.retain(|id, anchor| {
+            if !self
                 .objects
-                .get(object_id)
-                .is_some_and(|object| !object.scrolls_with_text())
+                .get(id)
+                .is_some_and(InlineObject::scrolls_with_text)
             {
                 return true;
             }
-            let new_row = anchor.row as i32 - rows_scrolled as i32;
-            if new_row + anchor.rows as i32 <= 0 {
+            let (point, offset) = if let Some(point) = self.text_anchors.get(id).copied() {
+                point
+            } else {
+                // Protocol placement coordinates refer to the live grid,
+                // regardless of the user's history viewport.
+                let y = anchor.row.clamp(0, i32::from(screen.size().rows()) - 1) as u16;
+                let Some(row) = screen.window().row(y) else {
+                    return false;
+                };
+                (
+                    TextAnchor::capture(&screen, row, anchor.col),
+                    anchor.row - i32::from(y),
+                )
+            };
+            let Some((row, col)) = point.resolve(&screen) else {
+                self.dirty = true;
                 return false;
-            }
-            anchor.row = new_row.max(0) as u16;
+            };
+            self.text_anchors
+                .insert(*id, (TextAnchor::capture(&screen, row, col), offset));
+            let y = (row.index() as i64 - top as i64 + i64::from(offset))
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+            self.dirty |= anchor.row != y || anchor.col != col;
+            anchor.row = y;
+            anchor.col = col;
             true
         });
-        self.dirty = true;
-    }
-
-    /// Returns whether any anchors need scroll tracking.
-    pub fn has_scroll_tracked_anchors(&self) -> bool {
-        self.anchors.keys().any(|object_id| {
-            self.objects
-                .get(object_id)
-                .is_some_and(InlineObject::scrolls_with_text)
-        })
+        self.text_anchors
+            .retain(|id, _| self.anchors.contains_key(id));
     }
 
     /// Refreshes placeholder-derived Kitty anchors.
@@ -196,6 +213,7 @@ impl TerminalInlineObjects {
     }
 
     fn set_anchor(&mut self, object_id: u32, anchor: InlineAnchor) {
+        self.text_anchors.remove(&object_id);
         self.anchors.insert(object_id, anchor);
         self.dirty = true;
     }
@@ -203,6 +221,7 @@ impl TerminalInlineObjects {
     fn remove_object(&mut self, object_id: u32) {
         self.objects.remove(&object_id);
         self.anchors.remove(&object_id);
+        self.text_anchors.remove(&object_id);
         self.pending_rgp_payloads.remove(&object_id);
         self.dirty = true;
     }
@@ -210,6 +229,7 @@ impl TerminalInlineObjects {
     fn clear_objects(&mut self) {
         self.objects.clear();
         self.anchors.clear();
+        self.text_anchors.clear();
         self.pending_rgp_payloads.clear();
         self.dirty = true;
     }
@@ -242,7 +262,7 @@ impl TerminalInlineObjects {
                 anchor,
             } => {
                 self.remove_objects_at(&InlineAnchor {
-                    row: anchor.row,
+                    row: i32::from(anchor.row),
                     col: anchor.col,
                     columns: anchor.columns,
                     rows: anchor.rows,
@@ -253,7 +273,7 @@ impl TerminalInlineObjects {
                 self.set_anchor(
                     object_id,
                     InlineAnchor {
-                        row: anchor.row,
+                        row: i32::from(anchor.row),
                         col: anchor.col,
                         columns: anchor.columns,
                         rows: anchor.rows,
@@ -267,7 +287,7 @@ impl TerminalInlineObjects {
                     self.set_anchor(
                         object_id,
                         InlineAnchor {
-                            row: anchor.row,
+                            row: i32::from(anchor.row),
                             col: anchor.col,
                             columns: anchor.columns,
                             rows: anchor.rows,
@@ -367,7 +387,7 @@ impl TerminalInlineObjects {
                     self.set_anchor(
                         object_id,
                         InlineAnchor {
-                            row,
+                            row: i32::from(row),
                             col,
                             columns: anchor.columns,
                             rows: anchor.rows,
@@ -402,7 +422,7 @@ impl TerminalInlineObjects {
     }
 
     fn remove_objects_at(&mut self, new_anchor: &InlineAnchor) {
-        let row_start = new_anchor.row as i32;
+        let row_start = new_anchor.row;
         let row_end = row_start + new_anchor.rows as i32;
         let col_start = new_anchor.col as i32;
         let col_end = col_start + new_anchor.columns as i32;
@@ -411,7 +431,7 @@ impl TerminalInlineObjects {
             .anchors
             .iter()
             .filter_map(|(object_id, anchor)| {
-                let anchor_row_start = anchor.row as i32;
+                let anchor_row_start = anchor.row;
                 let anchor_row_end = anchor_row_start + anchor.rows as i32;
                 let anchor_col_start = anchor.col as i32;
                 let anchor_col_end = anchor_col_start + anchor.columns as i32;
@@ -427,6 +447,7 @@ impl TerminalInlineObjects {
         for object_id in overlapping_ids {
             self.objects.remove(&object_id);
             self.anchors.remove(&object_id);
+            self.text_anchors.remove(&object_id);
         }
     }
 
@@ -596,8 +617,8 @@ impl InlineObject {
 
 /// Inline object anchor.
 pub struct InlineAnchor {
-    /// Anchor row.
-    pub row: u16,
+    /// Anchor row relative to the viewport; negative when partially in history.
+    pub row: i32,
     /// Anchor column.
     pub col: u16,
     /// Object width in cells.
@@ -674,5 +695,127 @@ fn apply_vec3_update(target: &mut Vec3, update: [Option<f32>; 3]) {
     }
     if let Some(z) = update[2] {
         target.z = z;
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use fux_vt::{Feature, Parser, Size};
+
+    fn parser() -> Parser {
+        Parser::with_options(
+            Size::new(4, 8).expect("valid test operation"),
+            5,
+            Feature::Reflow.into(),
+        )
+        .expect("valid test operation")
+    }
+
+    fn place(objects: &mut TerminalInlineObjects, id: u32, row: i32, col: u16, rgp: bool) {
+        let object = if rgp {
+            InlineObject::RgpObject(RgpInlineObject::Gltf {
+                asset_path: "test.glb".into(),
+                handle: None,
+            })
+        } else {
+            InlineObject::KittyImage(KittyInlineObject {
+                raster: RasterObject {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255; 4],
+                    handle: None,
+                },
+                uses_placeholders: false,
+                plane: None,
+            })
+        };
+        objects.objects.insert(id, object);
+        objects.set_anchor(
+            id,
+            InlineAnchor {
+                row,
+                col,
+                columns: 1,
+                rows: 2,
+                style: InlineStyle::default(),
+            },
+        );
+    }
+
+    #[test]
+    fn unchanged_blank_rows_do_not_move_inline_placements() {
+        let mut parser = parser();
+        let mut objects = TerminalInlineObjects::default();
+        place(&mut objects, 1, 2, 0, false);
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        parser
+            .process(b"\x1b[3;1H\x1b[0m")
+            .expect("valid test operation");
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        assert_eq!(objects.anchors[&1].row, 2);
+    }
+
+    #[test]
+    fn placements_follow_partial_scroll_and_can_be_explicitly_repositioned() {
+        let mut parser = parser();
+        parser
+            .process(b"a\r\nb\r\nc\r\nd")
+            .expect("valid test operation");
+        let mut objects = TerminalInlineObjects::default();
+        place(&mut objects, 1, 0, 0, false);
+        place(&mut objects, 2, 2, 0, true);
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        parser
+            .process(b"\x1b[2;4r\x1b[4;1H\n")
+            .expect("valid test operation");
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        assert_eq!(objects.anchors[&1].row, 0);
+        assert_eq!(objects.anchors[&2].row, 1);
+        place(&mut objects, 2, 3, 1, true);
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        assert_eq!(objects.anchors[&2].row, 3);
+    }
+
+    #[test]
+    fn placement_reflows_with_text_and_survives_in_history_until_eviction() {
+        let mut parser = parser();
+        parser
+            .process(b"abcdefgh\r\nnext")
+            .expect("valid test operation");
+        let mut objects = TerminalInlineObjects::default();
+        place(&mut objects, 1, 0, 5, false);
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        parser
+            .resize(Size::new(4, 4).expect("valid test operation"))
+            .expect("valid test operation");
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        assert_eq!((objects.anchors[&1].row, objects.anchors[&1].col), (1, 1));
+        parser
+            .process(b"\x1b[4;1H\n\n")
+            .expect("valid test operation");
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        assert_eq!(objects.anchors[&1].row, -1);
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 2));
+        assert_eq!(objects.anchors[&1].row, 1);
+        parser
+            .process(&b"\n".repeat(10))
+            .expect("valid test operation");
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        assert!(!objects.anchors.contains_key(&1));
+        assert!(objects.objects.contains_key(&1));
+    }
+
+    #[test]
+    fn screen_switch_removes_placements_without_reusing_rows() {
+        let mut parser = parser();
+        let mut objects = TerminalInlineObjects::default();
+        place(&mut objects, 1, 0, 0, true);
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        parser
+            .process(b"\x1b[?1049h")
+            .expect("valid test operation");
+        objects.refresh_text_anchors(ScreenView::new(parser.screen(), 0));
+        assert!(objects.anchors.is_empty());
     }
 }
