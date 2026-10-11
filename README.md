@@ -235,6 +235,10 @@ A blazingly fast serial monitor with plotter TUI and 3D telemetry
 
 ## Agent Control
 
+<div>
+  <video width="80%" src="https://github.com/user-attachments/assets/0d4ffbf2-5ecd-4905-9576-3375ecc13c79"/>
+</div>
+
 Ratty includes an optional MCP server for controlling a running terminal from a compatible MCP
 client.
 
