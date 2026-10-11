@@ -535,7 +535,7 @@ impl Widget for TerminalWidget<'_> {
         buf.set_style(area, Style::default().fg(theme_fg));
 
         let selection = self.selection.normalized_bounds();
-        let (rows, cols) = self.screen.size();
+        let (rows, cols): (u16, u16) = self.screen.size().into();
         let draw_rows = rows.min(area.height);
         let draw_cols = cols.min(area.width);
 
@@ -651,6 +651,7 @@ fn cell_style(
         Blink::None => {}
         Blink::Slow => modifiers |= Modifier::SLOW_BLINK,
         Blink::Rapid => modifiers |= Modifier::RAPID_BLINK,
+        _ => {}
     }
 
     style.add_modifier(modifiers)
@@ -660,7 +661,8 @@ fn cell_color_to_tui(color: VtColor, theme_palette: &[TuiColor; 16]) -> Option<T
     match color {
         VtColor::Default => None,
         VtColor::Idx(index) => Some(ansi_index_to_tui(index, theme_palette)),
-        VtColor::Rgb(r, g, b) => Some(TuiColor::Rgb(r, g, b)),
+        VtColor::Rgb(fux_vt::Rgb { r, g, b }) => Some(TuiColor::Rgb(r, g, b)),
+        _ => None,
     }
 }
 
@@ -692,13 +694,14 @@ mod tests {
     use fux_vt::Parser;
 
     fn parse(rows: u16, cols: u16, input: &[u8]) -> Parser {
-        let mut parser = Parser::new(rows, cols, 1000).expect("parser");
+        let mut parser =
+            Parser::new(fux_vt::Size::new(rows, cols).expect("valid size"), 1000).expect("parser");
         parser.process(input).expect("process");
         parser
     }
 
     fn render_buffer(screen: ScreenView<'_>) -> Buffer {
-        let (rows, cols) = screen.size();
+        let (rows, cols): (u16, u16) = screen.size().into();
         let area = Rect::new(0, 0, cols, rows);
         let mut buffer = Buffer::empty(area);
         TerminalWidget {

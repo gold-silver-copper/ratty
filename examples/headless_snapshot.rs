@@ -166,7 +166,7 @@ fn capture_due(time: &Time<Real>, options: &Options, gate: &CaptureGate) -> bool
 fn report_stale_cells(terminal: &TerminalSurface, runtime: &TerminalRuntime) {
     let screen = runtime.screen();
     let snapshot = terminal.tui.surface().snapshot();
-    let (rows, cols) = screen.size();
+    let (rows, cols): (u16, u16) = screen.size().into();
     let mut stale = 0;
     for row in 0..rows {
         for col in 0..cols {
@@ -210,7 +210,7 @@ fn report_stale_cells(terminal: &TerminalSurface, runtime: &TerminalRuntime) {
 /// colour that leaked past the cells that set it.
 fn report_foreground_runs(runtime: &TerminalRuntime) {
     let screen = runtime.screen();
-    let (rows, cols) = screen.size();
+    let (rows, cols): (u16, u16) = screen.size().into();
     for row in 0..rows {
         let mut runs: Vec<(u16, fux_vt::Color, String)> = Vec::new();
         for col in 0..cols {

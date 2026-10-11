@@ -45,8 +45,12 @@ impl<'a> ScreenView<'a> {
     /// Returns the row drawn at `row`, counting from the top of the view.
     #[must_use]
     pub fn visible_row(&self, row: u16) -> Option<Row<'a>> {
-        let (rows, cols) = self.screen.size();
-        self.screen.window(self.scrollback, rows, cols).row(row)
+        self.screen
+            .window()
+            .row(0)?
+            .up(self.scrollback)
+            .window()
+            .row(row)
     }
 
     /// Returns the cell drawn at `row`, `col` of the view.
@@ -58,14 +62,14 @@ impl<'a> ScreenView<'a> {
     /// Returns the cell a renderer should draw the cursor in, as `(row, col)`.
     ///
     /// [`Screen::cursor_position`] reports the logical position, whose column
-    /// equals the width while a character drawn in the last column waits to
+    /// stays on the grid while a character in the last column waits to
     /// wrap. This clamps that column onto the grid and, when the cursor sits
     /// on the second half of a wide character, moves it to the first half,
     /// so the cell always exists and owns its glyph.
     #[must_use]
     pub fn display_cursor_position(&self) -> (u16, u16) {
         let (row, col) = self.screen.cursor_position();
-        let (_, cols) = self.screen.size();
+        let cols = self.screen.size().cols();
         let mut col = col.min(cols.saturating_sub(1));
         if self
             .screen
@@ -82,13 +86,13 @@ impl<'a> ScreenView<'a> {
     /// screen and must not be painted over history.
     #[must_use]
     pub fn cursor_hidden(&self) -> bool {
-        self.screen.hide_cursor() || self.scrollback > 0
+        !self.screen.mode(fux_vt::Mode::ShowCursor) || self.scrollback > 0
     }
 
     /// Returns each row of the view as text, trailing blanks trimmed.
     #[must_use]
     pub fn row_texts(&self) -> Vec<String> {
-        let (rows, _) = self.screen.size();
+        let rows = self.screen.size().rows();
         (0..rows)
             .map(|row| {
                 let mut text = String::new();
@@ -122,7 +126,8 @@ mod tests {
     use fux_vt::Parser;
 
     fn parse(rows: u16, cols: u16, input: &[u8]) -> Parser {
-        let mut parser = Parser::new(rows, cols, 20).expect("parser");
+        let mut parser =
+            Parser::new(fux_vt::Size::new(rows, cols).expect("valid size"), 20).expect("parser");
         parser.process(input).expect("process");
         parser
     }
@@ -154,7 +159,8 @@ mod tests {
     fn display_cursor_clamps_a_pending_wrap_and_snaps_off_wide_halves() {
         let parser = parse(2, 4, b"abcd");
         let view = ScreenView::new(parser.screen(), 0);
-        assert_eq!(view.cursor_position(), (0, 4));
+        assert_eq!(view.cursor_position(), (0, 3));
+        assert!(view.pending_wrap());
         assert_eq!(view.display_cursor_position(), (0, 3));
 
         let parser = parse(2, 6, "\u{4f60}\x1b[1;2H".as_bytes());

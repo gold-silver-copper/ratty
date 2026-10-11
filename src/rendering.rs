@@ -301,7 +301,8 @@ fn debug_color(color: Color) -> Option<Rgba> {
     match color {
         Color::Default => None,
         Color::Idx(index) => Some(ansi_index_to_rgba(index)),
-        Color::Rgb(r, g, b) => Some([r, g, b, 255]),
+        Color::Rgb(fux_vt::Rgb { r, g, b }) => Some([r, g, b, 255]),
+        _ => None,
     }
 }
 
@@ -348,7 +349,8 @@ mod tests {
     /// the skipped cell blank; the debug image must not paint it as content.
     #[test]
     fn wrapped_wide_character_padding_is_not_active_content() {
-        let mut parser = Parser::new(2, 14, 1000).expect("parser");
+        let mut parser =
+            Parser::new(fux_vt::Size::new(2, 14).expect("valid size"), 1000).expect("parser");
         parser
             .process("abcdefghijklm\u{4f60}".as_bytes())
             .expect("process");

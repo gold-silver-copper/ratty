@@ -298,7 +298,7 @@ pub fn refresh_kitty_placeholder_anchors(
         .collect::<HashMap<_, _>>();
 
     let mut bounds = HashMap::<u32, (u16, u16, u16, u16)>::new();
-    let (rows, cols) = screen.size();
+    let (rows, cols): (u16, u16) = screen.size().into();
     for row in 0..rows {
         let Some(grid_row) = screen.visible_row(row) else {
             continue;
@@ -312,7 +312,7 @@ pub fn refresh_kitty_placeholder_anchors(
             if !cell.contents().starts_with(KITTY_PLACEHOLDER) {
                 continue;
             }
-            let Color::Rgb(r, g, b) = cell.fgcolor() else {
+            let Color::Rgb(fux_vt::Rgb { r, g, b }) = cell.fgcolor() else {
                 continue;
             };
             let placeholder_id = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);

@@ -695,10 +695,10 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                     "visible": !screen.cursor_hidden(),
                 },
                 "modes": {
-                    "alternate_screen": screen.alternate_screen(),
-                    "application_cursor": screen.application_cursor(),
-                    "application_keypad": screen.application_keypad(),
-                    "bracketed_paste": screen.bracketed_paste(),
+                    "alternate_screen": screen.mode(fux_vt::Mode::AlternateScreen),
+                    "application_cursor": screen.mode(fux_vt::Mode::ApplicationCursor),
+                    "application_keypad": screen.mode(fux_vt::Mode::ApplicationKeypad),
+                    "bracketed_paste": screen.mode(fux_vt::Mode::BracketedPaste),
                     "mouse_protocol": mouse_protocol_name(screen.mouse_protocol_mode()),
                     "mouse_encoding": mouse_encoding_name(screen.mouse_protocol_encoding()),
                     "kitty_keyboard_flags": screen.kitty_keyboard_flags(),
@@ -774,7 +774,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
             if request.text.len() > MAX_INPUT_BYTES {
                 return ControlResponse::coded_error("input_too_large", "input exceeds 256 KiB");
             }
-            let bracketed = request.paste && runtime.screen().bracketed_paste();
+            let bracketed = request.paste && runtime.screen().mode(fux_vt::Mode::BracketedPaste);
             let bytes = encode_agent_text(&request.text, request.paste, &runtime.screen());
             let bytes_written = bytes.len();
             runtime.write_agent_input(&bytes);
@@ -1290,7 +1290,8 @@ mod tests {
     use crate::screen::ScreenView;
 
     fn snapshot(input: &str, rows: u16, columns: u16) -> ScreenSnapshot {
-        let mut parser = Parser::new(rows, columns, 0).expect("parser");
+        let mut parser =
+            Parser::new(fux_vt::Size::new(rows, columns).expect("valid size"), 0).expect("parser");
         for chunk in input.as_bytes().chunks(1) {
             parser.process(chunk).expect("process");
         }
@@ -1497,7 +1498,8 @@ mod tests {
 
     #[test]
     fn snapshot_never_starts_a_run_on_a_continuation_cell() {
-        let mut parser = Parser::new(2, 5, 0).expect("parser");
+        let mut parser =
+            Parser::new(fux_vt::Size::new(2, 5).expect("valid size"), 0).expect("parser");
         parser.process("abc界界".as_bytes()).expect("process");
         let screen = parser.screen();
         let snapshot = ScreenSnapshot::from_screen(

@@ -460,7 +460,8 @@ pub fn handle_keyboard_input(
         let modifiers = current_modifiers(&params.keys).union(keyboard.modifiers());
         if event.state == ButtonState::Pressed
             && let Some(action) = params.bindings.action_for(binding_key_code, modifiers)
-            && !(is_scroll_action(action) && params.runtime.screen().alternate_screen())
+            && !(is_scroll_action(action)
+                && params.runtime.screen().mode(fux_vt::Mode::AlternateScreen))
         {
             if event.repeat
                 && !matches!(
@@ -591,7 +592,7 @@ pub fn handle_keyboard_input(
                 }
                 BindingAction::Paste => {
                     if let Some(text) = params.clipboard.paste() {
-                        let bracketed = params.runtime.screen().bracketed_paste();
+                        let bracketed = params.runtime.screen().mode(fux_vt::Mode::BracketedPaste);
                         params
                             .runtime
                             .write_human_input(&encode_paste(&text, bracketed));
@@ -647,7 +648,10 @@ pub fn handle_keyboard_input(
 
         if let Some(input) = keyboard.handle_event_with_modes(
             event,
-            params.runtime.screen().application_cursor(),
+            params
+                .runtime
+                .screen()
+                .mode(fux_vt::Mode::ApplicationCursor),
             params.runtime.kitty_keyboard_flags(),
             params.runtime.modify_other_keys(),
         ) {
@@ -871,7 +875,7 @@ fn translate_key(key_code: KeyCode, ctx: KeyTranslationContext<'_>) -> Vec<u8> {
 pub fn encode_normalized_key(key: &NormalizedKey, screen: &Screen) -> Result<Vec<u8>, String> {
     encode_normalized_key_with_modes(
         key,
-        screen.application_cursor(),
+        screen.mode(fux_vt::Mode::ApplicationCursor),
         screen.kitty_keyboard_flags(),
         screen.modify_other_keys(),
     )
@@ -1150,7 +1154,7 @@ pub(crate) fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
 /// Encodes authenticated agent text without changing its UTF-8 payload.
 /// Bracketed-paste markers are added only when both requested and active.
 pub fn encode_agent_text(text: &str, paste: bool, screen: &Screen) -> Vec<u8> {
-    if paste && screen.bracketed_paste() {
+    if paste && screen.mode(fux_vt::Mode::BracketedPaste) {
         let mut bytes = Vec::with_capacity(text.len() + PASTE_START.len() + PASTE_END.len());
         bytes.extend_from_slice(PASTE_START);
         bytes.extend_from_slice(text.as_bytes());
@@ -1806,7 +1810,8 @@ mod tests {
     #[test]
     fn agent_text_preserves_utf8_exactly_and_brackets_only_when_active() {
         let text = "e\u{301} 👩🏽‍💻\r\n";
-        let mut parser = fux_vt::Parser::new(2, 20, 0).expect("parser");
+        let mut parser =
+            fux_vt::Parser::new(fux_vt::Size::new(2, 20).expect("valid size"), 0).expect("parser");
         assert_eq!(
             encode_agent_text(text, true, parser.screen()),
             text.as_bytes()
