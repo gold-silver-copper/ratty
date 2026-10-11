@@ -15,7 +15,7 @@ use bevy::prelude::Resource;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::config::AppConfig;
-use fux_vt::{Identity, Options, Parser, Sink, Unhandled};
+use fux_vt::{Feature, Identity, Options, Parser, Sink, Size, Unhandled};
 
 use crate::screen::ScreenView;
 
@@ -43,13 +43,10 @@ const IDENTITY: Identity = Identity {
 /// protocol and modifyOtherKeys (ratty encodes keys by them, see
 /// `keyboard.rs`, and answers the flag query), reflow on resize, and ratty's
 /// identity in device replies.
-pub const PARSER_OPTIONS: Options = Options {
-    events: false,
-    extended_replies: false,
-    kitty_keyboard: true,
-    reflow: true,
-    identity: Some(IDENTITY),
-};
+pub const PARSER_OPTIONS: Options = Options::new()
+    .with(Feature::KittyKeyboard)
+    .with(Feature::Reflow)
+    .with_identity(Some(IDENTITY));
 
 /// Receives what the engine leaves to its host: replies to queries, queued
 /// for write-back to the PTY, and sequences the engine does not implement,
@@ -124,11 +121,12 @@ fn keep_scrollback_anchored(
     let anchor = (*scrollback > 0)
         .then(|| ScreenView::new(parser.screen(), *scrollback).visible_row(0))
         .flatten()
-        .map(|row| row.id);
+        .map(|row| row.id());
     change(parser);
     let screen = parser.screen();
     *scrollback = anchor
-        .and_then(|id| screen.offset_for_row(id))
+        .and_then(|id| screen.row_by_id(id))
+        .map(|row| screen.history_len().saturating_sub(row.index()))
         .unwrap_or(*scrollback)
         .min(screen.history_len());
 }
@@ -329,8 +327,7 @@ impl TerminalRuntime {
         });
 
         let parser = Parser::with_options(
-            rows.max(1),
-            cols.max(1),
+            Size::new(rows.max(1), cols.max(1))?,
             config.terminal.scrollback,
             PARSER_OPTIONS,
         )
@@ -542,8 +539,9 @@ impl TerminalRuntime {
             let Self {
                 parser, scrollback, ..
             } = self;
+            let size = Size::new(rows, cols)?;
             keep_scrollback_anchored(parser, scrollback, |parser| {
-                if let Err(err) = parser.resize(rows, cols) {
+                if let Err(err) = parser.resize(size) {
                     bevy::log::warn!("terminal resize to {cols}x{rows} failed: {err}");
                 }
             });
@@ -619,7 +617,12 @@ mod tests {
     use super::*;
 
     fn parser(rows: u16, cols: u16) -> (Parser, TerminalParserSink) {
-        let parser = Parser::with_options(rows, cols, 100, PARSER_OPTIONS).expect("parser");
+        let parser = Parser::with_options(
+            fux_vt::Size::new(rows, cols).expect("valid size"),
+            100,
+            PARSER_OPTIONS,
+        )
+        .expect("parser");
         (parser, TerminalParserSink::default())
     }
 
@@ -702,19 +705,20 @@ mod tests {
     }
 
     #[test]
-    fn known_but_unmodelled_sequences_do_not_reply() {
+    fn supported_sequences_are_silent_and_unhandled_sequences_are_logged_once() {
         let (mut parser, mut sink) = parser(5, 20);
         process(
             &mut parser,
             &mut sink,
-            b"\x1b[?7h\x1b[?7l\x1b[>1;2m\x1b[3J\x1b(B",
+            b"\x1b[?7h\x1b[?7l\x1b[>1;2m\x1b[3J\x1b(B\x1b[3J",
         );
         assert!(replies(&mut sink).is_empty());
         // Unhandled sequences are logged once each.
         assert!(sink.seen.contains("\u{1b}[>1;2m"));
         assert!(sink.seen.contains("\u{1b}[3J"));
-        assert!(sink.seen.contains("\u{1b}(B"));
-        assert_eq!(sink.seen.len(), 3);
+        // ASCII character-set selection is now handled by the engine.
+        assert!(!sink.seen.contains("\u{1b}(B"));
+        assert_eq!(sink.seen.len(), 2);
     }
 
     fn scrolled(rows: u16, cols: u16, lines: usize, back: usize) -> (Parser, usize) {
@@ -756,7 +760,9 @@ mod tests {
         let (mut parser, mut scrollback) = scrolled(3, 10, 12, 4);
         let top = ScreenView::new(parser.screen(), scrollback).row_texts()[0].clone();
         keep_scrollback_anchored(&mut parser, &mut scrollback, |parser| {
-            parser.resize(5, 4).expect("resize");
+            parser
+                .resize(Size::new(5, 4).expect("valid size"))
+                .expect("resize");
         });
         assert_eq!(
             ScreenView::new(parser.screen(), scrollback).row_texts()[0],
@@ -823,7 +829,12 @@ mod resize_tests {
             master: SyncCell::new(Some(master)),
             child: None,
             reader_thread: None,
-            parser: Parser::with_options(24, 80, 100, PARSER_OPTIONS).expect("parser"),
+            parser: Parser::with_options(
+                fux_vt::Size::new(24, 80).expect("valid size"),
+                100,
+                PARSER_OPTIONS,
+            )
+            .expect("parser"),
             sink: TerminalParserSink::default(),
             scrollback: 0,
             pty_disconnected: false,
@@ -856,7 +867,10 @@ mod resize_tests {
         // child-facing PTY notification is retried.
         assert_eq!(runtime.last_pty_size, (80, 24, 0, 0));
         assert_eq!(runtime.last_parser_size, (100, 30));
-        assert_eq!(runtime.screen().size(), (30, 100));
+        assert_eq!(
+            runtime.screen().size(),
+            Size::new(30, 100).expect("valid size")
+        );
         assert_eq!(runtime.pending_resize, Some((100, 30, 800, 600)));
 
         let mut app = bevy::prelude::App::new();

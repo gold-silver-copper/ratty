@@ -171,7 +171,7 @@ impl ScreenSnapshot {
         request: &SnapshotRequest,
         screen_revision: u64,
     ) -> Self {
-        let (rows, columns) = screen.size();
+        let (rows, columns): (u16, u16) = screen.size().into();
         let (row_start, row_end, column_start, column_end) =
             request.rect.map_or((0, rows, 0, columns), |rect| {
                 (
@@ -254,13 +254,13 @@ impl ScreenSnapshot {
                 });
             }
 
-            if runs.is_empty() && !row.wrapped && !graphics_placeholder {
+            if runs.is_empty() && !row.wrapped() && !graphics_placeholder {
                 continue;
             }
             let plain = request.include_plain.then(|| plain_from_runs(&runs));
             content.push(SnapshotRow {
                 row: row_index,
-                wrapped: row.wrapped,
+                wrapped: row.wrapped(),
                 graphics_placeholder,
                 runs,
                 plain,
@@ -280,10 +280,10 @@ impl ScreenSnapshot {
                 visible: !screen.cursor_hidden(),
             },
             modes: SnapshotModes {
-                alternate_screen: screen.alternate_screen(),
-                application_cursor: screen.application_cursor(),
-                application_keypad: screen.application_keypad(),
-                bracketed_paste: screen.bracketed_paste(),
+                alternate_screen: screen.mode(fux_vt::Mode::AlternateScreen),
+                application_cursor: screen.mode(fux_vt::Mode::ApplicationCursor),
+                application_keypad: screen.mode(fux_vt::Mode::ApplicationKeypad),
+                bracketed_paste: screen.mode(fux_vt::Mode::BracketedPaste),
                 mouse_protocol: mouse_protocol_name(screen.mouse_protocol_mode()).into(),
                 mouse_encoding: mouse_encoding_name(screen.mouse_protocol_encoding()).into(),
                 kitty_keyboard_flags: screen.kitty_keyboard_flags(),
@@ -373,6 +373,7 @@ fn snapshot_style(cell: fux_vt::CellRef<'_>) -> SnapshotStyle {
             Blink::None => "none",
             Blink::Slow => "slow",
             Blink::Rapid => "rapid",
+            _ => "none",
         }
         .into(),
         hidden: cell.hidden(),
@@ -384,7 +385,12 @@ fn snapshot_color(color: VtColor) -> String {
     match color {
         VtColor::Default => "default".into(),
         VtColor::Idx(index) => format!("indexed:{index}"),
-        VtColor::Rgb(red, green, blue) => format!("rgb:{red},{green},{blue}"),
+        VtColor::Rgb(fux_vt::Rgb {
+            r: red,
+            g: green,
+            b: blue,
+        }) => format!("rgb:{red},{green},{blue}"),
+        _ => "default".into(),
     }
 }
 
@@ -395,6 +401,7 @@ pub(super) const fn mouse_protocol_name(mode: MouseProtocolMode) -> &'static str
         MouseProtocolMode::PressRelease => "press_release",
         MouseProtocolMode::ButtonMotion => "button_motion",
         MouseProtocolMode::AnyMotion => "any_motion",
+        _ => "unknown",
     }
 }
 
@@ -403,6 +410,7 @@ pub(super) const fn mouse_encoding_name(encoding: MouseProtocolEncoding) -> &'st
         MouseProtocolEncoding::Default => "default",
         MouseProtocolEncoding::Utf8 => "utf8",
         MouseProtocolEncoding::Sgr => "sgr",
+        _ => "unknown",
     }
 }
 

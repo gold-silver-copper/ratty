@@ -336,7 +336,7 @@ impl TerminalSelection {
     pub fn selected_text(&self, screen: ScreenView<'_>) -> Option<String> {
         let bounds = self.normalized_bounds()?;
 
-        let (_, cols) = screen.size();
+        let cols = screen.size().cols();
         let mut out = String::new();
 
         let start_row = bounds.start_row as u16;
@@ -702,7 +702,9 @@ pub(crate) fn handle_mouse_input(
                     mouse_encoding,
                 ));
             }
-        } else if mode == TerminalPresentationMode::Flat2d && !runtime.screen().alternate_screen() {
+        } else if mode == TerminalPresentationMode::Flat2d
+            && !runtime.screen().mode(fux_vt::Mode::AlternateScreen)
+        {
             let amount = match event.unit {
                 MouseScrollUnit::Line => {
                     app_config.terminal.mouse_scroll_lines as isize
@@ -754,6 +756,7 @@ fn encode_mouse_event(
             let y = (row + 32).min(u8::MAX as u32) as u8;
             vec![0x1b, b'[', b'M', code as u8, x, y]
         }
+        _ => Vec::new(),
     }
 }
 
@@ -1024,7 +1027,8 @@ mod tests {
     use fux_vt::Parser;
 
     fn terminal(rows: u16, cols: u16, input: &str) -> Parser {
-        let mut parser = Parser::new(rows, cols, 1000).expect("parser");
+        let mut parser =
+            Parser::new(fux_vt::Size::new(rows, cols).expect("valid size"), 1000).expect("parser");
         parser.process(input.as_bytes()).expect("process");
         parser
     }
