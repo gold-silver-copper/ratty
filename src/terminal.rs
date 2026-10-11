@@ -1,5 +1,6 @@
 //! Terminal surface rendering and Ratatui integration.
 
+use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroU16;
 use std::path::Path;
@@ -18,8 +19,8 @@ use ratatui::style::{Color as TuiColor, Modifier, Style};
 use ratatui::widgets::Widget;
 
 use crate::config::{AppConfig, FontConfig, FontStyleConfig, ThemeConfig};
-use crate::mouse::TerminalSelection;
-use fux_vt::{Blink, CellRef, Color as VtColor};
+use crate::mouse::{SelectionBounds, TerminalSelection};
+use fux_vt::{Blink, CellRef, Color as VtColor, Mark, RowId};
 
 use crate::colors::ResolvedColors;
 use crate::screen::{KITTY_PLACEHOLDER, ScreenView};
@@ -214,6 +215,7 @@ pub struct TerminalSurface {
     render_scale: f32,
     cell_size: Vec2,
     rendered_texture_size: Option<UVec2>,
+    composition: TerminalCompositionCache,
 }
 
 impl TerminalSurface {
@@ -255,7 +257,22 @@ impl TerminalSurface {
             // No geometry is inferred before the renderer measures the loaded font.
             cell_size: Vec2::ONE,
             rendered_texture_size: None,
+            composition: TerminalCompositionCache::default(),
         })
+    }
+
+    /// Composes changed rows and submits a complete Ratatui frame.
+    /// Cursor state is submitted on every draw independently of cached cells.
+    pub fn draw(&mut self, widget: TerminalWidget<'_>, cursor_visible: bool) {
+        self.sync_colors(widget.screen, widget.theme);
+        let cache = &mut self.composition;
+        self.tui.draw(|frame| {
+            cache.render(widget, frame.area(), frame.buffer_mut());
+            if cursor_visible && !widget.screen.cursor_hidden() {
+                let (row, col) = widget.screen.display_cursor_position();
+                frame.set_cursor_position((col, row));
+            }
+        });
     }
 
     /// Adjusts the font size.
@@ -541,6 +558,7 @@ fn points_to_logical_pixels(points: i32) -> f32 {
 }
 
 /// Ratatui widget backed by the terminal screen.
+#[derive(Clone, Copy)]
 pub struct TerminalWidget<'a> {
     /// Terminal state to render, as the user sees it.
     pub screen: ScreenView<'a>,
@@ -565,65 +583,218 @@ impl Widget for TerminalWidget<'_> {
         let draw_cols = cols.min(area.width);
 
         for row in 0..draw_rows {
-            let Some(grid_row) = self.screen.visible_row(row) else {
-                continue;
-            };
-            for col in 0..draw_cols {
-                let Some(vt_cell) = self.screen.cell(row, col) else {
-                    continue;
-                };
-                let cell = &mut buf[(area.x + col, area.y + row)];
-
-                // Ratatui skips a wide glyph's trailing cell when diffing and
-                // the Bevy backend synthesizes that continuation cell from the
-                // anchor, so the anchor branch below owns the glyph's style.
-                // The engine stores the continuation half with default
-                // attributes; when it does reach the diff (behind a narrow
-                // predecessor after an edit) it borrows the owner's style so a
-                // background covers both halves of the glyph.
-                if vt_cell.is_wide_continuation() {
-                    let owner = col
-                        .checked_sub(1)
-                        .and_then(|left| grid_row.cell(usize::from(left)))
-                        .filter(|left| left.is_wide())
-                        .unwrap_or(vt_cell);
-                    let mut style = cell_style(owner, &theme_palette, theme_fg, self.font_style);
-                    if selection.is_some_and(|bounds| bounds.contains(row, col)) {
-                        style = selected_style(style, &colors);
-                    }
-                    cell.set_symbol(" ")
-                        .set_style(style)
-                        .set_diff_option(forced_width(1));
-                    continue;
-                }
-
-                // Kitty Unicode placeholders (U+10EEEE plus row/column
-                // diacritics) only mark where an image goes; the image is
-                // drawn as a separate scene object, so the cell must stay a
-                // blank instead of rendering the placeholder as a glyph.
-                let symbol = if vt_cell.contents().starts_with(KITTY_PLACEHOLDER) {
-                    " "
-                } else {
-                    vt_cell.contents()
-                };
-                let mut style = cell_style(vt_cell, &theme_palette, theme_fg, self.font_style);
-                let is_wide = vt_cell.is_wide();
-                // A wide glyph renders as one unit: a selection touching
-                // either of its columns highlights the whole glyph, since the
-                // trailing continuation cell cannot carry its own style.
-                if selection.is_some_and(|bounds| {
-                    bounds.contains(row, col)
-                        || (is_wide && col + 1 < cols && bounds.contains(row, col + 1))
-                }) {
-                    style = selected_style(style, &colors);
-                }
-
-                cell.set_symbol(if symbol.is_empty() { " " } else { symbol })
-                    .set_style(style)
-                    .set_diff_option(forced_width(if is_wide { 2 } else { 1 }));
-            }
+            self.render_row(
+                row,
+                Rect::new(area.x, area.y + row, draw_cols, 1),
+                buf,
+                &colors,
+                &theme_palette,
+                selection,
+            );
         }
     }
+}
+
+impl TerminalWidget<'_> {
+    fn render_row(
+        self,
+        row: u16,
+        area: Rect,
+        buf: &mut Buffer,
+        colors: &ResolvedColors,
+        theme_palette: &[TuiColor; 256],
+        selection: Option<SelectionBounds>,
+    ) {
+        let theme_fg = rgb_to_tui(colors.foreground);
+        let cols = self.screen.size().cols();
+        let draw_cols = cols.min(area.width);
+        let Some(grid_row) = self.screen.visible_row(row) else {
+            return;
+        };
+        for col in 0..draw_cols {
+            let Some(vt_cell) = self.screen.cell(row, col) else {
+                continue;
+            };
+            let cell = &mut buf[(area.x + col, area.y)];
+
+            // Ratatui skips a wide glyph's trailing cell when diffing and
+            // the Bevy backend synthesizes that continuation cell from the
+            // anchor, so the anchor branch below owns the glyph's style.
+            // The engine stores the continuation half with default
+            // attributes; when it does reach the diff (behind a narrow
+            // predecessor after an edit) it borrows the owner's style so a
+            // background covers both halves of the glyph.
+            if vt_cell.is_wide_continuation() {
+                let owner = col
+                    .checked_sub(1)
+                    .and_then(|left| grid_row.cell(usize::from(left)))
+                    .filter(|left| left.is_wide())
+                    .unwrap_or(vt_cell);
+                let mut style = cell_style(owner, theme_palette, theme_fg, self.font_style);
+                if selection.is_some_and(|bounds| bounds.contains(row, col)) {
+                    style = selected_style(style, colors);
+                }
+                cell.set_symbol(" ")
+                    .set_style(style)
+                    .set_diff_option(forced_width(1));
+                continue;
+            }
+
+            // Kitty Unicode placeholders (U+10EEEE plus row/column
+            // diacritics) only mark where an image goes; the image is
+            // drawn as a separate scene object, so the cell must stay a
+            // blank instead of rendering the placeholder as a glyph.
+            let symbol = if vt_cell.contents().starts_with(KITTY_PLACEHOLDER) {
+                " "
+            } else {
+                vt_cell.contents()
+            };
+            let mut style = cell_style(vt_cell, theme_palette, theme_fg, self.font_style);
+            let is_wide = vt_cell.is_wide();
+            // A wide glyph renders as one unit: a selection touching
+            // either of its columns highlights the whole glyph, since the
+            // trailing continuation cell cannot carry its own style.
+            if selection.is_some_and(|bounds| {
+                bounds.contains(row, col)
+                    || (is_wide && col + 1 < cols && bounds.contains(row, col + 1))
+            }) {
+                style = selected_style(style, colors);
+            }
+
+            cell.set_symbol(if symbol.is_empty() { " " } else { symbol })
+                .set_style(style)
+                .set_diff_option(forced_width(if is_wide { 2 } else { 1 }));
+        }
+    }
+}
+
+/// Retained CPU composition for one terminal parser's lifetime.
+///
+/// Rows follow Fux identities through scrolling; cell versions, viewport width,
+/// selection, palette and font style determine whether composition is needed.
+/// Every call still copies complete cells into the destination's fresh buffer.
+/// Cursor and scene graphics are submitted separately; placeholder cell edits
+/// participate in the normal row versions. Create a new cache if replacing the
+/// parser. Renderer recreation can reuse the cache because no GPU state is held.
+#[derive(Default)]
+pub struct TerminalCompositionCache {
+    rows: HashMap<RowId, ComposedRow>,
+    viewport: Vec<RowId>,
+    mark: Option<Mark>,
+    geometry: Option<(u16, u16, usize)>,
+    colors: Option<ResolvedColors>,
+    font: Option<FontStyleConfig>,
+    composed_rows: u64,
+}
+
+struct ComposedRow {
+    version: u64,
+    selection: Option<(u16, u16)>,
+    buffer: Buffer,
+    used: bool,
+}
+
+impl TerminalCompositionCache {
+    /// Total rows composed since this cache was created, for diagnostics.
+    pub fn composed_rows(&self) -> u64 {
+        self.composed_rows
+    }
+
+    /// Writes a complete terminal widget while recomposing only invalid rows.
+    pub fn render(&mut self, widget: TerminalWidget<'_>, area: Rect, buf: &mut Buffer) {
+        let screen = widget.screen;
+        let colors = ResolvedColors::new(&screen, widget.theme);
+        let palette = colors.palette.map(rgb_to_tui);
+        buf.set_style(area, Style::default().fg(rgb_to_tui(colors.foreground)));
+        let height = screen.size().rows().min(area.height);
+        let width = screen.size().cols().min(area.width);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let geometry = (width, height, screen.scrollback());
+        let unchanged = self.mark.is_some_and(|mark| !screen.changed_since(mark));
+        if self.geometry != Some(geometry)
+            || self.mark.is_none_or(|mark| screen.full_refresh_since(mark))
+        {
+            self.viewport.clear();
+            self.viewport
+                .extend((0..height).filter_map(|row| screen.visible_row(row).map(|r| r.id())));
+        }
+        if self.colors.as_ref() != Some(&colors) || self.font != Some(widget.font_style) {
+            self.rows.clear();
+        }
+        self.rows.values_mut().for_each(|row| row.used = false);
+        let bounds = widget.selection.bounds_in(screen);
+        for (index, id) in self.viewport.iter().copied().enumerate() {
+            let row = index as u16;
+            let selected = row_selection(bounds, row, screen.size().cols());
+            let old = self.rows.get(&id);
+            let version = if unchanged {
+                old.map_or_else(
+                    || screen.visible_row(row).map_or(0, |r| r.version()),
+                    |r| r.version,
+                )
+            } else {
+                screen.visible_row(row).map_or(0, |r| r.version())
+            };
+            let cached = self.rows.entry(id).or_insert_with(|| ComposedRow {
+                version: u64::MAX,
+                selection: None,
+                buffer: Buffer::empty(Rect::new(0, 0, width, 1)),
+                used: false,
+            });
+            if cached.version != version
+                || cached.selection != selected
+                || cached.buffer.area.width != width
+            {
+                cached.buffer.resize(Rect::new(0, 0, width, 1));
+                cached.buffer.reset();
+                cached.buffer.set_style(
+                    cached.buffer.area,
+                    Style::default().fg(rgb_to_tui(colors.foreground)),
+                );
+                widget.render_row(
+                    row,
+                    cached.buffer.area,
+                    &mut cached.buffer,
+                    &colors,
+                    &palette,
+                    bounds,
+                );
+                cached.version = version;
+                cached.selection = selected;
+                self.composed_rows += 1;
+            }
+            cached.used = true;
+            let start = buf.index_of(area.x, area.y + row);
+            buf.content[start..start + usize::from(width)].clone_from_slice(&cached.buffer.content);
+        }
+        // Retain only the visible viewport, independent of scrollback length.
+        self.rows.retain(|_, row| row.used);
+        self.colors = Some(colors);
+        self.font = Some(widget.font_style);
+        self.geometry = Some(geometry);
+        self.mark = Some(screen.mark());
+    }
+}
+
+fn row_selection(bounds: Option<SelectionBounds>, row: u16, cols: u16) -> Option<(u16, u16)> {
+    let bounds = bounds?;
+    let row = u32::from(row);
+    if row < bounds.start_row || row > bounds.end_row || cols == 0 {
+        return None;
+    }
+    let start = if row == bounds.start_row {
+        bounds.start_col
+    } else {
+        0
+    };
+    let end = if row == bounds.end_row {
+        bounds.end_col.min(u32::from(cols - 1))
+    } else {
+        u32::from(cols - 1)
+    };
+    (start <= end).then_some((start as u16, end as u16))
 }
 
 fn forced_width(width: u16) -> CellDiffOption {
@@ -723,6 +894,183 @@ mod tests {
             Parser::new(fux_vt::Size::new(rows, cols).expect("valid size"), 1000).expect("parser");
         parser.process(input).expect("process");
         parser
+    }
+
+    fn assert_cached_matches_full(
+        cache: &mut TerminalCompositionCache,
+        widget: TerminalWidget<'_>,
+        area: Rect,
+    ) {
+        let outer = Rect::new(0, 0, area.right() + 2, area.bottom() + 2);
+        let mut full = Buffer::empty(outer);
+        let mut cached = Buffer::empty(outer);
+        widget.render(area, &mut full);
+        cache.render(widget, area, &mut cached);
+        assert_eq!(
+            cached, full,
+            "cached cells, attributes and diff widths must match full composition"
+        );
+    }
+
+    #[test]
+    fn cached_composition_matches_full_through_terminal_and_host_changes() {
+        let mut parser = Parser::with_options(
+            fux_vt::Size::new(4, 12).expect("size"),
+            30,
+            crate::runtime::PARSER_OPTIONS,
+        )
+        .expect("parser");
+        let mut cache = TerminalCompositionCache::default();
+        let mut selection = TerminalSelection::default();
+        let mut theme = ThemeConfig::default();
+        let sequences: &[&[u8]] = &[
+            b"plain\r\n\x1b[31;44;1mcolored\x1b[0m\r\n",
+            "中文e\u{301}👩🏽‍💻\r\n".as_bytes(),
+            "\x1b[38;2;1;2;3m\u{10eeee}\u{301}\x1b[0m".as_bytes(),
+            b"\x1b[2;3H\x1b[@x\x1b[P\x1b[2K",
+            b"\x1b[2;4r\x1b[4;1H\n\n\x1b[r",
+            b"\x1b[?1049halternate\x1b[?1049l",
+            b"\x1b]4;1;#123456\x07\x1b]10;#abcdef\x07\x1b]17;#456789\x07",
+            b"\x1b]104\x07\x1b]110\x07\x1b]117\x07",
+            b"history\r\nmore\r\nmore\r\nmore\r\nmore\r\n",
+            b"\x1b[?25l\x1b[3;2H\x1b[?25h",
+            b"\x1b[3J\x1b[2J\x1b[H",
+            b"\x1bcreset",
+        ];
+        for iteration in 0..4 {
+            for bytes in sequences {
+                // Compare after every byte, including partial UTF-8/control strings.
+                for byte in *bytes {
+                    parser.process(&[*byte]).expect("process");
+                    for scrollback in [0, 1, 3, 100] {
+                        let widget = TerminalWidget {
+                            screen: ScreenView::new(parser.screen(), scrollback),
+                            selection: &selection,
+                            theme: &theme,
+                            font_style: if iteration % 2 == 0 {
+                                FontStyleConfig::Regular
+                            } else {
+                                FontStyleConfig::BoldItalic
+                            },
+                        };
+                        assert_cached_matches_full(&mut cache, widget, Rect::new(2, 1, 10, 4));
+                        assert_cached_matches_full(&mut cache, widget, Rect::new(1, 2, 14, 5));
+                    }
+                }
+                selection.begin(UVec2::new(2, iteration));
+                selection.update(UVec2::new(5, 3));
+                theme.foreground = [iteration as u8, 70, 120];
+            }
+            parser
+                .resize(
+                    fux_vt::Size::new(4, if iteration % 2 == 0 { 7 } else { 12 }).expect("size"),
+                )
+                .expect("resize");
+        }
+    }
+
+    #[test]
+    fn cache_reuses_unchanged_rows_and_bounds_memory_to_the_viewport() {
+        let mut parser = parse(4, 12, b"one\r\ntwo\r\nthree\r\nfour");
+        let mut cache = TerminalCompositionCache::default();
+        let theme = ThemeConfig::default();
+        let mut selection = TerminalSelection::default();
+        let draw = |cache: &mut TerminalCompositionCache,
+                    parser: &Parser,
+                    selection: &TerminalSelection| {
+            assert_cached_matches_full(
+                cache,
+                TerminalWidget {
+                    screen: ScreenView::new(parser.screen(), 0),
+                    selection,
+                    theme: &theme,
+                    font_style: FontStyleConfig::Regular,
+                },
+                Rect::new(0, 0, 12, 4),
+            );
+        };
+        draw(&mut cache, &parser, &selection);
+        assert_eq!(cache.composed_rows(), 4);
+        draw(&mut cache, &parser, &selection);
+        assert_eq!(
+            cache.composed_rows(),
+            4,
+            "fresh destination must not force composition"
+        );
+        parser.process(b"\x1b[1;1H\x1b[?25l").expect("cursor");
+        draw(&mut cache, &parser, &selection);
+        assert_eq!(cache.composed_rows(), 4, "cursor is a separate overlay");
+        parser.process(b"O").expect("edit");
+        draw(&mut cache, &parser, &selection);
+        assert_eq!(cache.composed_rows(), 5, "only edited row");
+        selection.begin(UVec2::new(1, 2));
+        draw(&mut cache, &parser, &selection);
+        assert_eq!(cache.composed_rows(), 6, "only selected row");
+        selection = TerminalSelection::default();
+        draw(&mut cache, &parser, &selection);
+        assert_eq!(cache.composed_rows(), 7);
+        for _ in 0..100 {
+            let before = cache.composed_rows();
+            parser.process(b"\x1b[4;1H\r\n").expect("scroll");
+            draw(&mut cache, &parser, &selection);
+            assert_eq!(
+                cache.composed_rows(),
+                before + 1,
+                "scroll should reuse retained row identities"
+            );
+            assert_eq!(
+                cache.rows.len(),
+                4,
+                "history must not accumulate cached buffers"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_surface_updates_cursor_and_repaints_recreated_renderer() {
+        let mut config = AppConfig::default();
+        config.terminal.default_rows = 2;
+        config.terminal.default_cols = 6;
+        let mut surface = TerminalSurface::new(&config).expect("surface");
+        let mut parser = parse(2, 6, "你a".as_bytes());
+        let selection = TerminalSelection::default();
+        for bytes in [b"\x1b[1;2H".as_slice(), b"\x1b[?25l", b"\x1b[?25h\x1b[2;4H"] {
+            parser.process(bytes).expect("cursor");
+            let screen = ScreenView::new(parser.screen(), 0);
+            surface.draw(
+                TerminalWidget {
+                    screen,
+                    selection: &selection,
+                    theme: &config.theme,
+                    font_style: config.font.style,
+                },
+                true,
+            );
+            assert_eq!(
+                surface.tui.surface().snapshot().cursor_visible(),
+                !screen.cursor_hidden()
+            );
+            if !screen.cursor_hidden() {
+                let (row, col) = screen.display_cursor_position();
+                assert_eq!(
+                    surface.tui.surface().snapshot().cursor_position(),
+                    (col, row).into()
+                );
+            }
+        }
+        let composed = surface.composition.composed_rows();
+        surface.tui = RatatuiTerminal::new(6, 2);
+        surface.draw(
+            TerminalWidget {
+                screen: ScreenView::new(parser.screen(), 0),
+                selection: &selection,
+                theme: &config.theme,
+                font_style: config.font.style,
+            },
+            true,
+        );
+        assert_eq!(symbol(&surface.tui.surface().snapshot(), 0, 0), "你");
+        assert_eq!(surface.composition.composed_rows(), composed);
     }
 
     #[test]

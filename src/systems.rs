@@ -538,24 +538,16 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
     }
 
     let screen = runtime.screen();
-    terminal.sync_colors(screen, &app_config.theme);
+    terminal.draw(
+        TerminalWidget {
+            screen,
+            selection,
+            theme: &app_config.theme,
+            font_style: app_config.font.style,
+        },
+        !app_config.cursor.model.visible,
+    );
     clear_color.0 = terminal.render_config().theme.background;
-    terminal.tui.draw(|frame| {
-        frame.render_widget(
-            TerminalWidget {
-                screen,
-                selection,
-                theme: &app_config.theme,
-                font_style: app_config.font.style,
-            },
-            frame.area(),
-        );
-
-        if !app_config.cursor.model.visible && !screen.cursor_hidden() {
-            let (cursor_row, cursor_col) = screen.display_cursor_position();
-            frame.set_cursor_position((cursor_col, cursor_row));
-        }
-    });
 }
 
 /// Applies Ratty's live font, theme, and DPI settings to the renderer entity.

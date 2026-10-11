@@ -519,22 +519,15 @@ fn pump_and_draw(
     drain_pty_output(&mut runtime, &mut inline_objects, &mut camera_updates);
 
     let screen = runtime.screen();
-    terminal.sync_colors(screen, &app_config.theme);
-    terminal.tui.draw(|frame| {
-        frame.render_widget(
-            TerminalWidget {
-                screen,
-                selection: &selection,
-                theme: &app_config.theme,
-                font_style: app_config.font.style,
-            },
-            frame.area(),
-        );
-        if !screen.cursor_hidden() {
-            let (row, col) = screen.display_cursor_position();
-            frame.set_cursor_position((col, row));
-        }
-    });
+    terminal.draw(
+        TerminalWidget {
+            screen,
+            selection: &selection,
+            theme: &app_config.theme,
+            font_style: app_config.font.style,
+        },
+        true,
+    );
 }
 
 fn request_texture_capture(params: CaptureParams, textures: Query<&TerminalTexture, With<Target>>) {

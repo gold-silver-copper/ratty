@@ -391,7 +391,7 @@ impl Default for FontConfig {
 }
 
 /// Font style override.
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 pub enum FontStyleConfig {
     /// Regular font style.
     #[serde(rename = "Regular")]
