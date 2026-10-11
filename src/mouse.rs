@@ -51,16 +51,59 @@ pub struct TerminalSelection {
     pending_anchor: Option<TextAnchor>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ForwardedMouseState {
     left_pressed: bool,
     middle_pressed: bool,
     right_pressed: bool,
     last_cell: Option<UVec2>,
     protocol: Option<(MouseProtocolMode, MouseProtocolEncoding)>,
+    pending_releases: u8,
+    pending_focus: Option<bool>,
 }
 
 impl ForwardedMouseState {
+    fn send_button(
+        &mut self,
+        button: VtButton,
+        pressed: bool,
+        cell: Option<UVec2>,
+        runtime: &mut TerminalRuntime,
+        mods: Modifiers,
+    ) {
+        let previous = *self;
+        let bit = match button {
+            VtButton::Left => 1,
+            VtButton::Middle => 2,
+            VtButton::Right => 4,
+            _ => 0,
+        };
+        let report = self.button(button, pressed, cell, &runtime.screen(), mods);
+        if runtime.write_human_input(&report) {
+            self.pending_releases &= !bit;
+        } else {
+            *self = previous;
+            if !pressed {
+                self.pending_releases |= bit;
+            }
+        }
+    }
+
+    fn send_releases(&mut self, runtime: &mut TerminalRuntime, mods: Modifiers, all: bool) {
+        for (button, bit) in [
+            (VtButton::Left, 1),
+            (VtButton::Middle, 2),
+            (VtButton::Right, 4),
+        ] {
+            if all || self.pending_releases & bit != 0 {
+                self.send_button(button, false, self.last_cell, runtime, mods);
+            }
+        }
+        if self.held().is_none() {
+            self.last_cell = None;
+        }
+    }
+
     fn held(&self) -> Option<VtButton> {
         if self.left_pressed {
             Some(VtButton::Left)
@@ -130,6 +173,7 @@ impl ForwardedMouseState {
         out
     }
 
+    #[cfg(test)]
     fn release_all(&mut self, screen: &Screen, mods: Modifiers) -> Vec<u8> {
         let mut out = Vec::new();
         for button in [VtButton::Left, VtButton::Middle, VtButton::Right] {
@@ -580,8 +624,7 @@ pub(crate) fn handle_mouse_input(
         mode == TerminalPresentationMode::Flat2d && mouse_mode != MouseProtocolMode::None;
     let protocol = (mouse_mode, mouse_encoding);
     if forwarded_mouse.protocol != Some(protocol) || !forward_mouse {
-        let releases = forwarded_mouse.release_all(&runtime.screen(), mods);
-        runtime.write_human_input(&releases);
+        forwarded_mouse.send_releases(runtime, mods, true);
         forwarded_mouse.protocol = Some(protocol);
     }
     for event in focus_events.read() {
@@ -589,14 +632,23 @@ pub(crate) fn handle_mouse_input(
             continue;
         }
         if !event.focused {
-            let releases = forwarded_mouse.release_all(&runtime.screen(), mods);
-            runtime.write_human_input(&releases);
-            release_pointer_drags(camera_interaction, selection, &mut forwarded_mouse);
+            forwarded_mouse.send_releases(runtime, mods, true);
+            release_pointer_drags(
+                camera_interaction,
+                selection,
+                &mut ForwardedMouseState::default(),
+            );
             touch_gesture.reset();
         }
+        forwarded_mouse.pending_focus = Some(event.focused);
+    }
+    forwarded_mouse.send_releases(runtime, mods, !window.focused);
+    if let Some(focused) = forwarded_mouse.pending_focus {
         let mut report = Vec::new();
-        runtime.screen().encode_focus(event.focused, &mut report);
-        runtime.write_human_input(&report);
+        runtime.screen().encode_focus(focused, &mut report);
+        if runtime.write_human_input(&report) {
+            forwarded_mouse.pending_focus = None;
+        }
     }
 
     for event in cursor_events.read() {
@@ -633,8 +685,11 @@ pub(crate) fn handle_mouse_input(
                 terminal,
                 forwarded_mouse.held().is_some(),
             ) {
+                let previous = *forwarded_mouse;
                 let report = forwarded_mouse.motion(cell, &runtime.screen(), mods);
-                runtime.write_human_input(&report);
+                if !runtime.write_human_input(&report) {
+                    *forwarded_mouse = previous;
+                }
             }
         } else if (selection.dragging || selection.pending_start.is_some())
             && let Some(cell) = position_to_cell(event.position, window_size, viewport, terminal)
@@ -693,8 +748,7 @@ pub(crate) fn handle_mouse_input(
                     .and_then(|position| {
                         mouse_cell(position, window_size, viewport, terminal, !pressed)
                     });
-                let report = forwarded_mouse.button(button, pressed, cell, &runtime.screen(), mods);
-                runtime.write_human_input(&report);
+                forwarded_mouse.send_button(button, pressed, cell, runtime, mods);
             }
             continue;
         }
@@ -1040,6 +1094,7 @@ mod wheel_zoom_tests {
             right_pressed: true,
             last_cell: Some(UVec2::ZERO),
             protocol: None,
+            ..default()
         };
 
         release_pointer_drags(&mut interaction, &mut selection, &mut forwarded);

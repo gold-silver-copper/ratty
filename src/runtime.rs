@@ -2,10 +2,9 @@
 
 use std::collections::HashSet;
 use std::env;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -15,6 +14,7 @@ use bevy::prelude::Resource;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::config::AppConfig;
+use crate::pty_input::InputQueue;
 use fux_vt::{Feature, Identity, Options, Parser, Sink, Size, Unhandled};
 
 use crate::screen::ScreenView;
@@ -141,8 +141,8 @@ fn keep_scrollback_anchored<T>(
 pub struct TerminalRuntime {
     /// PTY output channel.
     rx: SyncCell<Receiver<Vec<u8>>>,
-    /// PTY input writer.
-    pub writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    /// The sole ordered input path; only its worker touches the PTY writer.
+    input: InputQueue,
     /// PTY master handle.
     master: SyncCell<Option<Box<dyn MasterPty + Send>>>,
     /// Child process handle.
@@ -347,7 +347,7 @@ impl TerminalRuntime {
 
         Ok(Self {
             rx: SyncCell::new(rx),
-            writer: Arc::new(Mutex::new(Some(writer))),
+            input: InputQueue::spawn(writer).context("failed to spawn PTY input worker")?,
             master: SyncCell::new(Some(pair.master)),
             child: Some(child),
             reader_thread: Some(reader_thread),
@@ -434,38 +434,61 @@ impl TerminalRuntime {
         self.rx.get().try_recv()
     }
 
-    /// Writes input bytes to the PTY.
-    pub fn write_input(&self, bytes: &[u8]) {
-        self.write_input_bytes(bytes);
-    }
-
-    /// Writes input accepted from Ratty's local keyboard or mouse.
-    pub fn write_human_input(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            self.human_input_sequence = self.human_input_sequence.saturating_add(1);
+    /// Accepts input into the bounded PTY queue. Success means queued, not
+    /// written; actual progress and later write errors are reported separately.
+    ///
+    /// # Errors
+    /// Returns `WouldBlock` when full or `BrokenPipe` after shutdown/failure.
+    pub fn write_input(&self, bytes: &[u8]) -> io::Result<usize> {
+        if self.pty_disconnected {
+            return Err(io::ErrorKind::BrokenPipe.into());
         }
-        self.write_input_bytes(bytes);
+        self.input.enqueue(bytes)
     }
 
-    /// Writes input accepted from the authenticated control endpoint.
-    pub fn write_agent_input(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() {
+    /// Queues local input, reporting rejection and counting only acceptance.
+    /// The return value lets mouse ownership follow accepted presses/releases.
+    pub fn write_human_input(&mut self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        match self.write_input(bytes) {
+            Ok(count) => {
+                if count != 0 {
+                    self.human_input_sequence = self.human_input_sequence.saturating_add(1);
+                }
+                true
+            }
+            Err(error) => {
+                bevy::log::warn!("terminal input rejected: {error}");
+                false
+            }
+        }
+    }
+
+    /// Queues authenticated input, counting only accepted packets.
+    ///
+    /// # Errors
+    /// Returns the same backpressure/disconnect errors as [`Self::write_input`].
+    pub fn write_agent_input(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let count = self.write_input(bytes)?;
+        if count != 0 {
             self.agent_input_sequence = self.agent_input_sequence.saturating_add(1);
         }
-        self.write_input_bytes(bytes);
+        Ok(count)
     }
 
-    fn write_input_bytes(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-
-        if let Ok(mut writer) = self.writer.lock()
-            && let Some(writer) = writer.as_mut()
-        {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
-        }
+    /// Bytes retained in queued or partially written input packets.
+    pub fn pending_input_bytes(&self) -> usize {
+        self.input.pending_bytes()
+    }
+    /// Bytes actually written to the OS, including partial packets.
+    pub fn written_input_bytes(&self) -> u64 {
+        self.input.written_bytes()
+    }
+    /// A terminal writer failure, retained for logs and control observations.
+    pub fn input_error(&self) -> Option<String> {
+        self.input.error()
     }
 
     /// Returns the number of PTY output batches processed by Ratty.
@@ -568,9 +591,7 @@ impl TerminalRuntime {
         self.shutdown_started = true;
         self.pty_disconnected = true;
 
-        if let Ok(mut writer) = self.writer.lock() {
-            writer.take();
-        }
+        self.input.shutdown();
 
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
@@ -756,8 +777,9 @@ mod tests {
 
 #[cfg(test)]
 mod resize_tests {
-    use std::io;
+    use std::io::{self, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -810,7 +832,7 @@ mod resize_tests {
         let (_tx, rx) = mpsc::sync_channel(1);
         TerminalRuntime {
             rx: SyncCell::new(rx),
-            writer: Arc::new(Mutex::new(None)),
+            input: InputQueue::spawn(Box::new(io::sink())).expect("test writer"),
             master: SyncCell::new(Some(master)),
             child: None,
             reader_thread: None,
@@ -919,11 +941,41 @@ mod resize_tests {
         runtime.record_output_batch();
         runtime.write_human_input(b"a");
         runtime.write_human_input(b"");
-        runtime.write_agent_input("界".as_bytes());
+        runtime
+            .write_agent_input("界".as_bytes())
+            .expect("accepted");
         assert_eq!(runtime.output_sequence(), 2);
         assert!(runtime.elapsed_since_output().is_some());
         assert_eq!(runtime.human_input_sequence(), 1);
         assert_eq!(runtime.agent_input_sequence(), 1);
+        runtime.shutdown();
+        assert!(!runtime.write_human_input(b"rejected"));
+        assert!(runtime.write_agent_input(b"rejected").is_err());
+        assert_eq!(runtime.human_input_sequence(), 1);
+        assert_eq!(runtime.agent_input_sequence(), 1);
+    }
+
+    #[test]
+    fn output_budget_yields_to_other_update_work() {
+        let mut runtime = test_runtime(Box::new(FailOnceMaster {
+            attempts: Arc::new(AtomicUsize::new(1)),
+            applied_size: Arc::new(Mutex::new(None)),
+        }));
+        let (tx, rx) = mpsc::sync_channel(32);
+        for _ in 0..32 {
+            tx.try_send(vec![b'x'; 16 * 1024]).expect("test chunk");
+        }
+        runtime.rx = SyncCell::new(rx);
+        let mut objects = crate::inline::TerminalInlineObjects::default();
+        let mut camera = Vec::new();
+        let drained = crate::systems::drain_pty_output(&mut runtime, &mut objects, &mut camera);
+        assert!(drained.pending);
+        assert!(runtime.output_sequence() <= 16);
+        while runtime.output_sequence() < 32 {
+            crate::systems::drain_pty_output(&mut runtime, &mut objects, &mut camera);
+        }
+        assert!(!crate::systems::drain_pty_output(&mut runtime, &mut objects, &mut camera).pending);
+        drop(tx);
     }
 
     #[test]

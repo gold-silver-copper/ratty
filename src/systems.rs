@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::TryRecvError;
+use std::time::{Duration, Instant};
 
 use crate::camera::{
     MIN_ORTHOGRAPHIC_SCALE, TerminalCameraSlots, TerminalCameraUpdate, TerminalMobiusSource,
@@ -172,7 +173,15 @@ pub fn pump_pty_output(
     mut camera_update_writer: MessageWriter<TerminalCameraUpdate>,
     mut app_exit: MessageWriter<AppExit>,
     mut redraw: ResMut<TerminalRedrawState>,
+    mut request_redraw: MessageWriter<bevy::window::RequestRedraw>,
+    mut reported_input_error: Local<Option<String>>,
 ) {
+    if let Some(error) = runtime.input_error()
+        && reported_input_error.as_ref() != Some(&error)
+    {
+        warn!("PTY input worker failed: {error}");
+        *reported_input_error = Some(error);
+    }
     let mut camera_updates = Vec::new();
     let drained = drain_pty_output(&mut runtime, &mut inline_objects, &mut camera_updates);
     for update in camera_updates {
@@ -185,6 +194,9 @@ pub fn pump_pty_output(
     if drained.processed {
         redraw.request();
     }
+    if drained.pending {
+        request_redraw.write(bevy::window::RequestRedraw);
+    }
 }
 
 /// What [`drain_pty_output`] found on the PTY.
@@ -194,9 +206,11 @@ pub struct PtyDrain {
     pub processed: bool,
     /// Whether the PTY reader has hung up (the child exited).
     pub disconnected: bool,
+    /// The processing budget was reached; schedule another update promptly.
+    pub pending: bool,
 }
 
-/// Drains every pending PTY chunk into the parser and inline-object state.
+/// Drains a bounded batch of PTY output into parser and inline-object state.
 ///
 /// Each chunk goes through [`TerminalInlineObjects::consume_pty_output`]
 /// (which strips inline-graphics control sequences and feeds the rest to the
@@ -211,9 +225,18 @@ pub fn drain_pty_output(
     camera_updates: &mut Vec<TerminalCameraUpdate>,
 ) -> PtyDrain {
     let mut drained = PtyDrain::default();
+    let started = Instant::now();
+    let mut bytes = 0usize;
     loop {
+        // A reader chunk is at most 16 KiB; give continuous output a bounded
+        // slice of the update so input, rendering and control requests run.
+        if bytes >= 256 * 1024 || started.elapsed() >= Duration::from_millis(4) {
+            drained.pending = true;
+            break;
+        }
         match runtime.try_recv() {
             Ok(chunk) => {
+                bytes += chunk.len();
                 let mut replies = inline_objects.consume_pty_output(
                     &chunk,
                     runtime,
@@ -222,7 +245,9 @@ pub fn drain_pty_output(
                 );
                 replies.extend(runtime.take_replies());
                 for reply in replies {
-                    runtime.write_input(&reply);
+                    if let Err(error) = runtime.write_input(&reply) {
+                        warn!("terminal reply rejected: {error}");
+                    }
                 }
                 inline_objects.refresh_text_anchors(runtime.screen());
                 inline_objects.refresh_placeholder_anchors(runtime.screen());

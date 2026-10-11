@@ -708,6 +708,9 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                     "output_sequence": runtime.output_sequence(),
                     "human_input_sequence": runtime.human_input_sequence(),
                     "agent_input_sequence": runtime.agent_input_sequence(),
+                    "input_pending_bytes": runtime.pending_input_bytes(),
+                    "input_written_bytes": runtime.written_input_bytes(),
+                    "input_error": runtime.input_error(),
                     "last_output_elapsed_ms": runtime.elapsed_since_output().map(|elapsed| {
                         elapsed.as_millis().min(u128::from(u64::MAX)) as u64
                     }),
@@ -776,11 +779,14 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
             }
             let bracketed = request.paste && runtime.screen().mode(fux_vt::Mode::BracketedPaste);
             let bytes = encode_agent_text(&request.text, request.paste, &runtime.screen());
-            let bytes_written = bytes.len();
-            runtime.write_agent_input(&bytes);
+            let bytes_accepted = match runtime.write_agent_input(&bytes) {
+                Ok(count) => count,
+                Err(error) => return input_rejected(error),
+            };
             ControlResponse::data(serde_json::json!({
                 "text_bytes": request.text.len(),
-                "bytes_written": bytes_written,
+                "bytes_accepted": bytes_accepted,
+                "delivery": "queued",
                 "paste_requested": request.paste,
                 "bracketed": bracketed,
             }))
@@ -813,11 +819,14 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                 }
                 encoded.extend_from_slice(&bytes);
             }
-            let bytes_written = encoded.len();
-            runtime.write_agent_input(&encoded);
+            let bytes_accepted = match runtime.write_agent_input(&encoded) {
+                Ok(count) => count,
+                Err(error) => return input_rejected(error),
+            };
             ControlResponse::data(serde_json::json!({
-                "keys_pressed": key_count,
-                "bytes_written": bytes_written,
+                "keys_accepted": key_count,
+                "bytes_accepted": bytes_accepted,
+                "delivery": "queued",
             }))
         }
         ControlCommand::Resize(request) => {
@@ -1294,6 +1303,15 @@ impl ControlClient {
         }
         Ok(response)
     }
+}
+
+fn input_rejected(error: std::io::Error) -> ControlResponse {
+    let code = if error.kind() == std::io::ErrorKind::WouldBlock {
+        "input_backpressure"
+    } else {
+        "terminal_input_failed"
+    };
+    ControlResponse::coded_error(code, error.to_string())
 }
 
 #[cfg(test)]

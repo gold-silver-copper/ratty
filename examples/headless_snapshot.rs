@@ -287,7 +287,9 @@ fn send_input(
         return;
     }
     *next += 1;
-    runtime.write_input(bytes);
+    if let Err(error) = runtime.write_input(bytes) {
+        warn!("PTY input rejected: {error}");
+    }
     if options.diagnose {
         info!("sent PTY input {} of {}", *next, options.send.len());
     }
