@@ -3,7 +3,7 @@
 use bevy::ecs::system::SystemParam;
 use bevy::ecs::world::FromWorld;
 use bevy::input::ButtonState;
-use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::keyboard::{Key, KeyboardFocusLost, KeyboardInput};
 use bevy::prelude::*;
 use bevy::window::{Ime, PrimaryWindow};
 use fux_vt::Screen;
@@ -362,47 +362,26 @@ impl TerminalKeyBindings {
 /// Keyboard modifier state.
 #[derive(Default)]
 pub struct TerminalKeyboard {
-    pub(crate) ctrl_pressed: bool,
-    pub(crate) left_alt_pressed: bool,
-    pub(crate) right_alt_pressed: bool,
-    pub(crate) shift_pressed: bool,
-    pub(crate) super_pressed: bool,
+    pressed: ButtonInput<KeyCode>,
 }
 
 impl TerminalKeyboard {
     fn modifiers(&self) -> BindingModifiers {
-        BindingModifiers {
-            control: self.ctrl_pressed,
-            alt: self.left_alt_pressed,
-            shift: self.shift_pressed,
-            super_key: self.super_pressed,
-        }
+        current_modifiers(&self.pressed)
+    }
+
+    fn focus_lost(&mut self) {
+        self.pressed.reset_all();
     }
 
     /// Translates a keyboard event into terminal input bytes.
     pub fn handle_event(&mut self, event: &KeyboardInput, screen: &Screen) -> Option<Vec<u8>> {
-        match event.key_code {
-            KeyCode::ControlLeft | KeyCode::ControlRight => {
-                self.ctrl_pressed = event.state == ButtonState::Pressed;
-                return None;
+        if is_modifier_key(event.key_code) {
+            match event.state {
+                ButtonState::Pressed => self.pressed.press(event.key_code),
+                ButtonState::Released => self.pressed.release(event.key_code),
             }
-            KeyCode::AltLeft => {
-                self.left_alt_pressed = event.state == ButtonState::Pressed;
-                return None;
-            }
-            KeyCode::AltRight => {
-                self.right_alt_pressed = event.state == ButtonState::Pressed;
-                return None;
-            }
-            KeyCode::ShiftLeft | KeyCode::ShiftRight => {
-                self.shift_pressed = event.state == ButtonState::Pressed;
-                return None;
-            }
-            KeyCode::SuperLeft | KeyCode::SuperRight => {
-                self.super_pressed = event.state == ButtonState::Pressed;
-                return None;
-            }
-            _ => {}
+            return None;
         }
 
         if event.state != ButtonState::Pressed {
@@ -414,12 +393,12 @@ impl TerminalKeyboard {
             KeyTranslationContext {
                 logical_key: &event.logical_key,
                 text: event.text.as_deref(),
-                ctrl_pressed: self.ctrl_pressed,
-                alt_pressed: self.left_alt_pressed,
-                alt_gr_pressed: self.right_alt_pressed,
-                shift_pressed: self.shift_pressed,
+                ctrl_pressed: self.modifiers().control,
+                alt_pressed: self.modifiers().alt,
+                alt_gr_pressed: self.pressed.pressed(KeyCode::AltRight),
+                shift_pressed: self.modifiers().shift,
                 screen,
-                super_pressed: self.super_pressed,
+                super_pressed: self.modifiers().super_key,
             },
         ))
     }
@@ -448,6 +427,7 @@ pub struct KeyboardSystemParams<'w, 's> {
 pub fn handle_keyboard_input(
     mut keyboard_events: MessageReader<KeyboardInput>,
     mut ime_events: MessageReader<Ime>,
+    mut focus_lost: MessageReader<KeyboardFocusLost>,
     mut keyboard: Local<TerminalKeyboard>,
     mut params: KeyboardSystemParams,
 ) {
@@ -667,6 +647,12 @@ pub fn handle_keyboard_input(
             }
             params.runtime.write_human_input(&input);
         }
+    }
+    // Bevy emits this even when the OS does not send individual releases.
+    // Match its input system's ordering: clear after processing this batch.
+    if !focus_lost.is_empty() {
+        keyboard.focus_lost();
+        focus_lost.clear();
     }
 }
 
@@ -1584,6 +1570,86 @@ mod key_code_tests {
 #[cfg(test)]
 mod keyboard_translation_tests {
     use super::*;
+
+    fn keyboard_event(key_code: KeyCode, state: ButtonState) -> KeyboardInput {
+        KeyboardInput {
+            key_code,
+            state,
+            logical_key: Key::ArrowUp,
+            text: None,
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        }
+    }
+
+    #[test]
+    fn releasing_one_modifier_side_preserves_the_other_held_key() {
+        let parser = key_test_parser(false, 1, None);
+        for (left, right, expected) in [
+            (
+                KeyCode::ControlLeft,
+                KeyCode::ControlRight,
+                b"\x1b[1;5A".as_slice(),
+            ),
+            (
+                KeyCode::ShiftLeft,
+                KeyCode::ShiftRight,
+                b"\x1b[1;2A".as_slice(),
+            ),
+            (
+                KeyCode::SuperLeft,
+                KeyCode::SuperRight,
+                b"\x1b[1;9A".as_slice(),
+            ),
+        ] {
+            for (held, released) in [(left, right), (right, left)] {
+                let mut keyboard = TerminalKeyboard::default();
+                keyboard.handle_event(&keyboard_event(held, ButtonState::Pressed), parser.screen());
+                keyboard.handle_event(
+                    &keyboard_event(released, ButtonState::Pressed),
+                    parser.screen(),
+                );
+                keyboard.handle_event(
+                    &keyboard_event(released, ButtonState::Released),
+                    parser.screen(),
+                );
+                assert_eq!(
+                    keyboard
+                        .handle_event(
+                            &keyboard_event(KeyCode::ArrowUp, ButtonState::Pressed),
+                            parser.screen()
+                        )
+                        .expect("key"),
+                    expected,
+                    "{held:?} must remain pressed after releasing {released:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lost_focus_clears_modifiers_when_the_os_omits_releases() {
+        let parser = key_test_parser(false, 1, None);
+        let mut keyboard = TerminalKeyboard::default();
+        for key in [
+            KeyCode::ControlLeft,
+            KeyCode::ShiftRight,
+            KeyCode::AltLeft,
+            KeyCode::SuperRight,
+        ] {
+            keyboard.handle_event(&keyboard_event(key, ButtonState::Pressed), parser.screen());
+        }
+        keyboard.focus_lost();
+        assert_eq!(
+            keyboard
+                .handle_event(
+                    &keyboard_event(KeyCode::ArrowUp, ButtonState::Pressed),
+                    parser.screen()
+                )
+                .expect("key"),
+            b"\x1b[A"
+        );
+    }
 
     fn translate_navigation_key(
         key_code: KeyCode,
