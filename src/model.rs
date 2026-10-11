@@ -607,38 +607,6 @@ fn object_asset_path(path: &Path) -> anyhow::Result<String> {
         .to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rgp_asset_paths_reject_parent_traversal() {
-        for path in ["../../secret.obj", "assets/../secret.obj"] {
-            assert!(object_asset_path(Path::new(path)).is_err(), "{path}");
-        }
-    }
-
-    #[test]
-    fn rgp_asset_paths_keep_assets_relative_names() {
-        assert_eq!(
-            object_asset_path(Path::new("assets/widget/model.obj")).unwrap(),
-            "widget/model.obj"
-        );
-    }
-
-    #[test]
-    fn rgp_gltf_rejects_external_resources() {
-        let gltf = br#"{"buffers":[{"uri":"../../secret.bin"}]}"#;
-        assert!(validate_gltf_embedded_resources("gltf", gltf).is_err());
-    }
-
-    #[test]
-    fn rgp_gltf_accepts_embedded_resources() {
-        let gltf = br#"{"buffers":[{"uri":"data:application/octet-stream;base64,AA=="}]}"#;
-        assert!(validate_gltf_embedded_resources("gltf", gltf).is_ok());
-    }
-}
-
 fn load_stl_meshes_from_path(path: &Path) -> anyhow::Result<Mesh> {
     let data = std::fs::read(path)?;
     load_stl_meshes_from_bytes(&data)
@@ -799,4 +767,37 @@ fn build_meshes(
 
     ensure!(!output.is_empty(), "no mesh content inside {source}");
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgp_asset_paths_reject_parent_traversal() {
+        for path in ["../../secret.obj", "assets/../secret.obj"] {
+            assert!(object_asset_path(Path::new(path)).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn rgp_asset_paths_keep_assets_relative_names() {
+        assert_eq!(
+            object_asset_path(Path::new("assets/widget/model.obj"))
+                .expect("asset path should resolve"),
+            "widget/model.obj"
+        );
+    }
+
+    #[test]
+    fn rgp_gltf_rejects_external_resources() {
+        let gltf = br#"{"buffers":[{"uri":"../../secret.bin"}]}"#;
+        assert!(validate_gltf_embedded_resources("gltf", gltf).is_err());
+    }
+
+    #[test]
+    fn rgp_gltf_accepts_embedded_resources() {
+        let gltf = br#"{"buffers":[{"uri":"data:application/octet-stream;base64,AA=="}]}"#;
+        assert!(validate_gltf_embedded_resources("gltf", gltf).is_ok());
+    }
 }
