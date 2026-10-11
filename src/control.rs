@@ -178,8 +178,8 @@ pub struct ShapeUpdate {
 }
 
 pub use snapshot::{
-    ScreenSnapshot, SnapshotCursor, SnapshotModes, SnapshotRect, SnapshotRequest, SnapshotRow,
-    SnapshotRun, SnapshotStyle,
+    ScreenSnapshot, SnapshotColors, SnapshotCursor, SnapshotModes, SnapshotRect, SnapshotRequest,
+    SnapshotRow, SnapshotRun, SnapshotStyle,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -768,6 +768,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
                 runtime.screen(),
                 &request,
                 runtime.screen_revision(),
+                &app_config.theme,
             ))
         }
         ControlCommand::WriteText(request) => {
@@ -1026,6 +1027,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
             }
             if let Some(rgb) = update.background_rgb {
                 app_config.theme.background = rgb;
+                runtime.set_theme(&app_config.theme);
                 terminal.set_background(rgb);
                 clear_color.0 = Color::srgba_u8(
                     rgb[0],
@@ -1341,6 +1343,7 @@ mod tests {
                 include_plain: true,
             },
             0,
+            &crate::config::ThemeConfig::default(),
         )
     }
 
@@ -1548,6 +1551,7 @@ mod tests {
                 include_plain: false,
             },
             0,
+            &crate::config::ThemeConfig::default(),
         );
         for row in &snapshot.content {
             for run in &row.runs {
@@ -1565,6 +1569,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn snapshot_colors_resolve_indices_and_defaults_without_changing_style_names() {
+        let mut parser = Parser::with_options(
+            fux_vt::Size::new(2, 4).expect("size"),
+            0,
+            crate::runtime::PARSER_OPTIONS,
+        )
+        .expect("parser");
+        parser
+            .process(b"\x1b[31mX\x1b]4;1;#010203\x07\x1b]11;#040506\x07")
+            .expect("output");
+        let request = SnapshotRequest {
+            rect: None,
+            include_styles: true,
+            include_plain: true,
+        };
+        let theme = crate::config::ThemeConfig::default();
+        let snapshot =
+            ScreenSnapshot::from_screen(ScreenView::new(parser.screen(), 0), &request, 1, &theme);
+        assert_eq!(snapshot.colors.palette[1], [1, 2, 3]);
+        assert_eq!(snapshot.colors.background, [4, 5, 6]);
+        assert_eq!(snapshot.colors.foreground, theme.foreground);
+        assert!(
+            snapshot
+                .styles
+                .as_ref()
+                .expect("styles")
+                .iter()
+                .any(|s| s.foreground == "indexed:1")
+        );
+        parser.process(b"\x1b]104\x07\x1b]111\x07").expect("reset");
+        let snapshot =
+            ScreenSnapshot::from_screen(ScreenView::new(parser.screen(), 0), &request, 2, &theme);
+        assert_eq!(snapshot.colors.palette[1], theme.normal.red);
+        assert_eq!(snapshot.colors.background, theme.background);
     }
 
     #[test]

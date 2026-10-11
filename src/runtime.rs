@@ -13,7 +13,8 @@ use bevy::platform::cell::SyncCell;
 use bevy::prelude::Resource;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::config::AppConfig;
+use crate::colors::HostColors;
+use crate::config::{AppConfig, ThemeConfig};
 use crate::pty_input::InputQueue;
 use fux_vt::{Feature, Identity, Options, Parser, Sink, Size, Unhandled};
 
@@ -47,6 +48,8 @@ pub const PARSER_OPTIONS: Options = Options::new()
     .with(Feature::KittyKeyboard)
     .with(Feature::Reflow)
     .with(Feature::ModeReports)
+    .with(Feature::Events)
+    .with(Feature::Palette)
     .with_identity(Some(IDENTITY));
 
 /// Receives what the engine leaves to its host: replies to queries, queued
@@ -58,6 +61,7 @@ pub struct TerminalParserSink {
     pending_replies: Vec<Vec<u8>>,
     reply_bytes: usize,
     reply_overflow: bool,
+    host_colors: HostColors,
 }
 
 impl TerminalParserSink {
@@ -70,6 +74,14 @@ impl TerminalParserSink {
 }
 
 impl Sink for TerminalParserSink {
+    fn event(&mut self, event: fux_vt::Event<'_>) {
+        if let fux_vt::Event::ColorQuery { number, bel } = event
+            && let Some(reply) = self.host_colors.answer(number, bel)
+        {
+            self.reply(&reply);
+        }
+    }
+
     fn reply(&mut self, bytes: &[u8]) {
         if self.reply_bytes.saturating_add(bytes.len()) > 64 * 1024
             || self.pending_replies.len() >= 1024
@@ -360,12 +372,14 @@ impl TerminalRuntime {
             }
         });
 
-        let parser = Parser::with_options(
+        let mut parser = Parser::with_options(
             Size::new(rows.max(1), cols.max(1))?,
             config.terminal.scrollback,
             PARSER_OPTIONS,
         )
         .context("failed to create the terminal screen")?;
+        let host_colors = HostColors::from(&config.theme);
+        parser.set_host_palette(host_colors.palette.map(Some));
 
         Ok(Self {
             rx: SyncCell::new(rx),
@@ -374,7 +388,10 @@ impl TerminalRuntime {
             child: Some(child),
             reader_thread: Some(reader_thread),
             parser,
-            sink: TerminalParserSink::default(),
+            sink: TerminalParserSink {
+                host_colors,
+                ..Default::default()
+            },
             scrollback: 0,
             pty_disconnected: false,
             output_sequence: 0,
@@ -387,6 +404,18 @@ impl TerminalRuntime {
             last_pty_size: PtyDimensions::new(cols, rows, 0, 0)?,
             pending_resize: None,
         })
+    }
+
+    /// Updates host defaults without replacing the application's OSC overrides.
+    pub fn set_theme(&mut self, theme: &ThemeConfig) -> bool {
+        let colors = HostColors::from(theme);
+        if colors == self.sink.host_colors {
+            return false;
+        }
+        self.parser.set_host_palette(colors.palette.map(Some));
+        self.sink.host_colors = colors;
+        self.screen_revision = self.screen_revision.saturating_add(1);
+        true
     }
 
     /// Feeds bytes from the PTY into the VT state machine.
@@ -693,6 +722,63 @@ mod tests {
             process(&mut parser, &mut sink, format!("\x1b[{number}z").as_bytes());
         }
         assert_eq!(sink.seen.len(), 128);
+    }
+
+    #[test]
+    fn theme_queries_application_overrides_and_resets_agree() {
+        let (mut parser, mut sink) = parser(2, 4);
+        let mut theme = ThemeConfig {
+            foreground: [0x12, 0x34, 0x56],
+            background: [1, 2, 3],
+            cursor: [4, 5, 6],
+            ..Default::default()
+        };
+        theme.normal.red = [7, 8, 9];
+        sink.host_colors = HostColors::from(&theme);
+        parser.set_host_palette(sink.host_colors.palette.map(Some));
+        process(
+            &mut parser,
+            &mut sink,
+            b"\x1b]4;1;?\x07\x1b]10;?\x1b\\\x1b]11;?\x07\x1b]12;?\x1b\\",
+        );
+        assert_eq!(
+            replies(&mut sink),
+            [
+                "\x1b]4;1;rgb:0707/0808/0909\x07",
+                "\x1b]10;rgb:1212/3434/5656\x1b\\",
+                "\x1b]11;rgb:0101/0202/0303\x07",
+                "\x1b]12;rgb:0404/0505/0606\x1b\\"
+            ]
+        );
+        process(
+            &mut parser,
+            &mut sink,
+            b"\x1b]4;1;#aabbcc\x07\x1b]10;#998877\x07\x1b]4;1;?\x07\x1b]10;?\x07",
+        );
+        assert_eq!(
+            replies(&mut sink),
+            [
+                "\x1b]4;1;rgb:aaaa/bbbb/cccc\x07",
+                "\x1b]10;rgb:9999/8888/7777\x07"
+            ]
+        );
+        let colors = crate::colors::ResolvedColors::new(parser.screen(), &theme);
+        assert_eq!(colors.palette[1], [0xaa, 0xbb, 0xcc].into());
+        assert_eq!(colors.foreground, [0x99, 0x88, 0x77].into());
+        process(
+            &mut parser,
+            &mut sink,
+            b"\x1b]104;1\x07\x1b]110\x07\x1b]4;1;?\x07\x1b]10;?\x07",
+        );
+        assert_eq!(
+            replies(&mut sink),
+            [
+                "\x1b]4;1;rgb:0707/0808/0909\x07",
+                "\x1b]10;rgb:1212/3434/5656\x07"
+            ]
+        );
+        process(&mut parser, &mut sink, b"\x1bc\x1b]4;1;?\x07");
+        assert_eq!(replies(&mut sink), ["\x1b]4;1;rgb:0707/0808/0909\x07"]);
     }
 
     /// DA1 must not advertise sixel (`4`) or OSC 52 (`52`), or applications

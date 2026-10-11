@@ -114,6 +114,10 @@ impl Plugin for TerminalPlugin {
                     )
                     .in_set(TerminalCameraSystemSet::Transition),
             )
+            .add_systems(
+                Update,
+                crate::systems::sync_terminal_theme.before(pump_pty_output),
+            )
             .add_systems(Update, handle_window_resize)
             .add_systems(
                 Update,

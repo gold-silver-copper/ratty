@@ -145,6 +145,38 @@ pub struct SnapshotModes {
     pub modify_other_keys: Option<u8>,
 }
 
+/// Effective colors for interpreting default and indexed snapshot styles.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SnapshotColors {
+    /// Effective default text foreground, as RGB bytes.
+    pub foreground: [u8; 3],
+    /// Effective default background, before window opacity.
+    pub background: [u8; 3],
+    /// Effective terminal cursor color.
+    pub cursor: [u8; 3],
+    /// All 256 effective indexed colors, including application overrides.
+    pub palette: Vec<[u8; 3]>,
+    /// Application selection foreground override, if any.
+    pub selection_foreground: Option<[u8; 3]>,
+    /// Application selection background override, if any.
+    pub selection_background: Option<[u8; 3]>,
+}
+
+impl SnapshotColors {
+    fn new(screen: &fux_vt::Screen, theme: &crate::config::ThemeConfig) -> Self {
+        use crate::colors::{ResolvedColors, channels};
+        let colors = ResolvedColors::new(screen, theme);
+        Self {
+            foreground: channels(colors.foreground),
+            background: channels(colors.background),
+            cursor: channels(colors.cursor),
+            palette: colors.palette.map(channels).to_vec(),
+            selection_foreground: colors.selection_foreground.map(channels),
+            selection_background: colors.selection_background.map(channels),
+        }
+    }
+}
+
 /// Canonical structured view of Ratty's visible terminal grid.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScreenSnapshot {
@@ -163,6 +195,8 @@ pub struct ScreenSnapshot {
     pub cursor: SnapshotCursor,
     /// Input modes affecting interaction.
     pub modes: SnapshotModes,
+    /// Effective defaults and palette corresponding to the styled cells.
+    pub colors: SnapshotColors,
 }
 
 impl ScreenSnapshot {
@@ -170,6 +204,7 @@ impl ScreenSnapshot {
         screen: ScreenView<'_>,
         request: &SnapshotRequest,
         screen_revision: u64,
+        theme: &crate::config::ThemeConfig,
     ) -> Self {
         let (rows, columns): (u16, u16) = screen.size().into();
         let (row_start, row_end, column_start, column_end) =
@@ -193,8 +228,8 @@ impl ScreenSnapshot {
             let mut runs: Vec<SnapshotRun> = Vec::new();
             let mut graphics_placeholder = false;
             for column in 0..columns {
-                let Some(cell) = row.cell(usize::from(column)) else {
-                    break;
+                let Some(cell) = screen.cell(row_index, column) else {
+                    continue;
                 };
                 if cell.is_wide_continuation() {
                     continue;
@@ -270,6 +305,7 @@ impl ScreenSnapshot {
         let (cursor_row, cursor_column) = screen.display_cursor_position();
         Self {
             screen_revision,
+            colors: SnapshotColors::new(&screen, theme),
             columns,
             rows,
             content,

@@ -159,6 +159,17 @@ pub(crate) fn shutdown_terminal_runtime_on_exit(
     }
 }
 
+/// Applies configured defaults before child color queries are processed.
+pub(crate) fn sync_terminal_theme(
+    config: Res<AppConfig>,
+    mut runtime: ResMut<TerminalRuntime>,
+    mut redraw: ResMut<TerminalRedrawState>,
+) {
+    if config.is_changed() && runtime.set_theme(&config.theme) {
+        redraw.request();
+    }
+}
+
 /// Pumps PTY output into the terminal parser.
 ///
 /// This runs early in the update schedule, before `render_terminal_widget`. It drains PTY output
@@ -497,6 +508,7 @@ pub(crate) struct RenderWidgetParams<'w, 's> {
     terminal: ResMut<'w, TerminalSurface>,
     selection: Res<'w, TerminalSelection>,
     redraw: ResMut<'w, TerminalRedrawState>,
+    clear_color: ResMut<'w, ClearColor>,
     model_load_state: Res<'w, ModelLoadState>,
     frame_dirty: ResMut<'w, TerminalFrameDirty>,
     _marker: std::marker::PhantomData<&'s ()>,
@@ -514,6 +526,7 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
         terminal,
         selection,
         redraw,
+        clear_color,
         model_load_state,
         frame_dirty,
         _marker: _,
@@ -525,6 +538,8 @@ pub(crate) fn render_terminal_widget(mut params: RenderWidgetParams) {
     }
 
     let screen = runtime.screen();
+    terminal.sync_colors(screen, &app_config.theme);
+    clear_color.0 = terminal.render_config().theme.background;
     terminal.tui.draw(|frame| {
         frame.render_widget(
             TerminalWidget {

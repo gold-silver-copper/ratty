@@ -360,3 +360,11 @@ payloads. Further registrations are rejected; delete unused objects to make
 room. File-based RGP models have the same 32 MiB source-size limit as transfers.
 These are parser and registry budgets, not a cap on the GPU driver's allocations
 or on textures referenced by a glTF asset.
+
+Configured ANSI colors are supplied to the terminal engine for palette queries.
+OSC 4/104 palette overrides and OSC 10/11/12 foreground, background, and cursor
+colors affect existing content as well as subsequent output; resetting an
+application override restores the configured theme. Default-background opacity
+still comes from the window configuration. OSC 17/19 can override selection
+colors. MCP snapshots retain their `default` and `indexed:N` style names and
+include a `colors` table giving their effective RGB values.

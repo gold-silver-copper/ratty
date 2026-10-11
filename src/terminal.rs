@@ -21,6 +21,7 @@ use crate::config::{AppConfig, FontConfig, FontStyleConfig, ThemeConfig};
 use crate::mouse::TerminalSelection;
 use fux_vt::{Blink, CellRef, Color as VtColor};
 
+use crate::colors::ResolvedColors;
 use crate::screen::{KITTY_PLACEHOLDER, ScreenView};
 
 /// Terminal grid and presentation dimensions.
@@ -303,6 +304,20 @@ impl TerminalSurface {
         );
     }
 
+    /// Synchronizes the renderer's defaults with committed OSC colors and the
+    /// host theme, preserving the configured background opacity.
+    pub fn sync_colors(&mut self, screen: ScreenView<'_>, theme: &ThemeConfig) {
+        self.set_colors(&ResolvedColors::new(&screen, theme));
+    }
+
+    fn set_colors(&mut self, colors: &ResolvedColors) {
+        let color = |rgb: fux_vt::Rgb| Color::srgb_u8(rgb.r, rgb.g, rgb.b);
+        self.render_config.theme.foreground = color(colors.foreground);
+        self.set_background(crate::colors::channels(colors.background));
+        self.render_config.theme.ansi = std::array::from_fn(|i| color(colors.palette[i]));
+        self.render_config.cursor.color = color(colors.cursor);
+    }
+
     /// Updates the physical render scale; returns whether it changed.
     pub(crate) fn set_render_scale(&mut self, render_scale: f32) -> bool {
         let render_scale = render_scale.max(1.0);
@@ -539,9 +554,9 @@ pub struct TerminalWidget<'a> {
 
 impl Widget for TerminalWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let [fg_r, fg_g, fg_b] = self.theme.foreground;
-        let theme_fg = TuiColor::Rgb(fg_r, fg_g, fg_b);
-        let theme_palette = self.theme.palette().map(|[r, g, b]| TuiColor::Rgb(r, g, b));
+        let colors = ResolvedColors::new(&self.screen, self.theme);
+        let theme_fg = rgb_to_tui(colors.foreground);
+        let theme_palette = colors.palette.map(rgb_to_tui);
         buf.set_style(area, Style::default().fg(theme_fg));
 
         let selection = self.selection.bounds_in(self.screen);
@@ -574,7 +589,7 @@ impl Widget for TerminalWidget<'_> {
                         .unwrap_or(vt_cell);
                     let mut style = cell_style(owner, &theme_palette, theme_fg, self.font_style);
                     if selection.is_some_and(|bounds| bounds.contains(row, col)) {
-                        style = style.add_modifier(Modifier::REVERSED);
+                        style = selected_style(style, &colors);
                     }
                     cell.set_symbol(" ")
                         .set_style(style)
@@ -600,7 +615,7 @@ impl Widget for TerminalWidget<'_> {
                     bounds.contains(row, col)
                         || (is_wide && col + 1 < cols && bounds.contains(row, col + 1))
                 }) {
-                    style = style.add_modifier(Modifier::REVERSED);
+                    style = selected_style(style, &colors);
                 }
 
                 cell.set_symbol(if symbol.is_empty() { " " } else { symbol })
@@ -617,7 +632,7 @@ fn forced_width(width: u16) -> CellDiffOption {
 
 fn cell_style(
     cell: CellRef<'_>,
-    theme_palette: &[TuiColor; 16],
+    theme_palette: &[TuiColor; 256],
     theme_fg: TuiColor,
     font_style: FontStyleConfig,
 ) -> Style {
@@ -667,31 +682,31 @@ fn cell_style(
     style.add_modifier(modifiers)
 }
 
-fn cell_color_to_tui(color: VtColor, theme_palette: &[TuiColor; 16]) -> Option<TuiColor> {
+fn cell_color_to_tui(color: VtColor, theme_palette: &[TuiColor; 256]) -> Option<TuiColor> {
     match color {
         VtColor::Default => None,
-        VtColor::Idx(index) => Some(ansi_index_to_tui(index, theme_palette)),
+        VtColor::Idx(index) => Some(theme_palette[usize::from(index)]),
         VtColor::Rgb(fux_vt::Rgb { r, g, b }) => Some(TuiColor::Rgb(r, g, b)),
         _ => None,
     }
 }
 
-fn ansi_index_to_tui(index: u8, theme_palette: &[TuiColor; 16]) -> TuiColor {
-    match index {
-        0..=15 => theme_palette[index as usize],
-        16..=231 => {
-            let index = index - 16;
-            let r = index / 36;
-            let g = (index % 36) / 6;
-            let b = index % 6;
-            let component = |value: u8| if value == 0 { 0 } else { 55 + value * 40 };
-            TuiColor::Rgb(component(r), component(g), component(b))
-        }
-        232..=255 => {
-            let shade = 8 + (index - 232) * 10;
-            TuiColor::Rgb(shade, shade, shade)
-        }
+fn rgb_to_tui(fux_vt::Rgb { r, g, b }: fux_vt::Rgb) -> TuiColor {
+    TuiColor::Rgb(r, g, b)
+}
+
+fn selected_style(mut style: Style, colors: &ResolvedColors) -> Style {
+    if colors.selection_foreground.is_none() && colors.selection_background.is_none() {
+        return style.add_modifier(Modifier::REVERSED);
     }
+    style = style.remove_modifier(Modifier::REVERSED);
+    if let Some(fg) = colors.selection_foreground {
+        style = style.fg(rgb_to_tui(fg));
+    }
+    if let Some(bg) = colors.selection_background {
+        style = style.bg(rgb_to_tui(bg));
+    }
+    style
 }
 
 #[cfg(test)]
@@ -708,6 +723,42 @@ mod tests {
             Parser::new(fux_vt::Size::new(rows, cols).expect("valid size"), 1000).expect("parser");
         parser.process(input).expect("process");
         parser
+    }
+
+    #[test]
+    fn application_colors_repaint_existing_cells_and_renderer_defaults() {
+        let mut parser = Parser::with_options(
+            fux_vt::Size::new(2, 4).expect("size"),
+            0,
+            crate::runtime::PARSER_OPTIONS,
+        )
+        .expect("parser");
+        parser.process(b"\x1b[31mR\x1b[0mD").expect("text");
+        let before = render_buffer(ScreenView::new(parser.screen(), 0));
+        parser
+            .process(
+                b"\x1b]4;1;#010203\x07\x1b]10;#040506\x07\x1b]11;#070809\x07\x1b]12;#0a0b0c\x07",
+            )
+            .expect("colors");
+        let after = render_buffer(ScreenView::new(parser.screen(), 0));
+        assert_ne!(before[(0, 0)].fg, after[(0, 0)].fg);
+        assert_eq!(after[(0, 0)].fg, TuiColor::Rgb(1, 2, 3));
+        assert_eq!(after[(1, 0)].fg, TuiColor::Rgb(4, 5, 6));
+        let config = AppConfig::default();
+        let mut surface = TerminalSurface::new(&config).expect("surface");
+        surface.set_colors(&ResolvedColors::new(parser.screen(), &config.theme));
+        assert_eq!(
+            surface.render_config().theme.background.to_srgba().red,
+            7.0 / 255.0
+        );
+        assert_eq!(
+            surface.render_config().cursor.color,
+            Color::srgb_u8(10, 11, 12)
+        );
+        parser
+            .process(b"\x1b]104\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07")
+            .expect("reset");
+        assert_eq!(render_buffer(ScreenView::new(parser.screen(), 0)), before);
     }
 
     fn render_buffer(screen: ScreenView<'_>) -> Buffer {
@@ -1002,10 +1053,7 @@ mod tests {
         let theme = ThemeConfig::default();
         let [r, g, b] = theme.palette()[1];
         assert_eq!(rendered[0].fg, TuiColor::Rgb(r, g, b));
-        assert_eq!(
-            rendered[0].bg,
-            ansi_index_to_tui(99, &[TuiColor::Reset; 16])
-        );
+        assert_eq!(rendered[0].bg, TuiColor::Rgb(135, 95, 255));
         assert_eq!(rendered[1].fg, TuiColor::Rgb(1, 2, 3));
         let [fr, fg, fb] = theme.foreground;
         assert_eq!(rendered[2].fg, TuiColor::Rgb(fr, fg, fb));

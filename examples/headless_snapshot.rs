@@ -420,7 +420,7 @@ fn main() -> anyhow::Result<()> {
             .add_systems(Update, adopt_texture.after(TerminalSystems::Sync))
             .add_systems(
                 Update,
-                (sync_texture_font_config, pump_and_draw)
+                (pump_and_draw, sync_texture_font_config)
                     .chain()
                     .before(TerminalSystems::Sync),
             )
@@ -487,6 +487,7 @@ fn adopt_texture(
 
 fn sync_texture_font_config(
     faces: Res<ConfiguredFontFaces>,
+    terminal: Res<TerminalSurface>,
     mut font_cx: ResMut<FontCx>,
     mut configs: Query<&mut TerminalRenderConfig, With<Target>>,
 ) {
@@ -496,6 +497,13 @@ fn sync_texture_font_config(
     let resolved = faces.resolve(font_cx.bypass_change_detection());
     if config.font != resolved {
         config.font = resolved;
+    }
+    let desired = terminal.render_config();
+    if config.theme != desired.theme {
+        config.theme = desired.theme.clone();
+    }
+    if config.cursor != desired.cursor {
+        config.cursor = desired.cursor;
     }
 }
 
@@ -511,6 +519,7 @@ fn pump_and_draw(
     drain_pty_output(&mut runtime, &mut inline_objects, &mut camera_updates);
 
     let screen = runtime.screen();
+    terminal.sync_colors(screen, &app_config.theme);
     terminal.tui.draw(|frame| {
         frame.render_widget(
             TerminalWidget {

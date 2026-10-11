@@ -9,6 +9,7 @@
 
 pub mod camera;
 pub mod cli;
+mod colors;
 pub mod config;
 pub mod control;
 pub mod inline;
