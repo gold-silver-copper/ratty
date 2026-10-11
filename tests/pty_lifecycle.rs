@@ -117,6 +117,8 @@ fn child_is_a_session_leader_and_is_reaped_without_ui_polling() {
     // Do not read output or ask the runtime for exit status before the OS
     // reports the child gone: the independent supervisor must reap it.
     until(|| !fuxix::process::exists(pid));
+    // Reaping removes the PID before the supervisor publishes its result.
+    until(|| runtime.child_exit_code().is_some());
     assert_eq!(runtime.child_exit_code(), Some(23));
     runtime.shutdown();
 }

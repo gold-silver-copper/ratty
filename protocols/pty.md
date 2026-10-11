@@ -51,8 +51,11 @@ Shutdown does not recursively discover deliberately detached/disowned processes.
 The native reader polls for at most 20 ms at a time; output queue backpressure
 also checks cancellation. The input worker is the sole writer and uses the
 master's nonblocking writes. The portable reader/writer retain the OS backend's
-blocking I/O behavior on their worker threads; shutting down never joins an
-unfinished I/O worker on the UI thread.
+blocking I/O behavior on their worker threads. A prepared cleanup worker owns
+the final portable master/slave drop, because Windows `ClosePseudoConsole` can
+block. During Windows shutdown the reader discards output until EOF so console
+closure can finish draining. Shutting down never joins an unfinished I/O worker
+on the UI thread.
 
 ## Validation
 

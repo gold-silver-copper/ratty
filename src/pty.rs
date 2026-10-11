@@ -6,6 +6,11 @@ use std::path::Path;
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 mod native;
+#[cfg(any(
+    test,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+pub(crate) mod portable;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Dimensions {
@@ -22,7 +27,7 @@ pub(crate) enum Master {
         test,
         not(any(target_os = "linux", target_os = "android", target_os = "macos"))
     ))]
-    Portable(Box<dyn portable_pty::MasterPty + Send>),
+    Portable(portable::Master),
 }
 
 impl Master {
@@ -34,7 +39,7 @@ impl Master {
                 test,
                 not(any(target_os = "linux", target_os = "android", target_os = "macos"))
             ))]
-            Self::Portable(master) => master.resize(portable_pty::PtySize {
+            Self::Portable(master) => master.handle().resize(portable_pty::PtySize {
                 rows: size.rows,
                 cols: size.cols,
                 pixel_width: size.pixel_width,
@@ -120,6 +125,7 @@ pub(crate) fn spawn(
     {
         use anyhow::Context;
         let _ = launcher;
+        let closer = portable::Closer::prepare()?;
         let pair = portable_pty::native_pty_system().openpty(portable_pty::PtySize {
             rows: size.rows,
             cols: size.cols,
@@ -127,8 +133,9 @@ pub(crate) fn spawn(
             pixel_height: size.pixel_height,
         })?;
         // Do every fallible handle setup before creating the child.
-        let reader = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let mut master = closer.own(pair.master, Some(pair.slave));
+        let reader = master.handle().try_clone_reader()?;
+        let writer = master.handle().take_writer()?;
         let (program, args) = argv.split_first().context("empty PTY command")?;
         let mut command = portable_pty::CommandBuilder::new(program);
         command.args(args);
@@ -141,13 +148,77 @@ pub(crate) fn spawn(
         for (key, value) in env {
             command.env(key, value);
         }
-        let child = pair.slave.spawn_command(command)?;
-        drop(pair.slave);
+        let child = master.spawn(command)?;
         Ok(Opened {
-            master: Master::Portable(pair.master),
+            master: Master::Portable(master),
             reader,
             writer,
             child: Child::Portable(child),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct BlockingMaster {
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+    impl Drop for BlockingMaster {
+        fn drop(&mut self) {
+            self.entered.send(()).expect("entered");
+            self.release.recv().expect("release slow OS close");
+        }
+    }
+    impl portable_pty::MasterPty for BlockingMaster {
+        fn resize(&self, _: portable_pty::PtySize) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_size(&self) -> anyhow::Result<portable_pty::PtySize> {
+            Ok(Default::default())
+        }
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+            Ok(Box::new(io::empty()))
+        }
+        fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+            Ok(Box::new(io::sink()))
+        }
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<i32> {
+            None
+        }
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_slow_portable_master_close_never_blocks_the_callers_drop() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let master = Master::Portable(portable::Closer::prepare().expect("closer").own(
+            Box::new(BlockingMaster {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+            None,
+        ));
+        let caller = std::thread::spawn(move || {
+            drop(master);
+            done_tx.send(()).expect("done");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("OS close entered");
+        let caller_returned = done_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+        release_tx.send(()).expect("unblock cleanup");
+        caller.join().expect("caller");
+        assert!(caller_returned, "UI drop waited for the OS console close");
     }
 }

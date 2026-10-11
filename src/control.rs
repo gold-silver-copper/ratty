@@ -679,14 +679,14 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
     match command {
         ControlCommand::GetState {} => {
             let preset = slots.active();
-            let child_exit_code = runtime.child_exit_code();
+            let (child_state, child_exit_code) = runtime.child_status();
             let screen = runtime.screen();
             let (cursor_row, cursor_column) = screen.display_cursor_position();
             ControlResponse::data(serde_json::json!({
                 "connected": !runtime.pty_disconnected(),
                 "child": {
-                    "running": matches!(runtime.child_state(), "running" | "hung_up"),
-                    "state": runtime.child_state(),
+                    "running": matches!(child_state, "running" | "hung_up"),
+                    "state": child_state,
                     "exit_code": child_exit_code,
                 },
                 "columns": terminal.cols,

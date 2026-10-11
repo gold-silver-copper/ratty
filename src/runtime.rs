@@ -381,18 +381,31 @@ impl TerminalRuntime {
             .name("ratty-pty-output".into())
             .spawn(move || {
                 let mut buf = [0_u8; 16 * 1024];
-                while !cancelled.load(Ordering::Acquire) {
+                'reading: loop {
+                    if !cfg!(windows) && cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
                     match reader.read(&mut buf) {
                         Ok(0) => break,
                         Ok(size) => {
                             let mut chunk = buf[..size].to_vec();
                             loop {
                                 if cancelled.load(Ordering::Acquire) {
+                                    if cfg!(windows) {
+                                        // ClosePseudoConsole waits for its output to drain.
+                                        // Discard shutdown output without waiting for the UI.
+                                        continue 'reading;
+                                    }
                                     return;
                                 }
                                 match tx.try_send(chunk) {
                                     Ok(()) => break,
-                                    Err(TrySendError::Disconnected(_)) => return,
+                                    Err(TrySendError::Disconnected(_)) => {
+                                        if cfg!(windows) {
+                                            continue 'reading;
+                                        }
+                                        return;
+                                    }
                                     Err(TrySendError::Full(pending)) => {
                                         chunk = pending;
                                         thread::sleep(Duration::from_millis(10));
@@ -616,11 +629,15 @@ impl TerminalRuntime {
 
     /// Returns the independently supervised child lifecycle state.
     pub fn child_state(&self) -> &'static str {
+        self.child_status().0
+    }
+
+    pub(crate) fn child_status(&self) -> (&'static str, Option<u32>) {
         match self.process.phase() {
-            Phase::Running => "running",
-            Phase::HungUp => "hung_up",
-            Phase::Stopping => "stopping",
-            Phase::Exited(_) => "exited",
+            Phase::Running => ("running", None),
+            Phase::HungUp => ("hung_up", None),
+            Phase::Stopping => ("stopping", None),
+            Phase::Exited(code) => ("exited", Some(code)),
         }
     }
 
@@ -632,10 +649,7 @@ impl TerminalRuntime {
     /// Returns the exit code recorded by the child reaper. On supported Unix
     /// platforms, signal termination is represented as 128 + signal number.
     pub fn child_exit_code(&self) -> Option<u32> {
-        match self.process.phase() {
-            Phase::Exited(code) => Some(code),
-            _ => None,
-        }
+        self.child_status().1
     }
 
     /// Validates and applies the parser grid before notifying the child. A
@@ -1010,7 +1024,11 @@ mod resize_tests {
         TerminalRuntime {
             rx: SyncCell::new(rx),
             input: InputQueue::spawn(Box::new(io::sink())).expect("test writer"),
-            master: SyncCell::new(Some(Master::Portable(master))),
+            master: SyncCell::new(Some(Master::Portable(
+                pty::portable::Closer::prepare()
+                    .expect("closer")
+                    .own(master, None),
+            ))),
             process: Process::prepare().expect("test supervisor"),
             reader_stopped: Arc::new(AtomicBool::new(false)),
             reader_thread: None,
