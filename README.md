@@ -233,6 +233,56 @@ A blazingly fast serial monitor with plotter TUI and 3D telemetry
   <video width="80%" src="https://github.com/user-attachments/assets/29ba6751-65d7-4103-86b3-705ef47dbbfd"/>
 </div>
 
+## Agent Control
+
+Ratty includes an optional MCP server for controlling a running terminal from a compatible MCP
+client.
+
+e.g. for Codex, register it with the following commands:
+
+```bash
+codex mcp add ratty -- /usr/bin/ratty-mcp
+```
+
+And then you need to start Ratty with MCP enabled:
+
+```bash
+ratty --mcp
+```
+
+```text
+MCP client (e.g. Codex)
+        | starts ratty-mcp (MCP over stdin/stdout)
+        v
+   ratty-mcp
+        | authenticated local control socket
+        v
+ Ratty GUI (--mcp)
+        |
+        v
+  Running terminal
+```
+
+Here are the available capabilities:
+
+- `terminal_state`: inspect connection, grid, activity, camera and warp state
+- `observe`: read visible terminal content, styles, cursor and input modes
+- `type_text` / `press`: send text and mode-aware key presses
+- `set_terminal` / `set_window`: change grid, font, window size, position, title and background
+- `set_view` — change camera mode, pose and warp
+- `set_cursor`: configure the rat cursor's visibility and motion
+- `set_shape`: choose a built-in surface or define a custom lattice or mesh
+
+Try these example prompts:
+
+```text
+Use the Ratty terminal MCP to turn my terminal into a cyberpunk data storm. Use a static custom 4×4 lattice with alternating peaks and valleys, reaching about 350 units deep near the edges while keeping the center nearly flat. Set a near-black background, use perspective view, and adjust the camera until the center text remains readable while the edges look dramatically warped.
+```
+
+```text
+Use the Ratty terminal MCP to run a read-only project audit. Report the current Git branch and status; use GNU `find` and `wc` to count Rust source files, `grep` to find TODO/FIXME markers, and `du`, `sort`, and `head` to list the 10 largest paths, excluding `.git` and `target`. Then run `cargo fmt --check`, `cargo clippy --workspace`, and `cargo test --workspace` one at a time, waiting for each to finish. Summarize the results and relevant errors without changing files.
+```
+
 ## Architecture
 
 ### Rendering pipeline
@@ -252,15 +302,6 @@ Current workflow:
 
 The terminal image is fully GPU-resident: the only data crossing from the main
 world to the render world each frame is compact scene data, not pixels.
-
-### Workspace development
-
-The Cargo workspace contains the Ratty application. The widget remains a
-separate package under `widget/` with its own lockfile.
-
-```sh
-cargo test --workspace --locked     # Application tests and doctests
-```
 
 ## Touchscreen
 

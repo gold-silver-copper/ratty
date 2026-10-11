@@ -42,7 +42,8 @@ use crate::runtime::TerminalRuntime;
 use crate::scene::{
     MobiusTransition, ModelLoadState, TerminalPlane, TerminalPlaneBack,
     TerminalPlaneBackLayoutQuery, TerminalPlaneLayoutQuery, TerminalPlaneMeshes, TerminalPlaneWarp,
-    TerminalPresentationMode, TerminalViewport, sync_terminal_layout,
+    TerminalPresentationMode, TerminalSurfaceKind, TerminalSurfaceShape, TerminalViewport,
+    sync_terminal_layout,
 };
 use crate::terminal::{
     ConfiguredFontFaces, TerminalRedrawState, TerminalRenderTarget, TerminalSurface,
@@ -78,6 +79,7 @@ struct InlineLayout {
 
 struct KittyRenderContext<'a> {
     mode: TerminalPresentationMode,
+    surface_shape: TerminalSurfaceShape,
     mobius_progress: f32,
     warp_amount: f32,
     elapsed_secs: f32,
@@ -92,15 +94,18 @@ struct CursorPoseContext<'a, 'w, 's> {
     terminal: &'a TerminalSurface,
     viewport: &'a TerminalViewport,
     mode: TerminalPresentationMode,
-    plane_warp_amount: f32,
+    plane_warp: &'a TerminalPlaneWarp,
     mobius_progress: f32,
     elapsed_secs: f32,
     plane_query: &'a Query<'w, 's, &'static Transform, (With<TerminalPlane>, Without<CursorModel>)>,
 }
 
-/// Marker for objects that already had instance brightness applied.
+/// Original material plus the last live brightness applied to an instance.
 #[derive(Component)]
-pub struct BrightnessAdjusted;
+pub struct BrightnessAdjusted {
+    source: StandardMaterial,
+    brightness: f32,
+}
 
 type PlaneTransformQuery<'w, 's> =
     Query<'w, 's, &'static Transform, (With<TerminalPlane>, Without<TerminalRgpObject>)>;
@@ -227,6 +232,7 @@ pub fn drain_pty_output(
                     inline_objects.apply_scroll(scrolled);
                 }
                 inline_objects.refresh_placeholder_anchors(runtime.screen());
+                runtime.record_output_batch();
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
@@ -876,6 +882,7 @@ pub(crate) fn sync_inline_objects(mut params: SyncInlineParams) {
             InlineObject::KittyImage(object) => {
                 let mut ctx = KittyRenderContext {
                     mode: camera_slots.active().mode,
+                    surface_shape: plane_warp.shape.clone(),
                     mobius_progress: active_mobius_progress(
                         camera_slots.active().mode,
                         mobius_transition,
@@ -1025,6 +1032,7 @@ fn ensure_kitty_plane_assets(
         let mesh = build_kitty_plane_mesh(
             layout,
             ctx.mode,
+            &ctx.surface_shape,
             ctx.warp_amount,
             ctx.elapsed_secs,
             ctx.mobius_progress,
@@ -1046,6 +1054,7 @@ fn ensure_kitty_plane_assets(
             &mut mesh,
             layout,
             ctx.mode,
+            &ctx.surface_shape,
             ctx.warp_amount,
             ctx.elapsed_secs,
             ctx.mobius_progress,
@@ -1071,6 +1080,7 @@ fn kitty_plane_material(image_handle: &Handle<Image>) -> StandardMaterial {
 fn build_kitty_plane_mesh(
     layout: &InlineKittyPlaneLayout,
     mode: TerminalPresentationMode,
+    surface_shape: &TerminalSurfaceShape,
     warp_amount: f32,
     elapsed_secs: f32,
     mobius_progress: f32,
@@ -1116,6 +1126,7 @@ fn build_kitty_plane_mesh(
         &mut mesh,
         layout,
         mode,
+        surface_shape,
         warp_amount,
         elapsed_secs,
         mobius_progress,
@@ -1127,10 +1138,15 @@ fn write_kitty_plane_positions(
     mesh: &mut Mesh,
     layout: &InlineKittyPlaneLayout,
     mode: TerminalPresentationMode,
+    surface_shape: &TerminalSurfaceShape,
     warp_amount: f32,
     elapsed_secs: f32,
     mobius_progress: f32,
 ) {
+    let surface = TerminalPlaneWarp {
+        amount: warp_amount,
+        shape: surface_shape.clone(),
+    };
     let Some(VertexAttributeValues::Float32x3(positions)) =
         mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
     else {
@@ -1145,11 +1161,11 @@ fn write_kitty_plane_positions(
             let u = x as f32 / layout.x_segments as f32;
             let px = layout.local_x + (u - 0.5) * layout.local_width;
             if index < positions.len() {
-                let point = plane_surface_point(
+                let point = terminal_surface_point(
+                    &surface,
                     mode,
                     px,
                     py,
-                    warp_amount,
                     elapsed_secs,
                     1.5,
                     mobius_progress,
@@ -1177,9 +1193,14 @@ pub(crate) fn animate_inline_kitty_planes(
     let mode = camera_slots.active().mode;
     let mode_changed = previous_mode.as_ref() != Some(&mode);
     *previous_mode = Some(mode);
+    let animation_warp = if surface_shape_animates(&warp.shape) {
+        warp.amount.max(f32::EPSILON)
+    } else {
+        warp.amount
+    };
     if !should_animate_inline_kitty_planes(
         mode,
-        warp.amount,
+        animation_warp,
         warp.is_changed(),
         mode_changed,
         mobius_transition.active,
@@ -1198,6 +1219,7 @@ pub(crate) fn animate_inline_kitty_planes(
             &mut mesh,
             layout,
             mode,
+            &warp.shape,
             warp.amount,
             elapsed_secs,
             mobius_progress,
@@ -1474,11 +1496,11 @@ pub(crate) fn sync_rgp_objects(mut params: RgpSyncParams) {
                 *visibility = Visibility::Hidden;
                 continue;
             };
-            let local_position = plane_surface_point(
+            let local_position = terminal_surface_point(
+                plane_warp,
                 mode,
                 layout.local_x,
                 layout.local_y,
-                plane_warp.amount,
                 elapsed_secs,
                 8.0 + anchor.style.depth * 1.5,
                 mobius_progress,
@@ -1517,8 +1539,8 @@ pub(crate) struct BrightnessParams<'w, 's> {
             Entity,
             &'static mut MeshMaterial3d<StandardMaterial>,
             &'static ChildOf,
+            Option<&'static mut BrightnessAdjusted>,
         ),
-        Without<BrightnessAdjusted>,
     >,
     materials: ResMut<'w, Assets<StandardMaterial>>,
     commands: Commands<'w, 's>,
@@ -1531,8 +1553,8 @@ pub(crate) struct BrightnessParams<'w, 's> {
 /// [`TerminalRgpObject`] root or a [`CursorModel`] root and clones the referenced material with
 /// the effective brightness applied.
 ///
-/// Adjusted entities receive [`BrightnessAdjusted`] so the same material branch is not processed
-/// again every frame.
+/// Adjusted entities retain their unmodified source material in [`BrightnessAdjusted`], allowing
+/// MCP and RGP brightness changes to be reapplied without compounding the previous multiplier.
 pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
     let BrightnessParams {
         app_config,
@@ -1561,7 +1583,7 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
         .collect::<HashMap<_, _>>();
     let cursor_roots = cursor_roots.iter().collect::<Vec<_>>();
 
-    for (entity, mut material_handle, parent) in material_query.iter_mut() {
+    for (entity, mut material_handle, parent, adjusted_state) in material_query.iter_mut() {
         let mut current = parent.parent();
         let mut brightness = None;
 
@@ -1584,10 +1606,21 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
             continue;
         };
 
-        let Some(source_material) = materials.get(&material_handle.0).cloned() else {
+        if adjusted_state
+            .as_ref()
+            .is_some_and(|state| (state.brightness - brightness).abs() < f32::EPSILON)
+        {
+            continue;
+        }
+
+        let source_material = adjusted_state
+            .as_ref()
+            .map(|state| state.source.clone())
+            .or_else(|| materials.get(&material_handle.0).cloned());
+        let Some(source_material) = source_material else {
             continue;
         };
-        let mut adjusted = source_material;
+        let mut adjusted = source_material.clone();
         let linear = adjusted.base_color.to_linear();
         adjusted.base_color = Color::linear_rgba(
             linear.red * brightness,
@@ -1602,7 +1635,14 @@ pub(crate) fn apply_instance_brightness(mut params: BrightnessParams) {
             adjusted.emissive.alpha,
         );
         material_handle.0 = materials.add(adjusted);
-        commands.entity(entity).insert(BrightnessAdjusted);
+        if let Some(mut state) = adjusted_state {
+            state.brightness = brightness;
+        } else {
+            commands.entity(entity).insert(BrightnessAdjusted {
+                source: source_material,
+                brightness,
+            });
+        }
     }
 }
 
@@ -1734,7 +1774,13 @@ pub fn animate_terminal_plane_warp(
 
     let needs_update = should_animate_terminal_plane_warp(
         mode,
-        warp.amount,
+        if !warp.shape.custom_vertices.is_empty() {
+            0.0
+        } else if surface_shape_animates(&warp.shape) {
+            warp.amount.max(f32::EPSILON)
+        } else {
+            warp.amount
+        },
         camera_slots.is_changed() || warp.is_changed(),
         mobius_transition.active,
         mobius_transition.is_changed(),
@@ -1747,18 +1793,17 @@ pub fn animate_terminal_plane_warp(
     apply_plane_warp(
         meshes.get_mut(&plane_meshes.front),
         mode,
-        warp.amount,
+        &warp,
         time.elapsed_secs(),
         1.0,
         mobius_progress,
     );
-    // The back sheet is hidden in Mobius mode; skipping it avoids uploading a
-    // mesh nothing renders.
-    if !mode.is_mobius() {
+    // The back sheet is hidden for Möbius and custom mesh surfaces, so skip its upload.
+    if !mode.is_mobius() && warp.shape.custom_vertices.is_empty() {
         apply_plane_warp(
             meshes.get_mut(&plane_meshes.back),
             mode,
-            warp.amount,
+            &warp,
             time.elapsed_secs(),
             -1.0,
             mobius_progress,
@@ -1849,7 +1894,7 @@ fn active_mobius_progress(
 fn apply_plane_warp(
     mesh: Option<AssetMut<'_, Mesh>>,
     mode: TerminalPresentationMode,
-    warp_amount: f32,
+    warp: &TerminalPlaneWarp,
     elapsed_secs: f32,
     direction: f32,
     mobius_progress: f32,
@@ -1857,6 +1902,10 @@ fn apply_plane_warp(
     let Some(mut mesh) = mesh else {
         return;
     };
+    if !warp.shape.custom_vertices.is_empty() {
+        *mesh = custom_surface_mesh(&warp.shape);
+        return;
+    }
     let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0) else {
         return;
     };
@@ -1870,12 +1919,41 @@ fn apply_plane_warp(
     for (position, uv) in positions.iter_mut().zip(uvs.iter()) {
         let x = uv[0] - 0.5;
         let y = 0.5 - uv[1];
-        let point =
-            plane_surface_point(mode, x, y, warp_amount, elapsed_secs, 0.0, mobius_progress);
+        let point = terminal_surface_point(warp, mode, x, y, elapsed_secs, 0.0, mobius_progress);
         position[0] = point.x;
         position[1] = point.y;
         position[2] = oriented_plane_depth(mode, point.z, direction);
     }
+}
+
+fn custom_surface_mesh(shape: &TerminalSurfaceShape) -> Mesh {
+    let positions = shape
+        .custom_vertices
+        .iter()
+        .map(|vertex| {
+            [
+                vertex.position.x,
+                vertex.position.y,
+                vertex.position.z * shape.amplitude,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let uvs = shape
+        .custom_vertices
+        .iter()
+        .map(|vertex| vertex.uv.to_array())
+        .collect::<Vec<_>>();
+    let normals = vec![[0.0, 0.0, 1.0]; positions.len()];
+    let indices = shape
+        .custom_triangles
+        .iter()
+        .flat_map(|triangle| triangle.iter().copied())
+        .collect::<Vec<_>>();
+    Mesh::new(PrimitiveTopology::TriangleList, Default::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+        .with_inserted_indices(Indices::U32(indices))
 }
 
 fn oriented_plane_depth(mode: TerminalPresentationMode, depth: f32, direction: f32) -> f32 {
@@ -1932,7 +2010,7 @@ pub(crate) fn sync_asset_to_terminal_cursor(mut params: CursorSyncParams) {
         terminal,
         viewport,
         mode: camera_slots.active().mode,
-        plane_warp_amount: plane_warp.amount,
+        plane_warp,
         mobius_progress: active_mobius_progress(camera_slots.active().mode, mobius_transition),
         elapsed_secs: time.elapsed_secs(),
         plane_query,
@@ -1990,11 +2068,11 @@ fn cursor_pose(
         };
         let plane_local_x = cursor_x / cols - 0.5;
         let plane_local_y = 0.5 - (cursor_row + 0.5) / rows + plane_bob;
-        let local_position = plane_surface_point(
+        let local_position = terminal_surface_point(
+            ctx.plane_warp,
             ctx.mode,
             plane_local_x,
             plane_local_y,
-            ctx.plane_warp_amount,
             ctx.elapsed_secs,
             app_config.cursor.model.plane_offset,
             ctx.mobius_progress,
@@ -2050,6 +2128,214 @@ fn plane_surface_point(
     }
 }
 
+fn terminal_surface_point(
+    warp: &TerminalPlaneWarp,
+    mode: TerminalPresentationMode,
+    local_x: f32,
+    local_y: f32,
+    elapsed_secs: f32,
+    depth_offset: f32,
+    mobius_progress: f32,
+) -> Vec3 {
+    let shape = &warp.shape;
+    match shape.kind {
+        TerminalSurfaceKind::ModeDefault => plane_surface_point(
+            mode,
+            local_x,
+            local_y,
+            warp.amount,
+            elapsed_secs,
+            depth_offset,
+            mobius_progress,
+        ),
+        TerminalSurfaceKind::Plane => plane_surface_point(
+            TerminalPresentationMode::Plane3d,
+            local_x,
+            local_y,
+            warp.amount * shape.amplitude,
+            elapsed_secs,
+            depth_offset,
+            0.0,
+        ),
+        TerminalSurfaceKind::Mobius => mobius_surface_point(
+            local_x,
+            local_y,
+            warp.amount * shape.amplitude,
+            elapsed_secs,
+            depth_offset,
+        ),
+        TerminalSurfaceKind::PaperPlane => {
+            paper_plane_surface_point(shape, local_x, local_y, depth_offset)
+        }
+        TerminalSurfaceKind::Gomboc => {
+            let longitude = local_x * std::f32::consts::TAU;
+            let latitude = local_y * std::f32::consts::PI;
+            let asymmetry = 1.0 + 0.22 * latitude.sin() - 0.12 * (2.0 * latitude).sin();
+            let radial = latitude.cos() * asymmetry * shape.amplitude.max(0.01);
+            Vec3::new(
+                longitude.sin() * radial * 0.48,
+                latitude.sin() * 0.52 * shape.amplitude,
+                depth_offset + longitude.cos() * radial * 320.0,
+            )
+        }
+        TerminalSurfaceKind::Cylinder => {
+            let angle = local_x * std::f32::consts::PI * shape.twist;
+            let radius = 0.5 / shape.twist.abs().max(0.05);
+            Vec3::new(
+                angle.sin() * radius,
+                local_y,
+                depth_offset + (1.0 - angle.cos()) * 320.0 * shape.amplitude,
+            )
+        }
+        TerminalSurfaceKind::Sphere => {
+            let longitude = local_x * std::f32::consts::TAU * shape.twist;
+            let latitude = local_y * std::f32::consts::PI;
+            let radial = latitude.cos() * 0.5 * shape.amplitude;
+            Vec3::new(
+                longitude.sin() * radial,
+                latitude.sin() * 0.5 * shape.amplitude,
+                depth_offset + longitude.cos() * radial * 320.0,
+            )
+        }
+        TerminalSurfaceKind::Wave => {
+            wave_surface_point(shape, local_x, local_y, elapsed_secs, depth_offset)
+        }
+        TerminalSurfaceKind::Custom if !shape.custom_vertices.is_empty() => {
+            custom_mesh_surface_point(shape, local_x, local_y, depth_offset)
+        }
+        TerminalSurfaceKind::Custom => {
+            custom_surface_point(shape, local_x, local_y, elapsed_secs, depth_offset)
+        }
+    }
+}
+
+fn surface_shape_animates(shape: &TerminalSurfaceShape) -> bool {
+    shape.twist != 0.0
+        && match shape.kind {
+            TerminalSurfaceKind::Wave => true,
+            TerminalSurfaceKind::Custom => {
+                shape.custom_vertices.is_empty() && shape.amplitude > 0.0
+            }
+            _ => false,
+        }
+}
+
+fn paper_plane_surface_point(
+    shape: &TerminalSurfaceShape,
+    local_x: f32,
+    local_y: f32,
+    depth_offset: f32,
+) -> Vec3 {
+    // Keep the silhouette and folds piecewise linear so the surface reads as
+    // folded paper rather than a rounded, fabric-like wave.
+    let along = (0.5 - local_y).clamp(0.0, 1.0);
+    // A paper plane tapers to its nose and stays broad at the trailing edge.
+    let span = along;
+    let across = local_x.abs() * 2.0;
+    let fold_height = if across < 0.12 {
+        28.0 - (across / 0.12) * 23.0
+    } else if across < 0.2 {
+        5.0 - ((across - 0.12) / 0.08) * 16.0
+    } else if across < 0.55 {
+        -11.0 + ((across - 0.2) / 0.35) * 15.0
+    } else {
+        4.0 + ((across - 0.55) / 0.45) * 4.0
+    };
+    let depth = fold_height * shape.amplitude * shape.twist.abs().clamp(0.05, 2.0);
+
+    Vec3::new(local_x * span, local_y, depth_offset + depth)
+}
+
+fn wave_surface_point(
+    shape: &TerminalSurfaceShape,
+    local_x: f32,
+    local_y: f32,
+    elapsed_secs: f32,
+    depth_offset: f32,
+) -> Vec3 {
+    let phase =
+        (local_x + 0.5) * std::f32::consts::TAU * shape.frequency + elapsed_secs * shape.twist;
+    let depth = phase.sin()
+        * (local_y * std::f32::consts::PI * shape.frequency).cos()
+        * 120.0
+        * shape.amplitude;
+    Vec3::new(local_x, local_y, depth + depth_offset)
+}
+
+fn custom_surface_point(
+    shape: &TerminalSurfaceShape,
+    local_x: f32,
+    local_y: f32,
+    elapsed_secs: f32,
+    depth_offset: f32,
+) -> Vec3 {
+    let columns = usize::from(shape.control_columns);
+    let rows = usize::from(shape.control_rows);
+    if columns < 2 || rows < 2 || shape.control_points.len() != columns * rows {
+        return Vec3::new(local_x, local_y, depth_offset);
+    }
+    let gx = ((local_x + 0.5).clamp(0.0, 1.0) * (columns - 1) as f32).min((columns - 1) as f32);
+    let gy = ((0.5 - local_y).clamp(0.0, 1.0) * (rows - 1) as f32).min((rows - 1) as f32);
+    let x0 = gx.floor() as usize;
+    let y0 = gy.floor() as usize;
+    let x1 = (x0 + 1).min(columns - 1);
+    let y1 = (y0 + 1).min(rows - 1);
+    let top = shape.control_points[y0 * columns + x0]
+        .lerp(shape.control_points[y0 * columns + x1], gx - x0 as f32);
+    let bottom = shape.control_points[y1 * columns + x0]
+        .lerp(shape.control_points[y1 * columns + x1], gx - x0 as f32);
+    let mut point = top.lerp(bottom, gy - y0 as f32);
+    point.z = point.z * shape.amplitude + depth_offset;
+    if shape.twist != 0.0 {
+        let (min_z, max_z) = shape.control_points.iter().fold(
+            (f32::INFINITY, f32::NEG_INFINITY),
+            |(min_z, max_z), control| (min_z.min(control.z), max_z.max(control.z)),
+        );
+        let ripple_depth = (max_z - min_z) * shape.amplitude * 0.12;
+        let phase =
+            (local_x + 0.5) * std::f32::consts::TAU * shape.frequency + elapsed_secs * shape.twist;
+        point.z +=
+            phase.sin() * (local_y * std::f32::consts::PI * shape.frequency).cos() * ripple_depth;
+    }
+    point
+}
+
+fn custom_mesh_surface_point(
+    shape: &TerminalSurfaceShape,
+    local_x: f32,
+    local_y: f32,
+    depth_offset: f32,
+) -> Vec3 {
+    let uv = Vec2::new(local_x + 0.5, 0.5 - local_y);
+    for &[a, b, c] in &shape.custom_triangles {
+        let a = shape.custom_vertices[a as usize];
+        let b = shape.custom_vertices[b as usize];
+        let c = shape.custom_vertices[c as usize];
+        let Some((wa, wb, wc)) = barycentric_weights(uv, a.uv, b.uv, c.uv) else {
+            continue;
+        };
+        if wa >= -1e-5 && wb >= -1e-5 && wc >= -1e-5 {
+            let mut point = a.position * wa + b.position * wb + c.position * wc;
+            point.z = point.z * shape.amplitude + depth_offset;
+            return point;
+        }
+    }
+    Vec3::new(local_x, local_y, depth_offset)
+}
+
+fn barycentric_weights(point: Vec2, a: Vec2, b: Vec2, c: Vec2) -> Option<(f32, f32, f32)> {
+    let ab = b - a;
+    let ac = c - a;
+    let ap = point - a;
+    let denominator = ab.perp_dot(ac);
+    if denominator.abs() < 1e-8 {
+        return None;
+    }
+    let wb = ap.perp_dot(ac) / denominator;
+    let wc = ab.perp_dot(ap) / denominator;
+    Some((1.0 - wb - wc, wb, wc))
+}
+
 fn mobius_surface_point(
     local_x: f32,
     local_y: f32,
@@ -2077,6 +2363,49 @@ fn mobius_surface_point(
 mod tests {
     use super::*;
     use crate::scene::MobiusEnterZoomFloor;
+
+    #[test]
+    fn custom_surface_ripples_with_twist_and_can_be_stopped() {
+        let mut shape = TerminalSurfaceShape {
+            kind: TerminalSurfaceKind::Custom,
+            control_columns: 2,
+            control_rows: 2,
+            control_points: vec![
+                Vec3::new(-0.5, 0.5, 350.0),
+                Vec3::new(0.5, 0.5, -350.0),
+                Vec3::new(-0.5, -0.5, -350.0),
+                Vec3::new(0.5, -0.5, 350.0),
+            ],
+            ..default()
+        };
+        let first = custom_surface_point(&shape, 0.1, 0.1, 0.0, 0.0);
+        let moving = custom_surface_point(&shape, 0.1, 0.1, 1.0, 0.0);
+        assert!((first.z - moving.z).abs() > 1.0);
+        assert!(surface_shape_animates(&shape));
+
+        shape.twist = 0.0;
+        let stopped = custom_surface_point(&shape, 0.1, 0.1, 1.0, 0.0);
+        assert!((first.z - stopped.z).abs() > 1.0);
+        assert!(!surface_shape_animates(&shape));
+    }
+
+    #[test]
+    fn paper_plane_keeps_broad_wings_and_forms_a_nose_and_tail() {
+        let shape = TerminalSurfaceShape {
+            kind: TerminalSurfaceKind::PaperPlane,
+            ..default()
+        };
+        let nose = paper_plane_surface_point(&shape, 0.5, 0.5, 0.0);
+        let wing = paper_plane_surface_point(&shape, 0.5, -0.08, 0.0);
+        let tail = paper_plane_surface_point(&shape, 0.5, -0.5, 0.0);
+        let spine = paper_plane_surface_point(&shape, 0.0, -0.08, 0.0);
+        let crease = paper_plane_surface_point(&shape, 0.1, -0.08, 0.0);
+        assert!(nose.x.abs() < 0.01);
+        assert_eq!(nose.y, 0.5);
+        assert!(tail.x.abs() > wing.x.abs());
+        assert!(spine.z - crease.z > 12.0);
+        assert!(wing.z - crease.z > 4.0);
+    }
 
     #[derive(Resource, Default)]
     struct CameraChangedProbe(bool);
@@ -2304,8 +2633,14 @@ mod tests {
             x_segments: 2,
             y_segments: 2,
         };
-        let mesh =
-            build_kitty_plane_mesh(&layout, TerminalPresentationMode::Mobius3d, 0.0, 0.0, 0.0);
+        let mesh = build_kitty_plane_mesh(
+            &layout,
+            TerminalPresentationMode::Mobius3d,
+            &TerminalSurfaceShape::default(),
+            0.0,
+            0.0,
+            0.0,
+        );
 
         let mut slots = TerminalCameraSlots::default();
         slots.active_mut().mode = TerminalPresentationMode::Mobius3d;
@@ -2376,8 +2711,14 @@ mod tests {
             x_segments: 2,
             y_segments: 2,
         };
-        let mesh =
-            build_kitty_plane_mesh(&layout, TerminalPresentationMode::Mobius3d, 0.0, 0.0, 1.0);
+        let mesh = build_kitty_plane_mesh(
+            &layout,
+            TerminalPresentationMode::Mobius3d,
+            &TerminalSurfaceShape::default(),
+            0.0,
+            0.0,
+            1.0,
+        );
         let Some(VertexAttributeValues::Float32x3(positions)) =
             mesh.attribute(Mesh::ATTRIBUTE_POSITION)
         else {
