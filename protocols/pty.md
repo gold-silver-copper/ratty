@@ -53,9 +53,11 @@ also checks cancellation. The input worker is the sole writer and uses the
 master's nonblocking writes. The portable reader/writer retain the OS backend's
 blocking I/O behavior on their worker threads. A prepared cleanup worker owns
 the final portable master/slave drop, because Windows `ClosePseudoConsole` can
-block. During Windows shutdown the reader discards output until EOF so console
-closure can finish draining. Shutting down never joins an unfinished I/O worker
-on the UI thread.
+block. During Windows and macOS shutdown the reader discards output until EOF:
+ConPTY closure and macOS slave closure can wait for the output to drain before
+the child finishes exiting. On macOS the reader also stops once the owned child
+is reaped, so a detached process holding the slave cannot keep it alive.
+Shutting down never joins an unfinished I/O worker on the UI thread.
 
 ## Validation
 
@@ -65,6 +67,8 @@ resize signals, natural exit and reaping, inherited descriptor closure, launch
 failure cleanup, hangup while the child is alive, full output queues and input
 backpressure. A kernel readback test covers all four resize dimensions. Native
 lifecycle tests also run on macOS, with Linux `/proc` checks gated separately.
+The macOS hangup fixture revokes its own PTY while the child ignores SIGHUP;
+closing standard streams alone leaves the session's controlling terminal alive.
 Windows tests exercise real ConPTY input, exit status and bounded shutdown.
 CI runs the workspace tests on Linux, macOS and Windows in addition to its
 existing platform compilation matrix.

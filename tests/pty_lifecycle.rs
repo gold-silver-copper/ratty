@@ -143,9 +143,39 @@ fn terminal_interrupt_reaches_the_foreground_job() {
 
 #[test]
 fn hangup_does_not_claim_that_a_still_running_child_exited() {
-    // Replace the shell as well: shell implementations may retain saved
-    // terminal descriptors while waiting for an external command.
+    // On Linux, closing the last slave descriptor hangs up the master.
+    #[cfg(not(target_os = "macos"))]
     let mut runtime = spawn("exec sleep 30 </dev/null >/dev/null 2>&1");
+    // macOS retains the controlling terminal while its session leader lives.
+    // Revoke this test's terminal to produce a real hangup without exiting
+    // the child. Ignoring HUP survives exec into sleep.
+    #[cfg(target_os = "macos")]
+    let mut runtime = {
+        let mut runtime = spawn("trap '' HUP; tty; exec sleep 30");
+        let mut output = Vec::new();
+        until(|| {
+            if let Ok(bytes) = runtime.try_recv() {
+                output.extend(bytes);
+            }
+            output.contains(&b'\n')
+        });
+        let name = String::from_utf8(output).expect("terminal path");
+        let name = name.trim();
+        assert!(name.starts_with("/dev/ttys"), "unexpected terminal: {name}");
+        let name = std::ffi::CString::new(name).expect("terminal path has no NUL");
+        unsafe extern "C" {
+            fn revoke(path: *const std::ffi::c_char) -> std::ffi::c_int;
+        }
+        // SAFETY: revoke reads a NUL-terminated pathname. The CString remains
+        // alive for the call; the path identifies only this fixture's PTY.
+        assert_eq!(
+            unsafe { revoke(name.as_ptr()) },
+            0,
+            "revoke test PTY: {}",
+            std::io::Error::last_os_error()
+        );
+        runtime
+    };
     until(|| matches!(runtime.try_recv(), Err(TryRecvError::Disconnected)));
     assert!(runtime.pty_disconnected());
     assert_eq!(runtime.child_state(), "hung_up");

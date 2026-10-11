@@ -376,13 +376,17 @@ impl TerminalRuntime {
         let input = InputQueue::spawn(writer).context("failed to spawn PTY input worker")?;
         let reader_stopped = Arc::new(AtomicBool::new(false));
         let cancelled = reader_stopped.clone();
+        let child_exited = process.exit_observer();
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
         let reader_thread = thread::Builder::new()
             .name("ratty-pty-output".into())
             .spawn(move || {
                 let mut buf = [0_u8; 16 * 1024];
                 'reading: loop {
-                    if !cfg!(windows) && cancelled.load(Ordering::Acquire) {
+                    if cancelled.load(Ordering::Acquire)
+                        && (!cfg!(any(windows, target_os = "macos"))
+                            || (cfg!(target_os = "macos") && child_exited()))
+                    {
                         break;
                     }
                     match reader.read(&mut buf) {
@@ -391,8 +395,9 @@ impl TerminalRuntime {
                             let mut chunk = buf[..size].to_vec();
                             loop {
                                 if cancelled.load(Ordering::Acquire) {
-                                    if cfg!(windows) {
-                                        // ClosePseudoConsole waits for its output to drain.
+                                    if cfg!(any(windows, target_os = "macos")) {
+                                        // ConPTY closure and macOS's slave close can
+                                        // wait for output to drain before child exit.
                                         // Discard shutdown output without waiting for the UI.
                                         continue 'reading;
                                     }
@@ -401,7 +406,7 @@ impl TerminalRuntime {
                                 match tx.try_send(chunk) {
                                     Ok(()) => break,
                                     Err(TrySendError::Disconnected(_)) => {
-                                        if cfg!(windows) {
+                                        if cfg!(any(windows, target_os = "macos")) {
                                             continue 'reading;
                                         }
                                         return;

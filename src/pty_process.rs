@@ -88,6 +88,16 @@ impl Process {
         *self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    pub(crate) fn exit_observer(&self) -> impl Fn() -> bool + Send + 'static {
+        let state = self.state.clone();
+        move || {
+            matches!(
+                *state.lock().unwrap_or_else(|e| e.into_inner()),
+                Phase::Exited(_)
+            )
+        }
+    }
+
     pub(crate) fn id(&self) -> Option<u32> {
         self.pid
     }
