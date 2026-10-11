@@ -95,6 +95,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - name: Run workspace tests and doctests
         run: cargo test --workspace --locked
 

@@ -20,6 +20,7 @@ fn spawn(script: &str) -> TerminalRuntime {
     .expect("spawn PTY")
 }
 
+#[track_caller]
 fn until(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !predicate() {
@@ -28,6 +29,7 @@ fn until(mut predicate: impl FnMut() -> bool) {
     }
 }
 
+#[track_caller]
 fn assert_reaped(runtime: &TerminalRuntime) {
     let pid = fuxix::process::Pid::from_raw(runtime.child_process_id().expect("PID") as i32)
         .expect("positive PID");
@@ -141,7 +143,9 @@ fn terminal_interrupt_reaches_the_foreground_job() {
 
 #[test]
 fn hangup_does_not_claim_that_a_still_running_child_exited() {
-    let mut runtime = spawn("exec 0<&- 1>&- 2>&-; sleep 30");
+    // Replace the shell as well: shell implementations may retain saved
+    // terminal descriptors while waiting for an external command.
+    let mut runtime = spawn("exec sleep 30 </dev/null >/dev/null 2>&1");
     until(|| matches!(runtime.try_recv(), Err(TryRecvError::Disconnected)));
     assert!(runtime.pty_disconnected());
     assert_eq!(runtime.child_state(), "hung_up");
@@ -155,10 +159,14 @@ fn hangup_does_not_claim_that_a_still_running_child_exited() {
 #[test]
 fn saturated_input_queue_and_full_output_channel_do_not_block_shutdown() {
     for script in [
-        "stty raw -echo; printf ready; sleep 30",
-        "stty raw -echo; printf ready; while :; do printf '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'; done",
+        "stty raw -echo; printf 'ready\\n'; exec sleep 30",
+        "stty raw -echo; printf 'ready\\n'; while :; do printf '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'; done",
     ] {
         let mut runtime = spawn(script);
+        eprintln!(
+            "backpressure fixture: {script}; pid={:?}",
+            runtime.child_process_id()
+        );
         let mut output = Vec::new();
         until(|| {
             if let Ok(bytes) = runtime.try_recv() {
@@ -190,6 +198,12 @@ fn saturated_input_queue_and_full_output_channel_do_not_block_shutdown() {
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "shutdown blocked on PTY I/O"
+        );
+        eprintln!(
+            "after shutdown: state={}, exit={:?}, input_error={:?}",
+            runtime.child_state(),
+            runtime.child_exit_code(),
+            runtime.input_error()
         );
         assert_reaped(&runtime);
     }
