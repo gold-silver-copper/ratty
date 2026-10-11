@@ -3,15 +3,18 @@
 use std::collections::HashSet;
 use std::env;
 use std::io::{self, ErrorKind, Read};
-use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::pty::{self, Dimensions, Master};
+use crate::pty_process::{Phase, Process};
 use anyhow::Context;
 use bevy::platform::cell::SyncCell;
 use bevy::prelude::Resource;
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::colors::HostColors;
 use crate::config::{AppConfig, ThemeConfig};
@@ -19,6 +22,19 @@ use crate::pty_input::InputQueue;
 use fux_vt::{Feature, Identity, Options, Parser, Sink, Size, Unhandled};
 
 use crate::screen::ScreenView;
+
+/// Handles fuxix's private PTY launch entry point, exiting after launch failure.
+/// Call this as the first action in an executable that spawns a terminal runtime,
+/// before CLI parsing, logging, or starting threads. On other platforms it is a no-op.
+pub fn run_pty_launcher() {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        let args: Vec<_> = env::args_os().skip(1).collect();
+        if args.first().is_some_and(|arg| arg == fuxix::pty::LAUNCH) {
+            std::process::exit(i32::from(fuxix::pty::launched(&args[1..])));
+        }
+    }
+}
 
 /// Command-line runtime overrides.
 #[derive(Debug, Clone, Default)]
@@ -178,9 +194,10 @@ pub struct TerminalRuntime {
     /// The sole ordered input path; only its worker touches the PTY writer.
     input: InputQueue,
     /// PTY master handle.
-    master: SyncCell<Option<Box<dyn MasterPty + Send>>>,
-    /// Child process handle.
-    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    master: SyncCell<Option<Master>>,
+    /// Child lifecycle and dedicated reaper.
+    process: Process,
+    reader_stopped: Arc<AtomicBool>,
     /// PTY reader thread.
     reader_thread: Option<JoinHandle<()>>,
     /// Terminal parser: the VT state machine plus the screen it drives.
@@ -190,14 +207,12 @@ pub struct TerminalRuntime {
     /// How many rows the view is scrolled back into history.
     scrollback: usize,
     /// Indicates PTY shutdown.
-    pub pty_disconnected: bool,
+    pty_disconnected: bool,
     output_sequence: u64,
     human_input_sequence: u64,
     agent_input_sequence: u64,
     screen_revision: u64,
     last_output_at: Option<Instant>,
-    child_exit_code: Option<u32>,
-    shutdown_started: bool,
     /// Last dimensions successfully applied to the PTY.
     last_pty_size: PtyDimensions,
     /// Desired dimensions retained until both the PTY and parser accept them.
@@ -297,26 +312,34 @@ impl TerminalRuntime {
     ///
     /// Returns an error if the PTY cannot be created or the shell cannot be spawned.
     pub fn spawn(config: &AppConfig, options: &RuntimeOptions) -> anyhow::Result<Self> {
+        Self::spawn_with_launcher(config, options, &env::current_exe()?)
+    }
+
+    /// Spawns using an executable that calls [`run_pty_launcher`] before parsing
+    /// its arguments. Useful to embedders and integration-test harnesses whose
+    /// current executable does not implement the launch entry point.
+    ///
+    /// # Errors
+    /// Returns an error if validation, PTY creation, launching, or worker setup fails.
+    pub fn spawn_with_launcher(
+        config: &AppConfig,
+        options: &RuntimeOptions,
+        launcher: &Path,
+    ) -> anyhow::Result<Self> {
         let cols = config.terminal.default_cols;
         let rows = config.terminal.default_rows;
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("failed to create PTY pair")?;
-
-        let mut cmd = if let Some(command) = &options.command {
-            let mut command = command.iter();
-            let program = command
-                .next()
-                .context("command override must contain at least one argument")?;
-            let mut cmd = CommandBuilder::new(program);
-            cmd.args(command);
-            cmd
+        let dimensions = PtyDimensions::new(cols, rows, 0, 0)?;
+        let mut parser =
+            Parser::with_options(dimensions.grid, config.terminal.scrollback, PARSER_OPTIONS)
+                .context("failed to create the terminal screen")?;
+        let host_colors = HostColors::from(&config.theme);
+        parser.set_host_palette(host_colors.palette.map(Some));
+        let argv = if let Some(command) = &options.command {
+            anyhow::ensure!(
+                !command.is_empty(),
+                "command override must contain at least one argument"
+            );
+            command.clone()
         } else {
             let shell = config
                 .shell
@@ -325,67 +348,78 @@ impl TerminalRuntime {
                 .map(|path| path.to_string_lossy().into_owned())
                 .or_else(|| env::var("SHELL").ok())
                 .unwrap_or_else(default_shell);
-            let mut cmd = CommandBuilder::new(shell);
-            cmd.args(&config.shell.args);
-            cmd
+            std::iter::once(shell)
+                .chain(config.shell.args.iter().cloned())
+                .collect()
         };
-
-        if let Some(working_dir) = &options.working_dir {
-            cmd.cwd(working_dir);
-        }
-        if !config.env.contains_key("TERM") {
-            cmd.env("TERM", "xterm-256color");
-        }
-        for (key, value) in &config.env {
-            cmd.env(key, value);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .context("failed to spawn shell")?;
-        drop(pair.slave);
-
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .context("failed to clone PTY reader")?;
-        let writer = pair
-            .master
-            .take_writer()
-            .context("failed to create PTY writer")?;
-
+        let mut process = Process::prepare().context("failed to start child supervisor")?;
+        let pty::Opened {
+            master,
+            mut reader,
+            writer,
+            child,
+        } = pty::spawn(
+            Dimensions {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            &argv,
+            &config.env,
+            options.working_dir.as_deref(),
+            launcher,
+        )?;
+        process.adopt(child);
+        // From here, every setup failure drops the supervisor, which signals
+        // and reaps its child without blocking the caller.
+        let input = InputQueue::spawn(writer).context("failed to spawn PTY input worker")?;
+        let reader_stopped = Arc::new(AtomicBool::new(false));
+        let cancelled = reader_stopped.clone();
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(16);
-        let reader_thread = thread::spawn(move || {
-            let mut buf = [0_u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(size) => {
-                        if tx.send(buf[..size].to_vec()).is_err() {
-                            break;
+        let reader_thread = thread::Builder::new()
+            .name("ratty-pty-output".into())
+            .spawn(move || {
+                let mut buf = [0_u8; 16 * 1024];
+                while !cancelled.load(Ordering::Acquire) {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(size) => {
+                            let mut chunk = buf[..size].to_vec();
+                            loop {
+                                if cancelled.load(Ordering::Acquire) {
+                                    return;
+                                }
+                                match tx.try_send(chunk) {
+                                    Ok(()) => break,
+                                    Err(TrySendError::Disconnected(_)) => return,
+                                    Err(TrySendError::Full(pending)) => {
+                                        chunk = pending;
+                                        thread::sleep(Duration::from_millis(10));
+                                    }
+                                }
+                            }
                         }
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                ErrorKind::Interrupted | ErrorKind::WouldBlock
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => break,
                     }
-                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                    Err(_) => break,
                 }
-            }
-        });
-
-        let mut parser = Parser::with_options(
-            Size::new(rows.max(1), cols.max(1))?,
-            config.terminal.scrollback,
-            PARSER_OPTIONS,
-        )
-        .context("failed to create the terminal screen")?;
-        let host_colors = HostColors::from(&config.theme);
-        parser.set_host_palette(host_colors.palette.map(Some));
+            })
+            .context("failed to spawn PTY output worker")?;
 
         Ok(Self {
             rx: SyncCell::new(rx),
-            input: InputQueue::spawn(writer).context("failed to spawn PTY input worker")?,
-            master: SyncCell::new(Some(pair.master)),
-            child: Some(child),
+            input,
+            master: SyncCell::new(Some(master)),
+            process,
+            reader_stopped,
             reader_thread: Some(reader_thread),
             parser,
             sink: TerminalParserSink {
@@ -399,9 +433,7 @@ impl TerminalRuntime {
             agent_input_sequence: 0,
             screen_revision: 0,
             last_output_at: None,
-            child_exit_code: None,
-            shutdown_started: false,
-            last_pty_size: PtyDimensions::new(cols, rows, 0, 0)?,
+            last_pty_size: dimensions,
             pending_resize: None,
         })
     }
@@ -486,7 +518,12 @@ impl TerminalRuntime {
 
     /// Receives pending PTY output without blocking.
     pub fn try_recv(&mut self) -> Result<Vec<u8>, TryRecvError> {
-        self.rx.get().try_recv()
+        let result = self.rx.get().try_recv();
+        if matches!(result, Err(TryRecvError::Disconnected)) {
+            self.pty_disconnected = true;
+            self.process.hung_up();
+        }
+        result
     }
 
     /// Accepts input into the bounded PTY queue. Success means queued, not
@@ -571,15 +608,34 @@ impl TerminalRuntime {
         self.last_output_at.map(|instant| instant.elapsed())
     }
 
-    /// Polls and returns the child process exit code when available.
-    pub fn child_exit_code(&mut self) -> Option<u32> {
-        if self.child_exit_code.is_none()
-            && let Some(child) = self.child.as_mut()
-            && let Ok(Some(status)) = child.try_wait()
-        {
-            self.child_exit_code = Some(status.exit_code());
+    /// Whether the PTY output stream has hung up or shutdown was requested.
+    /// A child may still be alive after closing all its terminal descriptors.
+    pub fn pty_disconnected(&self) -> bool {
+        self.pty_disconnected
+    }
+
+    /// Returns the independently supervised child lifecycle state.
+    pub fn child_state(&self) -> &'static str {
+        match self.process.phase() {
+            Phase::Running => "running",
+            Phase::HungUp => "hung_up",
+            Phase::Stopping => "stopping",
+            Phase::Exited(_) => "exited",
         }
-        self.child_exit_code
+    }
+
+    /// Returns the child's OS process identifier, retained after exit.
+    pub fn child_process_id(&self) -> Option<u32> {
+        self.process.id()
+    }
+
+    /// Returns the exit code recorded by the child reaper. On supported Unix
+    /// platforms, signal termination is represented as 128 + signal number.
+    pub fn child_exit_code(&self) -> Option<u32> {
+        match self.process.phase() {
+            Phase::Exited(code) => Some(code),
+            _ => None,
+        }
     }
 
     /// Validates and applies the parser grid before notifying the child. A
@@ -615,7 +671,7 @@ impl TerminalRuntime {
         if self.last_pty_size != desired {
             let master = self.master.get().as_ref().context("PTY is closed")?;
             master
-                .resize(PtySize {
+                .resize(Dimensions {
                     rows: desired.grid.rows(),
                     cols: desired.grid.cols(),
                     pixel_width: desired.pixel_width,
@@ -640,18 +696,10 @@ impl TerminalRuntime {
 
     /// Shuts down the PTY runtime without blocking the Bevy main thread indefinitely.
     pub fn shutdown(&mut self) {
-        if self.shutdown_started {
-            return;
-        }
-        self.shutdown_started = true;
         self.pty_disconnected = true;
-
+        self.reader_stopped.store(true, Ordering::Release);
         self.input.shutdown();
-
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-        }
-        self.child.take();
+        self.process.stop();
         self.master.get().take();
 
         if self
@@ -905,6 +953,7 @@ mod tests {
 
 #[cfg(test)]
 mod resize_tests {
+    use portable_pty::{MasterPty, PtySize};
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -961,8 +1010,9 @@ mod resize_tests {
         TerminalRuntime {
             rx: SyncCell::new(rx),
             input: InputQueue::spawn(Box::new(io::sink())).expect("test writer"),
-            master: SyncCell::new(Some(master)),
-            child: None,
+            master: SyncCell::new(Some(Master::Portable(master))),
+            process: Process::prepare().expect("test supervisor"),
+            reader_stopped: Arc::new(AtomicBool::new(false)),
             reader_thread: None,
             parser: Parser::with_options(
                 fux_vt::Size::new(24, 80).expect("valid size"),
@@ -978,8 +1028,6 @@ mod resize_tests {
             agent_input_sequence: 0,
             screen_revision: 0,
             last_output_at: None,
-            child_exit_code: None,
-            shutdown_started: false,
             last_pty_size: PtyDimensions::new(80, 24, 0, 0).expect("valid test operation"),
             pending_resize: None,
         }

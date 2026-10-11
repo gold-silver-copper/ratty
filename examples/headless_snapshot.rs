@@ -310,6 +310,7 @@ struct SceneTarget(Handle<Image>, UVec2);
 struct Target;
 
 fn main() -> anyhow::Result<()> {
+    ratty::runtime::run_pty_launcher();
     let args = Args::parse();
     if let Some(last) = args.send.len().checked_sub(1) {
         let last_send = args.send_after + last as f32 * args.send_interval;
@@ -640,7 +641,7 @@ fn hold_scene_until_capture(
     runtime: Res<TerminalRuntime>,
     mut exits: ResMut<Messages<AppExit>>,
 ) {
-    if runtime.pty_disconnected && !state.done {
+    if runtime.pty_disconnected() && !state.done {
         let errors: Vec<_> = exits
             .drain()
             .filter(|exit| matches!(exit, AppExit::Error(_)))

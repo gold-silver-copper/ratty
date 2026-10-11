@@ -194,12 +194,12 @@ pub fn pump_pty_output(
         *reported_input_error = Some(error);
     }
     let mut camera_updates = Vec::new();
+    let was_connected = !runtime.pty_disconnected();
     let drained = drain_pty_output(&mut runtime, &mut inline_objects, &mut camera_updates);
     for update in camera_updates {
         camera_update_writer.write(update);
     }
-    if drained.disconnected && !runtime.pty_disconnected {
-        runtime.pty_disconnected = true;
+    if drained.disconnected && was_connected {
         app_exit.write(AppExit::Success);
     }
     if drained.processed {

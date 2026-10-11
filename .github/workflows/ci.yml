@@ -79,12 +79,17 @@ jobs:
         run: cargo check --workspace --locked --manifest-path ${{ matrix.manifest }} --target ${{ matrix.target }}
 
   test:
-    name: Test workspace
-    runs-on: ubuntu-latest
+    name: Test workspace (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install system dependencies
+        if: startsWith(matrix.os, 'ubuntu-')
         uses: ./.github/actions/install-linux-deps
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable

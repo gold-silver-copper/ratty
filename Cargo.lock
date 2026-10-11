@@ -2778,6 +2778,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuxix"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb60d3a960f7bcd8273614e00c4e5dfa82e4f8db00c97ffa6b9108e63c16c17b"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4781,12 +4790,14 @@ dependencies = [
  "clap",
  "etcetera",
  "fux-vt",
+ "fuxix",
  "getrandom 0.3.4",
  "image",
  "portable-pty",
  "ratatui",
  "rmcp",
  "rust-embed",
+ "rustix 1.1.4",
  "schemars",
  "serde",
  "serde_json",

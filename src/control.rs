@@ -683,9 +683,10 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
             let screen = runtime.screen();
             let (cursor_row, cursor_column) = screen.display_cursor_position();
             ControlResponse::data(serde_json::json!({
-                "connected": !runtime.pty_disconnected,
+                "connected": !runtime.pty_disconnected(),
                 "child": {
-                    "running": child_exit_code.is_none() && !runtime.pty_disconnected,
+                    "running": matches!(runtime.child_state(), "running" | "hung_up"),
+                    "state": runtime.child_state(),
                     "exit_code": child_exit_code,
                 },
                 "columns": terminal.cols,
@@ -772,7 +773,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
             ))
         }
         ControlCommand::WriteText(request) => {
-            if runtime.pty_disconnected {
+            if runtime.pty_disconnected() {
                 return ControlResponse::coded_error(
                     "terminal_disconnected",
                     "cannot write text because the terminal child is not running",
@@ -796,7 +797,7 @@ fn apply_command(command: ControlCommand, params: &mut ControlApplyParams) -> Co
             }))
         }
         ControlCommand::PressKeys(request) => {
-            if runtime.pty_disconnected {
+            if runtime.pty_disconnected() {
                 return ControlResponse::coded_error(
                     "terminal_disconnected",
                     "cannot press keys because the terminal child is not running",

@@ -40,6 +40,7 @@ fn window_resolution(app_config: &AppConfig) -> WindowResolution {
 }
 
 fn main() -> anyhow::Result<()> {
+    ratty::runtime::run_pty_launcher();
     let cli = Cli::parse();
     let app_config = AppConfig::load_from_path(cli.config_file.as_deref())?;
     let runtime = TerminalRuntime::spawn(

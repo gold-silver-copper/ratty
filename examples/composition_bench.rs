@@ -14,6 +14,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 fn main() -> anyhow::Result<()> {
+    ratty::runtime::run_pty_launcher();
     if std::env::args().any(|arg| arg == "--bench-child") {
         loop {
             std::thread::sleep(Duration::from_secs(60));
